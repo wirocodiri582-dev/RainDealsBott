@@ -6,7 +6,7 @@ def _store_rows():
     rows = []
     if MINI_APP_URL:
         rows.append([InlineKeyboardButton(
-            text="🏬 Open the site",
+            text="🛍 Store",
             web_app=WebAppInfo(url=MINI_APP_URL),
             style="success",
         )])

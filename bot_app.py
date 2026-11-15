@@ -11,11 +11,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     BotCommandScopeDefault,
-    MenuButtonWebApp,
-    WebAppInfo,
+    MenuButtonCommands,
 )
 
-from config import BOT_TOKEN, MINI_APP_URL
+from config import BOT_TOKEN
 
 from middleware.membership import BannedUserMiddleware
 from middleware.session_timeout import CallbackSessionTimeoutMiddleware
@@ -120,19 +119,14 @@ async def _register_bot_commands(bot: Bot):
     except Exception:
         logger.exception("Could not register Telegram bot commands")
 
-    if MINI_APP_URL:
-        try:
-            await bot.set_chat_menu_button(
-                menu_button=MenuButtonWebApp(
-                    text="Store",
-                    web_app=WebAppInfo(url=MINI_APP_URL),
-                )
-            )
-            logger.info("Telegram chat menu button configured to open the RainDeals Store")
-        except Exception:
-            logger.exception("Could not configure Telegram Store menu button")
-    else:
-        logger.warning("Telegram Store menu button is disabled; MINI_APP_URL is not configured")
+    try:
+        # Telegram provides one native chat-menu button per chat. Keep that
+        # slot for the command menu; the Store Mini App is an inline button
+        # on the RainDeals home card so both actions stay visible together.
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        logger.info("Telegram chat menu button configured to open RainDeals commands")
+    except Exception:
+        logger.exception("Could not configure Telegram command menu button")
 
 
 async def _warm_product_catalog(bot: Bot):
