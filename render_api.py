@@ -47,7 +47,7 @@ from services.polling_lease import ensure_polling_lease_schema, run_polling_as_l
 from services.session_resume import flush_pending_resume
 from services.upstream_callbacks import process_upstream_callback
 from services.cloudflare_bridge import dispatch_update, ensure_schema, verify_request
-from config import API_MAX_REQUEST_BYTES, MAIN_BOT_USERNAME
+from config import API_MAX_REQUEST_BYTES, MAIN_BOT_USERNAME, MINI_APP_URL
 
 
 # ============================================================
@@ -127,6 +127,10 @@ async def lifespan(app: FastAPI):
         logger.info(
             "Main Telegram bot connected: @%s",
             me.username,
+        )
+        logger.info(
+            "RainDeals Mini App menu button %s",
+            "enabled" if MINI_APP_URL else "disabled; MINI_APP_URL is not set",
         )
 
         # Requeue submitted deposits left in an in-flight state by a prior

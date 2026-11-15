@@ -6,17 +6,24 @@ catalog, wallet, or order system.
 
 ## Render configuration
 
-Set this environment value on the Render service that runs `render_api.py`:
+The bot reads the Mini App URL only from `MINI_APP_URL`; the URL is not
+hard-coded in the Python menu code. For this Render deployment, use:
 
 ```text
-MINI_APP_URL=https://<your-render-service-host>/miniapp
+MINI_APP_URL=https://raindealsbott-hnpn.onrender.com/miniapp
 ```
+
+For local development, put that line in the project-root `.env` file (or copy
+`.env.example` to `.env`). On Render, add the same key/value under the service's
+Environment settings; Render does not receive your local ignored `.env` file
+when you push Git commits.
 
 The main bot username is read from Telegram at startup. `BOT_TOKEN` is used
 only on the server to verify Telegram's signed `initData`; it is never returned
-to the browser. Deploy the existing service after adding the URL, then register
-the HTTPS host for the bot's Mini App in BotFather. The bot home menu will show
-the RainDeals Mini App button when `MINI_APP_URL` is configured.
+to the browser. After adding the URL, redeploy/restart the service and send
+`/start` again to get a newly generated menu keyboard. Register the HTTPS host
+for the bot's Mini App in BotFather if Telegram prompts you to do so. The bot
+home menu shows the Mini App button only when `MINI_APP_URL` is configured.
 
 ## Screens
 
