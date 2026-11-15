@@ -415,6 +415,9 @@ async def request_logger(request: Request, call_next):
     try:
         response = await call_next(request)
 
+        if request.url.path.startswith("/miniapp/api/"):
+            response.headers["Cache-Control"] = "no-store, private"
+
         logger.info(
             "%s %s -> %s",
             request.method,

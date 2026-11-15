@@ -19,7 +19,7 @@ from database import SessionLocal, transaction, retry_on_write_conflict
 from models.user import User
 from models.deposit import Deposit
 from services.session_resume import save_resume
-from config import ADMIN_IDS, CHANNEL_LINK, GROUP_LINK, TOS_LINK
+from config import ADMIN_IDS, CHANNEL_LINK, GROUP_LINK, MINI_APP_URL, TOS_LINK
 
 from keyboards.menu import get_main_menu, get_admin_main_menu
 from utils.ui import show, answer_card, update_card
@@ -221,7 +221,12 @@ def _build_start_welcome(
         f"💸 Referral Earnings: ${earnings}\n"
         f"🔗 Referral Link: {referral_link}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Choose an option below to get started.</i>"
+        "🛍 <b>Choose how you’d like to shop</b>\n"
+        + (
+            "Open the RainDeals website or browse and buy right here in Telegram."
+            if MINI_APP_URL
+            else "Browse and buy RainDeals products right here in Telegram."
+        )
     )
 
 

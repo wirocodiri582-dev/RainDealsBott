@@ -3,9 +3,18 @@ from config import MINI_APP_URL
 
 
 def _store_rows():
-    rows = [[InlineKeyboardButton(text="🛍 SHOP", callback_data="products_menu", style="primary")]]
+    rows = []
     if MINI_APP_URL:
-        rows.append([InlineKeyboardButton(text="🌧️ Open RainDeals Store", web_app=WebAppInfo(url=MINI_APP_URL))])
+        rows.append([InlineKeyboardButton(
+            text="🏬 Open the site",
+            web_app=WebAppInfo(url=MINI_APP_URL),
+            style="success",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="🤖 Buy via bot",
+        callback_data="products_menu",
+        style="success",
+    )])
     return rows
 
 

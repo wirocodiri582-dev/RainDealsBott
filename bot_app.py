@@ -8,9 +8,14 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BotCommandScopeDefault
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeDefault,
+    MenuButtonWebApp,
+    WebAppInfo,
+)
 
-from config import BOT_TOKEN
+from config import BOT_TOKEN, MINI_APP_URL
 
 from middleware.membership import BannedUserMiddleware
 from middleware.session_timeout import CallbackSessionTimeoutMiddleware
@@ -114,6 +119,20 @@ async def _register_bot_commands(bot: Bot):
         )
     except Exception:
         logger.exception("Could not register Telegram bot commands")
+
+    if MINI_APP_URL:
+        try:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="Store",
+                    web_app=WebAppInfo(url=MINI_APP_URL),
+                )
+            )
+            logger.info("Telegram chat menu button configured to open the RainDeals Store")
+        except Exception:
+            logger.exception("Could not configure Telegram Store menu button")
+    else:
+        logger.warning("Telegram Store menu button is disabled; MINI_APP_URL is not configured")
 
 
 async def _warm_product_catalog(bot: Bot):

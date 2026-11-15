@@ -94,11 +94,20 @@ def clear(user_id):
 
 
 def _quote(db, user_id):
-    from handlers.products import _active_custom_price, _get_bulk_price, _money, _product_purchase_configuration_errors
+    from handlers.products import _get_catalog_custom_prices, _get_bulk_price, _money, _product_purchase_configuration_errors
     from services.fulfillment_policy import plan_delivery, effective_delivery_type
     lines = []
-    for item in db.query(CartItem).filter_by(telegram_id=user_id).order_by(CartItem.id).all():
-        product = db.get(Product, item.product_id)
+    items = db.query(CartItem).filter_by(telegram_id=user_id).order_by(CartItem.id).all()
+    product_ids = [int(item.product_id) for item in items]
+    products = {
+        int(product.id): product
+        for product in db.query(Product).filter(Product.id.in_(product_ids)).all()
+    } if product_ids else {}
+    # One cached catalog-rate lookup for all cart lines avoids a price query
+    # per item on each cart open or checkout review.
+    custom_prices = _get_catalog_custom_prices(user_id, product_ids)
+    for item in items:
+        product = products.get(int(item.product_id))
         price, error, plan = Decimal(0), None, None
         if not product or not product.is_active:
             error = 'Unavailable'
@@ -109,7 +118,7 @@ def _quote(db, user_id):
             elif Decimal(str(product.price)) < 0:
                 error = 'Product is unavailable because its price is invalid.'
             else:
-                custom = _active_custom_price(db, user_id, product.id)
+                custom = custom_prices.get(int(product.id))
                 price = _money(custom if custom is not None else product.price)
                 bulk = _get_bulk_price(product.bulk_pricing, item.quantity) if custom is None and product.bulk_pricing else None
                 if bulk is not None:

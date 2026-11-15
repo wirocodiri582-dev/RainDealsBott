@@ -9,17 +9,22 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import time
+from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import desc
 
-from config import API_BASE_URL, BOT_TOKEN, MAIN_BOT_USERNAME
+import config
+from config import BOT_TOKEN, MAIN_BOT_USERNAME
 from database import SessionLocal
-from models.api_key import ApiKey
+from models.deposit import Deposit
 from models.order import Order
 from models.product import Product
 from models.user import User
@@ -93,17 +98,24 @@ def _requirements(product: Product) -> list[dict[str, str]]:
     return result
 
 
-def _product_rows(user_id: int, freebies: bool = False) -> list[dict]:
+def _product_rows(user_id: int, freebies: bool = False, *, product_id: int | None = None, include_details: bool = False) -> list[dict]:
     from handlers.products import (
-        _active_custom_price, _get_bulk_price, _get_max_qty, _money as shop_money,
+        _get_bulk_price, _get_max_qty, _get_catalog_custom_prices, _money as shop_money,
         _real_stock,
         _product_purchase_configuration_errors,
     )
     from services.fulfillment_policy import manual_allowed as _manual_allowed
     with SessionLocal() as db:
         query = db.query(Product).filter(Product.is_active.is_(True))
-        query = query.filter(Product.price == 0) if freebies else query.filter(Product.price > 0)
-        products = query.order_by(Product.id.desc()).limit(1000).all()
+        if product_id is not None:
+            query = query.filter(Product.id == int(product_id))
+        else:
+            query = query.filter(Product.price == 0) if freebies else query.filter(Product.price > 0)
+        products = query.order_by(Product.id.desc()).limit(1 if product_id is not None else 1000).all()
+        # Resolve custom rates as a catalog batch instead of querying them
+        # separately for every product. Newly added products are still read
+        # from the database on each catalog request.
+        custom_prices = _get_catalog_custom_prices(user_id, [int(p.id) for p in products])
         output = []
         for product in products:
             try:
@@ -120,7 +132,7 @@ def _product_rows(user_id: int, freebies: bool = False) -> list[dict]:
                     and available <= 0
                     and _manual_allowed(product)
                 )
-                custom_price = _active_custom_price(db, user_id, product.id)
+                custom_price = custom_prices.get(int(product.id))
                 price = custom_price if custom_price is not None else shop_money(product.price)
                 bulk = _get_bulk_price(product.bulk_pricing, 1) if custom_price is None and product.bulk_pricing else None
                 if bulk is not None:
@@ -128,7 +140,10 @@ def _product_rows(user_id: int, freebies: bool = False) -> list[dict]:
                 output.append({
                     "id": int(product.id), "name": str(product.name or "Product")[:255],
                     "icon": str(product.icon or "📦")[:50],
-                    "description": str(product.description or "")[:1200],
+                    # Keep the catalog response light, but include enough buyer
+                    # requirements for product cards and checkout prompts.
+                    "description": str(product.description or "")[:1200 if include_details else 350],
+                    "description_truncated": bool(not include_details and len(str(product.description or "")) > 350),
                     "category": (str(product.category or "General").strip() or "General")[:100],
                     "price": _money(price), "currency": "USDT", "stock": available,
                     "sellable_stock": sellable, "in_stock": available > 0,
@@ -178,19 +193,124 @@ class CheckoutPayload(BaseModel):
         return value
 
 
+class DepositCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    network: str = Field(pattern=r"^(BEP20|POLYGON|BINANCE|UPI)$")
+
+
+class DepositReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reference: str = Field(min_length=8, max_length=255)
+
+
+class PromocodePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: str = Field(min_length=1, max_length=32)
+
+
+_DEPOSIT_LABELS = {
+    "BEP20": ("🟡", "USDT · BEP20 (BSC)", "Transaction Hash (TXID)"),
+    "POLYGON": ("🟣", "USDT · Polygon", "Transaction Hash (TXID)"),
+    "BINANCE": ("🔴", "Binance Pay", "Binance Pay Order ID"),
+    "UPI": ("🟢", "UPI · INR", "UTR / Transaction ID"),
+}
+
+
+def _deposit_method_rows() -> list[dict]:
+    configured = {
+        "BEP20": bool(str(getattr(config, "BEP20_ADDRESS", "") or "").strip()),
+        "POLYGON": bool(str(getattr(config, "POLYGON_ADDRESS", "") or "").strip()),
+        "BINANCE": bool(str(getattr(config, "BINANCE_PAY_ID", "") or "").strip()),
+        "UPI": bool(str(getattr(config, "UPI_ID", "") or "").strip()),
+    }
+    return [{"network": key, "icon": value[0], "label": value[1], "reference_label": value[2],
+             "configured": configured[key]}
+            for key, value in _DEPOSIT_LABELS.items()]
+
+
+def _deposit_view(row: Deposit) -> dict:
+    network = str(row.network or "").upper()
+    label = _DEPOSIT_LABELS.get(network, ("💳", network or "Payment", "Reference"))
+    expiry = row.invoice_expires_at
+    # Database invoice timestamps are naive UTC values; subtract UTC datetimes
+    # directly so the remaining time is independent of the host timezone.
+    if expiry:
+        now = datetime.now(expiry.tzinfo) if expiry.tzinfo else datetime.utcnow()
+        remaining = max(0, int((expiry - now).total_seconds()))
+    else:
+        remaining = 0
+    can_pay = bool(row.status == "waiting_hash" and not row.tx_hash and remaining > 0)
+    payment = {"address": "", "qr_url": None, "instructions": ""}
+    if can_pay:
+        qr_setting = ""
+        if network == "BEP20":
+            payment["address"] = str(getattr(config, "BEP20_ADDRESS", "") or "")
+            qr_setting = str(getattr(config, "BEP20_QR_FILE", "") or "")
+            payment["instructions"] = "Send USDT on BNB Smart Chain (BEP20), then submit the transaction hash."
+        elif network == "POLYGON":
+            payment["address"] = str(getattr(config, "POLYGON_ADDRESS", "") or "")
+            qr_setting = str(getattr(config, "POLYGON_QR_FILE", "") or "")
+            payment["instructions"] = "Send USDT on Polygon, then submit the transaction hash."
+        elif network == "BINANCE":
+            payment["address"] = str(getattr(config, "BINANCE_PAY_ID", "") or "")
+            payment["instructions"] = "Pay using Binance Pay, then submit the Order ID from the receipt."
+        elif network == "UPI":
+            payment["address"] = str(getattr(config, "UPI_ID", "") or "")
+            qr_setting = str(getattr(config, "UPI_QR_FILE", "") or "")
+            payment["instructions"] = "Pay using UPI, then submit the UTR or transaction reference."
+        if qr_setting:
+            if qr_setting.startswith("https://"):
+                payment["qr_url"] = qr_setting
+            elif Path(qr_setting).expanduser().is_file():
+                payment["qr_url"] = f"/miniapp/api/deposits/{int(row.id)}/qr"
+    return {
+        "id": int(row.id), "invoice": str(row.invoice_code or row.order_id or ""),
+        "network": network, "network_label": label[1], "icon": label[0],
+        "reference_label": label[2], "status": str(row.status or "unknown"),
+        "amount": _money(row.amount), "received_amount": _money(row.received_amount),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "expires_at": expiry.isoformat() if expiry else None, "remaining_seconds": remaining,
+        "payment": payment if can_pay else None,
+        "reference_submitted": bool(row.tx_hash),
+    }
+
+
+def _owned_deposit(user_id: int, deposit_id: int) -> Deposit | None:
+    with SessionLocal() as db:
+        row = db.query(Deposit).filter(Deposit.id == deposit_id, Deposit.telegram_id == user_id).first()
+        if not row:
+            return None
+        # Detach scalar fields needed by the API serializer before closing DB.
+        db.expunge(row)
+        return row
+
+
+def _qr_file(network: str):
+    name = {"BEP20": "BEP20_QR_FILE", "POLYGON": "POLYGON_QR_FILE", "UPI": "UPI_QR_FILE"}.get(network)
+    value = str(getattr(config, name, "") or "").strip() if name else ""
+    if not value or value.startswith(("https://", "http://")):
+        return None
+    path = Path(value).expanduser()
+    return path if path.is_file() else None
+
+
 @router.get("/bootstrap")
 def bootstrap(request: Request, auth=Depends(current_user)):
     from services import notification_inbox
     with SessionLocal() as db:
         user = db.query(User).filter(User.telegram_id == auth["id"]).first()
-        key_count = db.query(ApiKey.id).filter(ApiKey.telegram_id == auth["id"], ApiKey.is_active.is_(True)).count()
+        username = getattr(request.app.state, "main_bot_username", MAIN_BOT_USERNAME)
+        referral_code = str(user.referral_code or "").strip()
+        referral_link = f"https://t.me/{username}?start=ref_{referral_code}" if username and referral_code else ""
         return {
             "profile": {"telegram_id": int(user.telegram_id), "name": user.full_name or "RainDeals customer",
                         "username": user.username, "balance": _money(user.balance),
-                        "spent": _money(user.total_spent), "orders": int(user.total_orders or 0)},
+                        "spent": _money(user.total_spent), "deposited": _money(user.total_deposited),
+                        "orders": int(user.total_orders or 0), "referrals": int(user.total_referrals or 0),
+                        "referral_earnings": _money(user.referral_earnings), "referral_link": referral_link},
             "unread_notifications": int(notification_inbox.count(auth["id"])),
-            "active_api_keys": int(key_count), "api_base_url": API_BASE_URL,
-            "main_bot_username": getattr(request.app.state, "main_bot_username", MAIN_BOT_USERNAME),
+            "main_bot_username": username,
+            "deposit_methods": _deposit_method_rows(),
         }
 
 
@@ -198,6 +318,144 @@ def bootstrap(request: Request, auth=Depends(current_user)):
 def products(freebies: bool = False, auth=Depends(current_user)):
     rows = _product_rows(auth["id"], freebies)
     return {"products": rows, "categories": sorted({row["category"] for row in rows}, key=str.casefold)}
+
+
+@router.get("/products/{product_id}")
+def product_detail(product_id: int, auth=Depends(current_user)):
+    rows = _product_rows(auth["id"], product_id=product_id, include_details=True)
+    if not rows:
+        raise HTTPException(status_code=404, detail="Product is unavailable.")
+    return {"product": rows[0]}
+
+
+@router.get("/deposit-methods")
+def deposit_methods(auth=Depends(current_user)):
+    return {"methods": _deposit_method_rows()}
+
+
+@router.post("/deposits")
+async def create_deposit(payload: DepositCreate, auth=Depends(current_user)):
+    import asyncio
+    from handlers.deposit import (
+        _active_invoice, _create_invoice, _load_invoice_for_resume,
+        _submitted_invoice, _switch_invoice_network,
+    )
+    from decimal import Decimal
+
+    method = next((row for row in _deposit_method_rows() if row["network"] == payload.network), None)
+    if not method or not method["configured"]:
+        raise HTTPException(status_code=503, detail="This payment method is not configured. Choose another method or contact support.")
+    submitted = await asyncio.to_thread(_submitted_invoice, auth["id"])
+    if submitted:
+        raise HTTPException(status_code=409, detail="A payment reference is already being verified. Check your deposit history before starting another.")
+    try:
+        active = await asyncio.to_thread(_active_invoice, auth["id"])
+        if active:
+            invoice_id = int(active["id"])
+            if active.get("network") != payload.network:
+                changed = await asyncio.to_thread(_switch_invoice_network, invoice_id, payload.network)
+                if not changed:
+                    raise HTTPException(status_code=409, detail="The current invoice can no longer switch methods. Check your deposit history.")
+        else:
+            created = await asyncio.to_thread(_create_invoice, auth["id"], Decimal("0"), payload.network)
+            if created.get("verification_pending"):
+                raise HTTPException(status_code=409, detail="A payment reference is already being verified. Check your deposit history before starting another.")
+            invoice_id = int(created["id"])
+            # _create_invoice safely reuses one active invoice. Apply the newly
+            # selected method to that same invoice when another tab raced it.
+            current = await asyncio.to_thread(_load_invoice_for_resume, auth["id"], invoice_id)
+            if current and current.get("network") != payload.network:
+                await asyncio.to_thread(_switch_invoice_network, invoice_id, payload.network)
+        row = await asyncio.to_thread(_load_invoice_for_resume, auth["id"], invoice_id)
+        if not row:
+            raise HTTPException(status_code=409, detail="The invoice is no longer active. Refresh and try again.")
+        owned = await asyncio.to_thread(_owned_deposit, auth["id"], invoice_id)
+        return {"deposit": _deposit_view(owned)}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Mini App deposit invoice creation failed for telegram_id=%s", auth["id"])
+        raise HTTPException(status_code=503, detail="Could not prepare the payment invoice. Please try again.")
+
+
+@router.get("/deposits")
+def deposits(page: int = 0, auth=Depends(current_user)):
+    page = max(0, min(int(page), 100000))
+    with SessionLocal() as db:
+        rows = (db.query(Deposit).filter(Deposit.telegram_id == auth["id"])
+                .order_by(Deposit.id.desc()).offset(page * 10).limit(11).all())
+        return {"deposits": [_deposit_view(row) for row in rows[:10]], "has_more": len(rows) > 10}
+
+
+@router.get("/deposits/{deposit_id}")
+def deposit_detail(deposit_id: int, auth=Depends(current_user)):
+    row = _owned_deposit(auth["id"], deposit_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Deposit not found.")
+    return {"deposit": _deposit_view(row)}
+
+
+@router.get("/deposits/{deposit_id}/qr")
+def deposit_qr(deposit_id: int, auth=Depends(current_user)):
+    row = _owned_deposit(auth["id"], deposit_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Deposit not found.")
+    if row.status != "waiting_hash" or row.tx_hash:
+        raise HTTPException(status_code=404, detail="Payment QR is no longer active.")
+    path = _qr_file(str(row.network or "").upper())
+    if not path:
+        raise HTTPException(status_code=404, detail="No QR image is configured for this payment method.")
+    return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream", filename=path.name)
+
+
+@router.post("/deposits/{deposit_id}/reference")
+async def submit_deposit_reference(deposit_id: int, payload: DepositReference, auth=Depends(current_user)):
+    import asyncio
+    from handlers.deposit import _valid_order_id, _valid_upi_reference, TX_HASH_RE
+    from services.payment_submissions import bind_reference
+
+    row = await asyncio.to_thread(_owned_deposit, auth["id"], deposit_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Deposit not found.")
+    network = str(row.network or "").upper()
+    reference = payload.reference.strip()
+    valid = (_valid_upi_reference(reference) if network == "UPI" else
+             _valid_order_id(reference) if network == "BINANCE" else
+             bool(TX_HASH_RE.fullmatch(reference)) if network in {"BEP20", "POLYGON"} else False)
+    if not valid:
+        reference_label = _DEPOSIT_LABELS.get(network, ("", "", "payment reference"))[2]
+        raise HTTPException(status_code=422, detail=f"Enter a valid {reference_label}.")
+    result = await asyncio.to_thread(bind_reference, deposit_id, reference, auth["id"], network)
+    if result not in {"ok", "already_submitted"}:
+        messages = {
+            "duplicate": "This payment reference was already submitted.",
+            "reference_locked": "This invoice already has a different reference attached.",
+            "expired": "This invoice has expired. Check deposit history before creating another.",
+            "closed": "This invoice is closed.",
+            "not_found": "This invoice cannot accept a reference.",
+            "completed": "This deposit is already complete.",
+        }
+        if result == "completed":
+            return {"status": "completed", "message": "Payment already verified."}
+        raise HTTPException(status_code=409, detail=messages.get(result, "Could not save this reference."))
+    verify_info: dict = {}
+    try:
+        from services.deposit_checker import verify_deposit
+        await verify_deposit(deposit_id, result_info=verify_info)
+    except Exception:
+        logger.exception("Mini App immediate deposit verification failed deposit_id=%s", deposit_id)
+    latest = await asyncio.to_thread(_owned_deposit, auth["id"], deposit_id)
+    status = str(latest.status if latest else "pending")
+    return {"status": status, "message": "Payment verified." if status == "completed" else "Reference saved. Automatic verification will continue; you can check this deposit again here."}
+
+
+@router.post("/promocodes/redeem")
+def redeem_promocode(payload: PromocodePayload, auth=Depends(current_user)):
+    from services.promotions import redeem
+    ok, result = redeem(auth["id"], payload.code)
+    if not ok:
+        raise HTTPException(status_code=409, detail=str(result))
+    return {"success": True, "code": result["code"], "amount": _money(result["amount"]), "balance": _money(result["balance"])}
 
 
 @router.get("/cart")
