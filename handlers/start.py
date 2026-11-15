@@ -22,7 +22,7 @@ from services.session_resume import save_resume
 from config import ADMIN_IDS, CHANNEL_LINK, GROUP_LINK, MINI_APP_URL, TOS_LINK
 
 from keyboards.menu import get_main_menu, get_admin_main_menu
-from utils.ui import show, answer_card, update_card
+from utils.ui import show, answer_card, update_card, get_card_location
 
 # Membership check
 from middleware.membership import check_user_membership, get_join_keyboard
@@ -228,6 +228,45 @@ def _build_start_welcome(
             else "Browse and buy RainDeals products right here in Telegram."
         )
     )
+
+
+_START_LOADING_TEXT = (
+    "🌧 <b>RainDeals</b>\n\n"
+    "⏳ <b>Opening your store…</b>\n"
+    "Checking access and preparing your account."
+)
+
+
+async def _delete_start_cards_quietly(bot, chat_id: int, message_ids, keep_id: int) -> None:
+    """Remove stale start/invoice cards without delaying the visible menu."""
+    ids = set()
+    for item in message_ids:
+        if not item or len(item) != 2:
+            continue
+        item_chat_id, message_id = item
+        if (
+            item_chat_id is not None
+            and int(item_chat_id) == int(chat_id)
+            and message_id
+            and str(message_id).isdigit()
+            and int(message_id) != int(keep_id)
+        ):
+            ids.add(int(message_id))
+    if ids:
+        await asyncio.gather(
+            *(bot.delete_message(chat_id=chat_id, message_id=message_id) for message_id in ids),
+            return_exceptions=True,
+        )
+
+
+async def _cleanup_admin_start_cards(bot, admin_id: int, chat_id: int, keep_id: int) -> None:
+    """Look up legacy admin alerts off the /start response path."""
+    try:
+        from services.notification_outbox import private_admin_alert_cards
+        cards = await asyncio.to_thread(private_admin_alert_cards, admin_id, bot.id)
+        await _delete_start_cards_quietly(bot, chat_id, cards, keep_id)
+    except Exception:
+        logger.debug("Could not clean old admin alerts during /start", exc_info=True)
 
 
 def _load_main_menu_data(
@@ -533,7 +572,8 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         return
 
     started_at = time.perf_counter()
-    membership_ms = db_ms = username_ms = card_ms = menu_save_ms = 0.0
+    loader_ms = membership_ms = db_ms = username_ms = card_ms = menu_save_ms = 0.0
+    telegram_id = message.from_user.id
     from handlers.restart import stop_restart
     await stop_restart((message.from_user.id, message.chat.id))
     previous_card = await state.get_data()
@@ -541,15 +581,47 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         (previous_card.get('_card_chat_id') or message.chat.id, previous_card.get(key))
         for key in ('_card_message_id', 'invoice_card_message_id', 'invoice_photo_message_id')
     ]
-    if message.from_user.id in ADMIN_IDS:
-        from services.notification_outbox import private_admin_alert_cards
-        previous_cards.extend(await asyncio.to_thread(private_admin_alert_cards,message.from_user.id,message.bot.id))
     # Reset only transient prompts. Any unpaid/pending invoice remains in the
     # database and is reused/reported by the deposit flow after /start.
     await state.clear()
     save_resume((message.from_user.id, message.chat.id), None)
 
-    telegram_id = message.from_user.id
+    # Put one lightweight loader on the user's current card before membership
+    # or database checks. The same card is edited into the final screen below.
+    loading_card = await update_card(
+        message,
+        text=_START_LOADING_TEXT,
+        parse_mode="HTML",
+        delete_input=True,
+        owner_id=telegram_id,
+        replace_media=bool(
+            previous_card.get("invoice_photo_message_id")
+            and str(previous_card.get("invoice_photo_message_id"))
+            == str(previous_card.get("_card_message_id"))
+        ),
+        disable_web_page_preview=True,
+    )
+    loader_ms = (time.perf_counter() - started_at) * 1000
+    loading_location = (
+        (int(loading_card.chat.id), int(loading_card.message_id))
+        if loading_card
+        else get_card_location(telegram_id, message.chat.id)
+    )
+    if loading_location:
+        asyncio.create_task(_delete_start_cards_quietly(
+            message.bot,
+            message.chat.id,
+            previous_cards,
+            int(loading_location[1]),
+        ))
+        if telegram_id in ADMIN_IDS:
+            asyncio.create_task(_cleanup_admin_start_cards(
+                message.bot,
+                telegram_id,
+                message.chat.id,
+                int(loading_location[1]),
+            ))
+
     start_payload = (command.args or "").strip() if command else ""
     deep_link_product_id = None
     if start_payload.startswith("product_"):
@@ -569,12 +641,17 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         )
         membership_ms = (time.perf_counter() - membership_started_at) * 1000
         if not is_member:
-            await answer_card(message,
+            await update_card(
+                message,
                 "⚠️ <b>Access Restricted</b>\n\n"
                 "You must join every required chat to use the bot.\n\n"
                 "👇 Join below, then press <b>Try Again</b>",
                 reply_markup=get_join_keyboard(),
-                parse_mode="HTML"
+                parse_mode="HTML",
+                delete_input=False,
+                chat_id=loading_location[0] if loading_location else message.chat.id,
+                message_id=loading_location[1] if loading_location else None,
+                owner_id=telegram_id,
             )
             return
 
@@ -616,13 +693,28 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         db_ms = (time.perf_counter() - db_started_at) * 1000
     except Exception:
         logger.exception("Failed to create/update user %s on /start", telegram_id)
-        await answer_card(message,
+        await update_card(
+            message,
             "❌ <b>Startup Error</b>\n\nSomething went wrong starting your session.\nPlease try again with /start",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            delete_input=False,
+            chat_id=loading_location[0] if loading_location else message.chat.id,
+            message_id=loading_location[1] if loading_location else None,
+            owner_id=telegram_id,
         )
         return
 
     user = SimpleNamespace(**result["profile"])
+    saved_home = (
+        (result["profile"].get("home_menu_chat_id"), result["profile"].get("home_menu_message_id")),
+    )
+    if loading_location:
+        asyncio.create_task(_delete_start_cards_quietly(
+            message.bot,
+            message.chat.id,
+            previous_cards + list(saved_home),
+            int(loading_location[1]),
+        ))
     if deep_link_product_id is not None:
         from handlers.products import product_info
 
@@ -630,7 +722,12 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         return
 
     username_started_at = time.perf_counter()
-    bot_username = await _get_bot_username(message.bot)
+    try:
+        bot_username = await _get_bot_username(message.bot)
+    except Exception:
+        # A temporary getMe failure must not strand the user on the loader.
+        logger.warning("Could not load bot username while rendering /start", exc_info=True)
+        bot_username = ""
     username_ms = (time.perf_counter() - username_started_at) * 1000
     user.username = username
     user.full_name = full_name
@@ -650,12 +747,10 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         text=text,
         reply_markup=keyboard,
         parse_mode="HTML",
-        delete_input=True,
-        chat_id=result["profile"].get("home_menu_chat_id"),
-        message_id=result["profile"].get("home_menu_message_id"),
+        delete_input=False,
+        chat_id=loading_location[0] if loading_location else result["profile"].get("home_menu_chat_id"),
+        message_id=loading_location[1] if loading_location else result["profile"].get("home_menu_message_id"),
         owner_id=telegram_id,
-        force_new_card=True,
-        cleanup_cards=previous_cards,
         disable_web_page_preview=True,
     )
     card_ms = (time.perf_counter() - card_started_at) * 1000
@@ -669,9 +764,10 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         )
         menu_save_ms = (time.perf_counter() - menu_save_started_at) * 1000
     logger.info(
-        "start_timing user_id=%s membership_ms=%.1f db_ms=%.1f username_ms=%.1f "
+        "start_timing user_id=%s loader_ms=%.1f membership_ms=%.1f db_ms=%.1f username_ms=%.1f "
         "card_ms=%.1f menu_save_ms=%.1f visible_ms=%.1f total_ms=%.1f",
         telegram_id,
+        loader_ms,
         membership_ms,
         db_ms,
         username_ms,
