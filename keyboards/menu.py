@@ -1,17 +1,18 @@
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from config import MINI_APP_URL
+
+
+def _store_rows():
+    rows = [[InlineKeyboardButton(text="🛍 SHOP", callback_data="products_menu", style="primary")]]
+    if MINI_APP_URL:
+        rows.append([InlineKeyboardButton(text="🌧️ Open RainDeals Store", web_app=WebAppInfo(url=MINI_APP_URL))])
+    return rows
 
 
 def get_main_menu(unread_count=0) -> InlineKeyboardMarkup:
     from services.notification_inbox import badge
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🛍 SHOP",
-                    callback_data="products_menu",
-                    style="primary",
-                )
-            ],
+        inline_keyboard=_store_rows() + [
             [InlineKeyboardButton(text="🛒 Cart", callback_data="ct_cart", style="primary"), InlineKeyboardButton(text=badge(unread_count), callback_data="ct_inbox", style="primary")],
             [
                 InlineKeyboardButton(
@@ -70,14 +71,7 @@ def get_main_menu(unread_count=0) -> InlineKeyboardMarkup:
 def get_admin_main_menu(unread_count=0) -> InlineKeyboardMarkup:
     from services.notification_inbox import badge
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🛍 SHOP",
-                    callback_data="products_menu",
-                    style="primary",
-                )
-            ],
+        inline_keyboard=_store_rows() + [
             [InlineKeyboardButton(text="🛒 Cart", callback_data="ct_cart", style="primary"), InlineKeyboardButton(text=badge(unread_count), callback_data="ct_inbox", style="primary")],
             [
                 InlineKeyboardButton(

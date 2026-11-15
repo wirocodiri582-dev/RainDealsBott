@@ -109,6 +109,8 @@ SESSION_RESUME_ENCRYPTION_KEY = os.getenv("SESSION_RESUME_ENCRYPTION_KEY", "")
 # https://my-reseller-api.wasmer.app.  Do not put the Vercel/Render bot URL
 # here, because it is an internal bridge only.
 API_BASE_URL = os.getenv("API_BASE_URL", "").rstrip("/")
+MINI_APP_URL = os.getenv("MINI_APP_URL", "").strip().rstrip("/")
+MAIN_BOT_USERNAME = os.getenv("MAIN_BOT_USERNAME", "").strip().lstrip("@")
 MANAGER_WEB_URL = os.getenv(
     "MANAGER_WEB_URL",
     "https://raindeals-manager.samarthp2727-rd.workers.dev",

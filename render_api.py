@@ -17,13 +17,16 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from api.reseller_v1 import router as reseller_router
+from api.miniapp import router as miniapp_router
 from bot_app import bot, dp
 from services.deposit_checker import deposit_checker_loop
 from services.deposit_card_recovery import (
@@ -44,7 +47,7 @@ from services.polling_lease import ensure_polling_lease_schema, run_polling_as_l
 from services.session_resume import flush_pending_resume
 from services.upstream_callbacks import process_upstream_callback
 from services.cloudflare_bridge import dispatch_update, ensure_schema, verify_request
-from config import API_MAX_REQUEST_BYTES
+from config import API_MAX_REQUEST_BYTES, MAIN_BOT_USERNAME
 
 
 # ============================================================
@@ -91,6 +94,8 @@ async def lifespan(app: FastAPI):
     polling_task: asyncio.Task | None = None
 
     try:
+        app.state.main_bot = bot
+        app.state.main_bot_username = MAIN_BOT_USERNAME
         await asyncio.to_thread(ensure_product_api_access_schema)
         await asyncio.to_thread(ensure_provider_schema)
         await asyncio.to_thread(ensure_maintenance_schema)
@@ -117,6 +122,7 @@ async def lifespan(app: FastAPI):
             await bot.delete_webhook()
 
         me = await bot.get_me()
+        app.state.main_bot_username = me.username or MAIN_BOT_USERNAME
 
         logger.info(
             "Main Telegram bot connected: @%s",
@@ -232,7 +238,9 @@ class ApiBodySizeLimitMiddleware:
 
     async def __call__(self, scope, receive, send):
         path = scope.get("path", "")
-        if scope.get("type") != "http" or not path.startswith("/api/v1/"):
+        if scope.get("type") != "http" or not (
+            path.startswith("/api/v1/") or path.startswith("/miniapp/api/")
+        ):
             await self.app(scope, receive, send)
             return
 
@@ -354,7 +362,8 @@ async def api_validation_error(request: Request, exc: RequestValidationError):
 @app.middleware("http")
 async def request_logger(request: Request, call_next):
 
-    if request.url.path.startswith("/api/v1/") and await asyncio.to_thread(is_maintenance_enabled):
+    commerce_api = request.url.path.startswith(("/api/v1/", "/miniapp/api/"))
+    if commerce_api and await asyncio.to_thread(is_maintenance_enabled):
         return JSONResponse(
             status_code=503,
             content={
@@ -467,6 +476,24 @@ async def health():
 app.include_router(
     reseller_router,
 )
+app.include_router(miniapp_router)
+
+MINI_APP_DIRECTORY = Path(__file__).resolve().parent / "miniapp"
+app.mount(
+    "/miniapp/assets",
+    StaticFiles(directory=MINI_APP_DIRECTORY / "assets"),
+    name="rain-deals-miniapp-assets",
+)
+
+
+@app.get("/miniapp", include_in_schema=False)
+async def miniapp_index_redirect():
+    return FileResponse(MINI_APP_DIRECTORY / "index.html", media_type="text/html; charset=utf-8")
+
+
+@app.get("/miniapp/", include_in_schema=False)
+async def miniapp_index():
+    return FileResponse(MINI_APP_DIRECTORY / "index.html", media_type="text/html; charset=utf-8")
 
 
 # ============================================================

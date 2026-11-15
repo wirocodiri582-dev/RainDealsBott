@@ -141,6 +141,7 @@ def _quote(db, user_id):
         ).encode('utf-8')).hexdigest()
         lines.append(dict(product_id=item.product_id, name=product.name if product else 'Removed product',
                           quantity=item.quantity, revision=item.revision, total=str(_money(price*item.quantity)),
+                          required_info=requirements if isinstance(requirements, list) else [],
                           source=getattr(product, 'source', 'own'),
                           delivery_mode=(plan.order_mode if plan else settings['effective_delivery_type']),
                           automatic_quantity=(plan.automatic_quantity if plan else item.quantity if product and product.source == 'reseller' else 0),
@@ -299,7 +300,7 @@ def resolve_hold(admin_id,token,order_id,note):
                               summary=json.dumps({'order_id':order_id,'provider_investigation':note})))
 
 
-async def checkout(user_id,token,bot_id):
+async def checkout(user_id,token,bot_id,buyer_info_by_product=None):
     from handlers.products import _do_purchase, _do_reseller_purchase, _get_purchase_lock
     from services.checkout_actions import claim_checkout, finish_checkout
     from services.notification_outbox import enqueue_admin
@@ -308,6 +309,7 @@ async def checkout(user_id,token,bot_id):
         lines = await asyncio.to_thread(claim,user_id,token)
         if lines is None:
             return await asyncio.to_thread(result,user_id,token)
+        buyer_info_by_product = buyer_info_by_product or {}
         async def heartbeat():
             while True:
                 await asyncio.sleep(45)
@@ -328,10 +330,18 @@ async def checkout(user_id,token,bot_id):
                     outcome = {'duplicate_order_id':claimed['order_id']} if claimed.get('order_id') else {'needs_review':True}
                 else:
                     try:
+                        buyer_info = buyer_info_by_product.get(str(line['product_id']), {})
                         if line['source']=='reseller':
-                            outcome = await _do_reseller_purchase(user_id,line['product_id'],line['quantity'],checkout_key=key,expected_total=line['total'])
+                            outcome = await _do_reseller_purchase(
+                                user_id, line['product_id'], line['quantity'], checkout_key=key,
+                                expected_total=line['total'], buyer_info=buyer_info,
+                                require_buyer_info=bool(line.get('required_info')),
+                            )
                         else:
-                            outcome = await asyncio.to_thread(_do_purchase,user_id,line['product_id'],line['quantity'],None,key,line['total'])
+                            outcome = await asyncio.to_thread(
+                                _do_purchase, user_id, line['product_id'], line['quantity'], None,
+                                key, line['total'], buyer_info, bool(line.get('required_info')),
+                            )
                     except Exception:
                         outcome = {'needs_review':True}
                     await asyncio.to_thread(finish_checkout,key,outcome)

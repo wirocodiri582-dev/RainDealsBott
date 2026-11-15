@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f3f6fc">
+  <meta name="description" content="Browse the RainDeals digital store in Telegram.">
+  <title>RainDeals Store</title>
+  <link rel="stylesheet" href="/miniapp/assets/styles.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script defer src="/miniapp/assets/app.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#store" aria-label="RainDeals home">
+        <span class="brand-mark">R</span>
+        <span><strong>RAIN<span>DEALS</span></strong><small>digital store</small></span>
+      </a>
+      <div class="top-actions">
+        <button class="icon-button" id="notify-open" aria-label="Notifications">🔔<i id="notify-dot" class="dot hidden"></i></button>
+        <button class="icon-button bag-button" id="cart-open" aria-label="Shopping cart">🛍️<b id="cart-count" class="count-badge hidden">0</b></button>
+      </div>
+    </header>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="loading" class="loading"><span class="spinner"></span><p>Opening your RainDeals store…</p></div>
+    <div id="auth-error" class="auth-error hidden">
+      <span class="auth-icon">🌧️</span><h1>Open RainDeals in Telegram</h1>
+      <p>This store uses your Telegram account securely. Open the Mini App from the RainDeals bot to continue.</p>
+      <button class="primary-button" id="open-bot">Open Telegram bot</button>
+    </div>
+
+    <main id="main" class="main-content hidden">
+      <section id="store-view" class="view active">
+        <div class="welcome-row">
+          <div><p class="eyebrow" id="greeting">WELCOME TO RAINDEALS</p><h1>What are we<br>getting today?</h1></div>
+          <button class="balance-chip" data-view="balance" aria-label="Open balance"><span>◉</span><small>Balance</small><strong id="balance-mini">$0</strong></button>
+        </div>
+
+        <div class="search-row">
+          <label class="search-box"><span>⌕</span><input id="search" type="search" placeholder="Search products" autocomplete="off"><button id="clear-search" aria-label="Clear search" class="clear-search hidden">×</button></label>
+          <button id="stock-toggle" class="filter-chip" aria-pressed="false">✓ <span>In stock</span></button>
+          <button id="sort-toggle" class="square-button" aria-label="Change sort order">☷</button>
+        </div>
+
+        <div class="category-strip" id="categories" aria-label="Product categories"></div>
+        <div class="section-heading"><div><p class="eyebrow">CURATED FOR YOU</p><h2 id="catalog-title">All products</h2></div><span id="catalog-count" class="muted-count"></span></div>
+        <div id="product-grid" class="product-grid"></div>
+        <div id="empty-state" class="empty-state hidden"><span>🔎</span><strong>No products found</strong><p>Try another search or category.</p></div>
+        <div class="store-footer"><span>🌧️</span> RainDeals · Quality digital products at great rates</div>
+      </section>
+
+      <section id="balance-view" class="view"></section>
+      <section id="api-view" class="view"></section>
+      <section id="profile-view" class="view"></section>
+      <section id="orders-view" class="view"></section>
+      <section id="notifications-view" class="view"></section>
+    </main>
+
+    <nav id="bottom-nav" class="bottom-nav hidden" aria-label="Main navigation">
+      <button class="nav-item active" data-view="store"><span>▦</span><small>Store</small></button>
+      <button class="nav-item" data-view="balance"><span>▤</span><small>Balance</small></button>
+      <button class="nav-item" data-view="api"><span>⌘</span><small>API</small></button>
+      <button class="nav-item" data-view="profile"><span>♙</span><small>Profile</small></button>
+    </nav>
+  </div>
+
+  <div id="modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-backdrop" data-close-modal></div>
+    <section class="modal-sheet"><div class="sheet-handle"></div><button class="modal-close" data-close-modal aria-label="Close">×</button><div id="modal-content"></div></section>
+  </div>
+</body>
+</html>
