@@ -11,7 +11,7 @@ const tables = {
   custom_rates: {fields:'telegram_id,product_id,price,is_active',required:['telegram_id','price'],read:true},
   users: {fields:'is_banned',read:true}, orders:{fields:'',read:true}, deposits:{fields:'',read:true},
   tickets:{fields:'status,priority,admin_response',read:true}, api_keys:{fields:'is_active',read:true},
-  api_orders:{fields:'',read:true}, referrals:{fields:'',read:true},
+  api_orders:{fields:'',read:true}, referrals:{fields:'',read:true}, vendor_offers:{fields:'',read:true},
   manager_audit:{table:'raindeals_web_manager_audit',fields:'',read:true},
   product_rate_controls:{fields:'is_active',read:true}, rate_control_assignments:{fields:'is_active',read:true}
 };
@@ -25,7 +25,8 @@ const responseFields={
  deposits:'id,telegram_id,user_id,amount,currency,network,status,txid,payment_method,created_at,updated_at,verified_at',
  tickets:'id,telegram_id,user_id,subject,status,priority,admin_response,created_at,updated_at',
  api_keys:'id,telegram_id,name,key_prefix,is_active,created_at,last_used_at',
- api_orders:'id,telegram_id,user_id,product_id,product_name,quantity,amount,status,created_at,updated_at',
+  api_orders:'id,telegram_id,user_id,product_id,product_name,quantity,amount,status,created_at,updated_at',
+  vendor_offers:'id,request_id,telegram_id,product_name,offer_description,delivery_instructions,payout_method,status,approved_amount,admin_id,admin_note,payout_reference,created_at,updated_at,paid_at',
  referrals:'id,referrer_id,referred_id,commission,created_at',
  product_rate_controls:'id,product_id,telegram_id,rate,is_active,created_at',
  rate_control_assignments:'id,control_id,telegram_id,is_active,created_at',
@@ -85,12 +86,45 @@ async function session(request,env){const raw=/rd_manager=([a-f0-9]{64})/.exec(r
 async function body(request){if(Number(request.headers.get('content-length')||0)>1000000)error('Upload is limited to 1 MB.',413);const raw=await request.text();if(raw.length>1000000)error('Upload is limited to 1 MB.',413);try{return JSON.parse(raw);}catch{error('Invalid JSON request.');}}
 async function throttleLogin(request,env){const bucket=await hash(request.headers.get('cf-connecting-ip')||'unknown');await db(env,"INSERT INTO raindeals_web_manager_attempts VALUES (?,1,DATE_ADD(UTC_TIMESTAMP(),INTERVAL 1 MINUTE)) ON DUPLICATE KEY UPDATE attempts=IF(expires_at<UTC_TIMESTAMP(),1,attempts+1),expires_at=IF(expires_at<UTC_TIMESTAMP(),DATE_ADD(UTC_TIMESTAMP(),INTERVAL 1 MINUTE),expires_at)",[bucket]);const row=(await rows(env,'SELECT attempts FROM raindeals_web_manager_attempts WHERE bucket=?',[bucket]))[0];if(Number(row?.attempts)>5)error('Too many login attempts. Wait one minute.',429)}
 async function audit(env,adminId,action,targetType,targetId,details={}){await db(env,'INSERT INTO raindeals_web_manager_audit (admin_id,action,target_type,target_id,details,created_at) VALUES (?,?,?,?,?,UTC_TIMESTAMP(6))',[adminId,action,targetType,targetId==null?null:String(targetId),JSON.stringify(details).slice(0,4000)])}
+let vendorSchemaPromise;
+async function ensureVendorSchema(env){
+  if(!vendorSchemaPromise)vendorSchemaPromise=(async()=>{
+    await db(env,"CREATE TABLE IF NOT EXISTS bot_vendor_offers (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,request_id INT NULL,telegram_id BIGINT NOT NULL,bot_id BIGINT NOT NULL,product_name VARCHAR(120) NOT NULL,offer_description TEXT NOT NULL,delivery_instructions TEXT NOT NULL,supply_ciphertext TEXT NOT NULL,payout_method VARCHAR(24) NOT NULL,payout_ciphertext TEXT NULL,status VARCHAR(20) NOT NULL DEFAULT 'submitted',approved_amount DECIMAL(20,8) NULL,admin_id BIGINT NULL,admin_note TEXT NULL,payout_reference VARCHAR(255) NULL,created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,paid_at DATETIME NULL,KEY ix_vendor_offer_queue(status,id),KEY ix_vendor_offer_owner(telegram_id,id),KEY ix_bot_vendor_offers_request_id(request_id))");
+    await db(env,"CREATE TABLE IF NOT EXISTS bot_vendor_requests (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,admin_id BIGINT NOT NULL,bot_id BIGINT NOT NULL,product_name VARCHAR(120) NOT NULL,requested_details TEXT NOT NULL,delivery_requirements TEXT NOT NULL,status VARCHAR(20) NOT NULL DEFAULT 'open',created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,KEY ix_vendor_request_status(status,id))");
+    await db(env,"CREATE TABLE IF NOT EXISTS bot_wallet_entries (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,telegram_id BIGINT NOT NULL,event_key VARCHAR(100) NOT NULL UNIQUE,label VARCHAR(200) NOT NULL,amount DECIMAL(20,8) NOT NULL,balance DECIMAL(20,8) NOT NULL,created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,KEY ix_wallet_entries_telegram_id(telegram_id,id))");
+    const cols=(await rows(env,'SHOW COLUMNS FROM bot_vendor_offers')).map(x=>x.Field);
+    if(!cols.includes('request_id'))await db(env,'ALTER TABLE bot_vendor_offers ADD COLUMN request_id INT NULL');
+    const indexes=await rows(env,'SHOW INDEX FROM bot_vendor_offers');
+    if(!indexes.some(x=>x.Key_name==='ix_bot_vendor_offers_request_id'))await db(env,'CREATE INDEX ix_bot_vendor_offers_request_id ON bot_vendor_offers(request_id)');
+  })().catch(e=>{vendorSchemaPromise=null;throw e});
+  await vendorSchemaPromise;
+}
+function base64urlBytes(value){const raw=atob(String(value).replace(/-/g,'+').replace(/_/g,'/'));return Uint8Array.from(raw,c=>c.charCodeAt(0))}
+function bytesToHex(value){return Array.from(value,b=>b.toString(16).padStart(2,'0')).join('')}
+async function decryptVendorCiphertext(env,token){
+  const secret=String(env.VENDOR_DATA_ENCRYPTION_KEY||env.SESSION_RESUME_ENCRYPTION_KEY||env.API_KEY_ENCRYPTION_KEY||'');
+  if(!secret)error('Configure VENDOR_DATA_ENCRYPTION_KEY on the Manager Worker to reveal vendor private details.',503);
+  const raw=base64urlBytes(token);if(raw.length<73||raw[0]!==0x80)error('Vendor private data format is invalid.',500);
+  const seed=new Uint8Array(await crypto.subtle.digest('SHA-256',enc.encode('raindeals-vendor-data-v1:'+secret)));
+  const signingKey=await crypto.subtle.importKey('raw',seed.slice(0,16),{name:'HMAC',hash:'SHA-256'},false,['verify']);
+  if(!await crypto.subtle.verify('HMAC',signingKey,raw.slice(-32),raw.slice(0,-32)))error('Vendor private data could not be authenticated. Check the shared encryption key.',503);
+  const encryptionKey=await crypto.subtle.importKey('raw',seed.slice(16),{name:'AES-CBC'},false,['decrypt']);
+  try{return new TextDecoder('utf-8',{fatal:true}).decode(await crypto.subtle.decrypt({name:'AES-CBC',iv:raw.slice(9,25)},encryptionKey,raw.slice(25,-32)))}catch{error('Vendor private data could not be decrypted. Check the shared encryption key.',503)}
+}
+const htmlEscape=value=>String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+function decimalUnits(value){const raw=String(value??'0').trim();if(!/^\d+(?:\.\d{1,8})?$/.test(raw))error('Enter a valid payout amount with up to eight decimals.');const [whole,fraction='']=raw.split('.');return BigInt(whole)*100000000n+BigInt((fraction+'00000000').slice(0,8))}
+function unitsDecimal(units){const whole=units/100000000n,fraction=String(units%100000000n).padStart(8,'0');return `${whole}.${fraction}`}
+function signedUnitsDecimal(units){return units<0n?`-${unitsDecimal(-units)}`:unitsDecimal(units)}
+async function queueVendorNotice(t,offer,suffix,body){
+  const chat=String(offer.telegram_id),event=`vendor-offer:${offer.id}:${suffix}`,key=await hash(`${offer.bot_id}:${event}:${chat}`);
+  await t.execute("INSERT IGNORE INTO bot_notification_jobs (event_key,bot_id,chat_id,body,reply_markup,category,status,attempts,next_attempt_at,created_at) VALUES (?,?,?, ?,NULL,'provider','queued',0,UTC_TIMESTAMP(),UTC_TIMESTAMP())",[key,offer.bot_id,chat,body]);
+}
 async function assertLoginUnlocked(env){const row=(await rows(env,'SELECT locked_until FROM raindeals_web_manager_login_lockouts WHERE lock_id=1 AND locked_until>UTC_TIMESTAMP()'))[0];if(row)error('Manager login is locked by /kill. Try again after the five-minute lock expires.',423)}
 async function assertLoginUnlockedTx(t){const row=(await t.execute('SELECT lock_id FROM raindeals_web_manager_login_lockouts WHERE lock_id=1 AND locked_until>UTC_TIMESTAMP() FOR UPDATE')).rows?.[0];if(row)error('Manager login is locked by /kill. Try again after the five-minute lock expires.',423)}
 const ownerIds=env=>new Set(String(env.MANAGER_ADMIN_IDS||'').split(',').map(x=>x.trim()).filter(x=>/^\d{1,20}$/.test(x)));
-const managerSections=['dashboard','products','orders','deposits','users','tickets','promocodes','custom_rates','api_keys','api_orders','referrals','product_rate_controls','rate_control_assignments','manager_audit','settings'];
-const writableSections=['products','orders','tickets','promocodes','custom_rates','api_keys','product_rate_controls','rate_control_assignments','settings'];
-const managerCapabilities=[...writableSections.map(x=>x+'_write'),'orders_export','orders_alerts','delivery_ids','delivery_secrets'];
+const managerSections=['dashboard','products','orders','deposits','users','tickets','promocodes','custom_rates','api_keys','api_orders','referrals','vendor_offers','product_rate_controls','rate_control_assignments','manager_audit','settings'];
+const writableSections=['products','orders','tickets','promocodes','custom_rates','api_keys','vendor_offers','product_rate_controls','rate_control_assignments','settings'];
+const managerCapabilities=[...writableSections.map(x=>x+'_write'),'orders_export','orders_alerts','delivery_ids','delivery_secrets','vendor_offer_secrets'];
 function jsonValue(value,fallback){if(typeof value==='string'){try{return JSON.parse(value)}catch{return fallback}}return value??fallback}
 async function optionalRows(env,sql,args=[]){try{return await rows(env,sql,args)}catch(e){if(/1146|doesn't exist/i.test(String(e?.message||e)))return[];throw e}}
 async function managerAdmin(env,id){
@@ -101,6 +135,8 @@ async function managerAdmin(env,id){
 }
 function hasPermission(admin,permission){return Number(admin?.is_owner)===1||admin?.permissions?.includes('*')||admin?.permissions?.includes(permission)}
 function requiredPermission(path){
+  if(/^\/manage\/vendor_offers\/\d+\/private$/.test(path))return'vendor_offer_secrets';
+  if(path==='/manage/vendor_offers'||path.startsWith('/manage/vendor_offers/'))return'vendor_offers';
   if(path==='/manage/claims'||path.startsWith('/manage/claims/'))return'orders';
   if(path==='/manage/me')return null;
   if(path==='/manage/admins'||path.startsWith('/manage/admins/'))return'admins';
@@ -266,8 +302,57 @@ async function notifyCompletedOrder(env,orderId,recipientId,adminId){
     const response=await env.API.fetch(new Request('https://internal/internal/delivery',{method:'POST',headers:{'content-type':'application/json','x-delivery-bridge-secret':env.DELIVERY_BRIDGE_SECRET},body:JSON.stringify({order_id:Number(orderId),recipient_id:String(recipientId),admin_id:String(adminId)})}));
     const payload=await response.json().catch(()=>({}));
     if(!response.ok||payload.success!==true)return{status:'failed',message:String(payload.message||payload.detail?.message||payload.error||`Delivery Worker returned HTTP ${response.status}.`)};
-    return{status:String(payload.status||'queued'),message:payload.status==='waiting_for_start'?'Order is fulfilled. The recipient must start the Delivery Bot; it will send the queued delivery then.':payload.status==='already_sent'?'Delivery was already sent; no duplicate message was sent.':payload.status==='sent'?'Order fulfilled and delivery sent through Telegram.':'Order fulfilled and delivery queued.'};
+    const deliveryStatus=String(payload.status||'').toLowerCase();if(!['sent','already_sent','queued','waiting_for_start'].includes(deliveryStatus))return{status:'failed',message:'Delivery Worker did not return a recognized delivery state. The order remains pending; check its status before retrying.'};
+    return{status:deliveryStatus,message:deliveryStatus==='waiting_for_start'?'Delivery is saved and waiting for the recipient to start the Delivery Bot. The order remains pending.':deliveryStatus==='already_sent'?'Delivery Worker confirmed this delivery was already sent; no duplicate message was sent.':deliveryStatus==='sent'?'Delivery Worker confirmed the Telegram send.':'Delivery is queued; the order remains pending until Telegram delivery is confirmed.'};
   }catch(e){return{status:'failed',message:String(e?.message||'Could not reach the delivery service.')}}
+}
+async function finalizeBridgeDelivery(env,orderId,adminId,bridgeStatus){
+  const normalized=String(bridgeStatus||'').toLowerCase(),confirmed=['sent','already_sent'].includes(normalized),waiting=['queued','waiting_for_start'].includes(normalized);
+  if(!confirmed&&!waiting)return{completed:false,status:normalized||'unknown'};
+  const orderColumns=await columnsFor(env,'orders'),hasTimeline=(await rows(env,"SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='order_events' LIMIT 1")).length>0;
+  return tx(env,async t=>{
+    const order=(await t.execute('SELECT id,telegram_id,amount,status,refunded,is_preorder,referral_commission_amount,referral_commission_to_balance FROM orders WHERE id=? FOR UPDATE',[orderId])).rows?.[0];
+    if(!order)error('Order not found while confirming delivery.',404);
+    if(Number(order.refunded)||String(order.status)==='refunded')error('The order was refunded before delivery confirmation; review the delivery job before taking further action.',409);
+    if(waiting){
+      const updates=["status='delivery_pending'"];if(String(order.status)==='completed'&&orderColumns.includes('coverage_started_at'))updates.push('coverage_started_at=NULL');if(String(order.status)==='completed'&&orderColumns.includes('warranty_expires_at'))updates.push('warranty_expires_at=NULL');if(String(order.status)==='completed'&&orderColumns.includes('subscription_expires_at'))updates.push('subscription_expires_at=NULL');if(orderColumns.includes('updated_at'))updates.push('updated_at=UTC_TIMESTAMP()');
+      if(String(order.status)==='completed')await t.execute('UPDATE orders SET '+updates.join(',')+' WHERE id=?',[orderId]);
+      if(hasTimeline&&String(order.status)==='completed')await t.execute("INSERT INTO order_events (order_id,kind,actor_id,summary,customer_visible,created_at) VALUES (?,? ,?,'Delivery Worker reports that the recipient has not received the delivery yet.',1,UTC_TIMESTAMP())",[orderId,normalized==='waiting_for_start'?'delivery_waiting_for_start':'delivery_queued',adminId]);
+      return{completed:false,status:normalized};
+    }
+    const alreadyCompleted=String(order.status)==='completed';
+    if(!alreadyCompleted&&String(order.status)!=='delivery_pending')error('Order is no longer waiting for delivery confirmation.',409);
+    const updates=["status='completed'",'is_preorder=0'];
+    if(orderColumns.includes('manual_pending_quantity'))updates.push('manual_pending_quantity=0');
+    if(orderColumns.includes('coverage_started_at'))updates.push("coverage_started_at=CASE WHEN COALESCE(aftercare_policy,'')<>'skip' AND coverage_started_at IS NULL THEN UTC_TIMESTAMP() ELSE coverage_started_at END");
+    if(orderColumns.includes('subscription_expires_at'))updates.push('subscription_expires_at=CASE WHEN term_days>0 AND subscription_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL term_days DAY) ELSE subscription_expires_at END');
+    if(orderColumns.includes('warranty_expires_at'))updates.push('warranty_expires_at=CASE WHEN warranty_days>0 AND warranty_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL warranty_days DAY) ELSE warranty_expires_at END');
+    if(orderColumns.includes('updated_at'))updates.push('updated_at=UTC_TIMESTAMP()');
+    if(!alreadyCompleted)await t.execute('UPDATE orders SET '+updates.join(',')+' WHERE id=?',[orderId]);
+    let commission=null;
+    if(Number(order.is_preorder)){
+      const buyer=(await t.execute('SELECT referred_by FROM users WHERE telegram_id=? FOR UPDATE',[order.telegram_id])).rows?.[0],referrerId=String(buyer?.referred_by||'');
+      const referrer=referrerId?(await t.execute('SELECT telegram_id FROM users WHERE telegram_id=? FOR UPDATE',[referrerId])).rows?.[0]:null;
+      if(referrer){
+        const alreadyRecorded=order.referral_commission_amount!=null&&Number(order.referral_commission_amount)>0;
+        if(!alreadyRecorded){
+          const rateText=String(env.REFERRAL_COMMISSION_RATE||'0.05'),rate=Number(rateText);
+          if(Number.isFinite(rate)&&rate>0&&rate<=1){
+            const amount=(await t.execute('SELECT CAST(ROUND(? * ?,8) AS CHAR) AS amount',[String(order.amount||'0'),rateText])).rows?.[0]?.amount||'0';
+            const credit=!['0','false','no','off'].includes(String(env.REFERRAL_CREDIT_TO_BALANCE??'true').toLowerCase());
+            await t.execute(credit?'UPDATE users SET referral_earnings=ROUND(COALESCE(referral_earnings,0)+?,8),balance=ROUND(COALESCE(balance,0)+?,8) WHERE telegram_id=?':'UPDATE users SET referral_earnings=ROUND(COALESCE(referral_earnings,0)+?,8) WHERE telegram_id=?',credit?[amount,amount,referrerId]:[amount,referrerId]);
+            const saved=[];if(orderColumns.includes('referral_commission_amount'))saved.push('referral_commission_amount=?');if(orderColumns.includes('referral_commission_to_balance'))saved.push('referral_commission_to_balance=?');
+            if(saved.length)await t.execute('UPDATE orders SET '+saved.join(',')+' WHERE id=?',[...(orderColumns.includes('referral_commission_amount')?[amount]:[]),...(orderColumns.includes('referral_commission_to_balance')?[credit?1:0]:[]),orderId]);
+            commission={referrer_telegram_id:referrerId,amount,credited_to_balance:credit};
+          }
+        }
+      }
+    }
+    if(alreadyCompleted)await t.execute('UPDATE orders SET is_preorder=0'+(orderColumns.includes('updated_at')?',updated_at=UTC_TIMESTAMP()':'')+' WHERE id=?',[orderId]);
+    if(hasTimeline&&!alreadyCompleted)await t.execute("INSERT INTO order_events (order_id,kind,actor_id,summary,customer_visible,created_at) VALUES (?,'completed',?,'Delivery Worker confirmed the Telegram send.',1,UTC_TIMESTAMP())",[orderId,adminId]);
+    if(!alreadyCompleted)await t.execute("INSERT INTO raindeals_web_manager_audit (admin_id,action,target_type,target_id,details,created_at) VALUES (?,'delivery_confirmed','order',?,?,UTC_TIMESTAMP(6))",[adminId,String(orderId),JSON.stringify({bridge_status:normalized,preorder_commission:commission})]);
+    return{completed:true,already_completed:alreadyCompleted,commission};
+  });
 }
 async function route(request,env){
   const url=new URL(request.url),path=url.pathname;
@@ -312,11 +397,15 @@ async function route(request,env){
   if(path==='/'&&request.method==='GET')return page(auth.csrf);
   if(path==='/manage/status'&&request.method==='GET')return reply(await status(env));
   if(path==='/manage/me'&&request.method==='GET')return reply({telegram_id:String(currentAdmin.telegram_id),display_name:currentAdmin.display_name,role_key:currentAdmin.role_key,is_owner:Number(currentAdmin.is_owner)===1,permissions:currentAdmin.permissions});
+  if(path==='/manage/products/categories'&&request.method==='GET'){
+    const found=await rows(env,"SELECT DISTINCT TRIM(category) AS category FROM products WHERE category IS NOT NULL AND TRIM(category)<>'' ORDER BY category LIMIT 500");
+    return reply({categories:found.map(row=>String(row.category||'').trim()).filter(Boolean)});
+  }
   const customerResponse=await customerToolsRoute(request,env,url,auth,currentAdmin,{reply,tx,hasPermission,body});
   if(customerResponse)return customerResponse;
   const claimResponse=await claimsRoute(request,env,url,auth,currentAdmin,{reply,tx,hasPermission,body});
   if(claimResponse)return claimResponse;
-  if(path.startsWith('/manage/products')||/^\/manage\/orders\/(?:\d+\/fulfill|bulk-fulfill)$/.test(path))await requireAftercareSchema(env);
+  if(path.startsWith('/manage/products')||/^\/manage\/orders\/(?:\d+\/(?:fulfill|notify)|bulk-fulfill)$/.test(path))await requireAftercareSchema(env);
   if(path==='/manage/admins'&&request.method==='GET'){
     if(Number(currentAdmin.is_owner)!==1)error('Only an owner can manage admin roles.',403);
     const found=await rows(env,'SELECT telegram_id,display_name,role_key,permissions_json,is_active,is_owner,created_at,updated_at FROM raindeals_web_manager_admins ORDER BY is_owner DESC,created_at ASC');
@@ -339,7 +428,7 @@ async function route(request,env){
     if(!/^[a-z][a-z0-9_-]{1,31}$/.test(role))error('Role name must be 2–32 letters, numbers, _ or -.');
     if(!Array.isArray(b.permissions)||!b.permissions.length)error('Select at least one permission.');
     const permissions=[...new Set(b.permissions.map(String))];for(const p of permissions)if(!managerSections.includes(p)&&!managerCapabilities.includes(p))error('Unknown permission: '+p);
-    for(const p of permissions){if(p.endsWith('_write')&&!permissions.includes(p.slice(0,-6)))error('Grant the section before its edit permission.');if(['orders_export','orders_alerts','delivery_ids','delivery_secrets'].includes(p)&&!permissions.includes('orders'))error('Grant Orders before its special actions.');}
+    for(const p of permissions){if(p.endsWith('_write')&&!permissions.includes(p.slice(0,-6)))error('Grant the section before its edit permission.');if(['orders_export','orders_alerts','delivery_ids','delivery_secrets'].includes(p)&&!permissions.includes('orders'))error('Grant Orders before its special actions.');if(p==='vendor_offer_secrets'&&!permissions.includes('vendor_offers'))error('Grant Vendor offers before private vendor details.');}
     await db(env,'INSERT INTO raindeals_web_manager_admins (telegram_id,display_name,role_key,permissions_json,is_active,is_owner,added_by,created_at,updated_at) VALUES (?,?,?,?,1,0,?,UTC_TIMESTAMP(6),UTC_TIMESTAMP(6)) ON DUPLICATE KEY UPDATE display_name=VALUES(display_name),role_key=VALUES(role_key),permissions_json=VALUES(permissions_json),is_active=1,updated_at=UTC_TIMESTAMP(6)',[telegramId,displayName,role,JSON.stringify(permissions),auth.admin_id]);
     await audit(env,auth.admin_id,target?'update':'create','manager_admin',telegramId,{role_key:role,permissions});return reply({success:true,message:'Admin role saved. The Telegram ID can now verify sign-ins.'});
   }
@@ -375,11 +464,12 @@ async function route(request,env){
     const submission=submissions[0],job=jobs[0]||null;
     let deliveredIdentifiers=[];
     if(hasPermission(currentAdmin,'delivery_ids')){const content=(await rows(env,'SELECT delivered_account FROM orders WHERE id=?',[id]))[0]?.delivered_account;deliveredIdentifiers=String(content||'').split(/\r?\n/).map(x=>x.trim()).filter(x=>/^[^:\s]{1,256}:.+$/.test(x)).map(x=>x.slice(0,x.indexOf(':')))}
-    const history=webHistory.map(r=>{const detail=jsonValue(r.details,{});return{admin_id:String(r.admin_id),admin_name:r.display_name||'',action:r.action,at:r.created_at,source:'Manager Web',session_started_at:detail.session_started_at||null,summary:r.action==='fulfill'?'Order fulfilled using '+(detail.mode==='inventory'?'uploaded stock':'entered delivery details'):r.action==='edit_delivery'?'Saved delivery details corrected; no Telegram resend':r.action==='retry_delivery'?'Delivery checked / retried':''}}).concat(botHistory.map(r=>({admin_id:String(r.admin_telegram_id),action:r.action,at:r.created_at,source:'Telegram bot',summary:r.summary}))).sort((a,b)=>String(b.at).localeCompare(String(a.at)));
+    const history=webHistory.map(r=>{const detail=jsonValue(r.details,{});return{admin_id:String(r.admin_id),admin_name:r.display_name||'',action:r.action,at:r.created_at,source:'Manager Web',session_started_at:detail.session_started_at||null,summary:r.action==='fulfill'?'Order fulfilled using '+(detail.mode==='inventory'?'uploaded stock':'entered delivery details'):r.action==='reserve_delivery'?'Stock reserved and sent to the Delivery Worker':r.action==='delivery_confirmed'?'Delivery Worker confirmed Telegram delivery':r.action==='bulk_inventory_reserve'?'Inventory reserved for bulk delivery':r.action==='edit_delivery'?'Saved delivery details corrected; no Telegram resend':r.action==='retry_delivery'?'Delivery checked / retried':''}}).concat(botHistory.map(r=>({admin_id:String(r.admin_telegram_id),action:r.action,at:r.created_at,source:'Telegram bot',summary:r.summary}))).sort((a,b)=>String(b.at).localeCompare(String(a.at)));
     const canWrite=hasPermission(currentAdmin,'orders_write'),completed=String(order.status).toLowerCase()==='completed';
     const claim=(await optionalRows(env,'SELECT status,request_type FROM bot_warranty_requests WHERE order_id=? LIMIT 1',[id]))[0];
     const cancellation=(await optionalRows(env,'SELECT reason,status,resolution,admin_id,created_at FROM bot_cancellation_requests WHERE order_id=?',[id]))[0]||null;
-    return reply({order,cancellation,aftercare:{policy:aftercarePolicy(order),claim_status:claim?.status||null},submitted_details:{status:submission?'submitted':Array.isArray(requirements)&&requirements.length?'awaiting_customer':'not_required',submitted_by:submission?String(submission.telegram_id):null,submitted_at:submission?.submitted_at||null,fields:jsonValue(submission?.values,{}),requirements},delivery:job,delivered_identifiers:deliveredIdentifiers,history,operator_session:sessionInfo[0]||null,can_edit_delivery:canWrite&&hasPermission(currentAdmin,'delivery_secrets')&&completed&&!Number(order.refunded)&&!['queued','sending','uncertain'].includes(job?.status),can_retry_delivery:canWrite&&completed&&Number(order.has_delivery)===1&&!Number(order.refunded)&&['manual','hybrid'].includes(order.delivery_type)&&(!job||['failed','queued'].includes(job.status))});
+    const retryable=['completed','delivery_pending'].includes(String(order.status||'').toLowerCase());
+    return reply({order,cancellation,aftercare:{policy:aftercarePolicy(order),claim_status:claim?.status||null},submitted_details:{status:submission?'submitted':Array.isArray(requirements)&&requirements.length?'awaiting_customer':'not_required',submitted_by:submission?String(submission.telegram_id):null,submitted_at:submission?.submitted_at||null,fields:jsonValue(submission?.values,{}),requirements},delivery:job,delivered_identifiers:deliveredIdentifiers,history,operator_session:sessionInfo[0]||null,can_edit_delivery:canWrite&&hasPermission(currentAdmin,'delivery_secrets')&&completed&&!Number(order.refunded)&&!['queued','sending','uncertain'].includes(job?.status),can_retry_delivery:canWrite&&retryable&&Number(order.has_delivery)===1&&!Number(order.refunded)&&['manual','hybrid'].includes(order.delivery_type)&&(!job||['failed','queued','waiting_for_start','sent'].includes(job.status))});
   }
   const orderContent=path.match(/^\/manage\/orders\/(\d+)\/delivery-content$/);
   if(orderContent){
@@ -431,20 +521,13 @@ async function route(request,env){
         const priorStock=Number(order.stock_deducted_quantity||0),capacityManaged=Number(product.manual_fallback)||String(product.delivery_type)==='manual';
         const reserved=priorStock>0||(order.stock_deducted_quantity==null&&!Number(order.is_preorder)&&capacityManaged),newlyDeducted=reserved?0:quantity;
         if(newlyDeducted)stock=Math.max(0,stock-newlyDeducted);
-        const updates=['delivered_account=?',"status='completed'","is_preorder=0",'delivery_telegram_id=?','manual_pending_quantity=0','automatic_quantity=COALESCE(automatic_quantity,0)+?','stock_deducted_quantity=COALESCE(stock_deducted_quantity,0)+?','assigned_admin_id=COALESCE(assigned_admin_id,?)','assigned_at=COALESCE(assigned_at,UTC_TIMESTAMP())'];
+        const updates=['delivered_account=?',"status='delivery_pending'",'delivery_telegram_id=?','manual_pending_quantity=0','automatic_quantity=COALESCE(automatic_quantity,0)+?','stock_deducted_quantity=COALESCE(stock_deducted_quantity,0)+?','assigned_admin_id=COALESCE(assigned_admin_id,?)','assigned_at=COALESCE(assigned_at,UTC_TIMESTAMP())'];
         const params=[[order.delivered_account,deliveryText].filter(Boolean).join('\n'),recipient,quantity,newlyDeducted,auth.admin_id];
         if(orderColumns.includes('reusable_delivery_quantity')){updates.push('reusable_delivery_quantity=?','reusable_delivery_account=COALESCE(?,reusable_delivery_account)');params.push(Number(order.reusable_delivery_quantity||0)+sharedUsed,sharedUsed?shared:(order.reusable_delivery_account||null));}
-        if(orderColumns.includes('coverage_started_at'))updates.push('coverage_started_at=COALESCE(coverage_started_at,UTC_TIMESTAMP())');
-        if(orderColumns.includes('subscription_expires_at'))updates.push('subscription_expires_at=CASE WHEN term_days>0 AND subscription_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL term_days DAY) ELSE subscription_expires_at END');
-        if(orderColumns.includes('warranty_expires_at'))updates.push('warranty_expires_at=CASE WHEN warranty_days>0 AND warranty_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL warranty_days DAY) ELSE warranty_expires_at END');
         if(orderColumns.includes('updated_at'))updates.push('updated_at=UTC_TIMESTAMP()');
         params.push(order.id);await t.execute('UPDATE orders SET '+updates.join(',')+' WHERE id=?',params);
-        if(hasTimeline)await t.execute("INSERT INTO order_events (order_id,kind,actor_id,summary,customer_visible,created_at) VALUES (?,'completed',?,'Team delivered this order from bulk inventory.',1,UTC_TIMESTAMP())",[order.id,auth.admin_id]);
-        await t.execute('INSERT INTO raindeals_web_manager_audit (admin_id,action,target_type,target_id,details,created_at) VALUES (?,\'bulk_inventory_deliver\',\'order\',?,?,UTC_TIMESTAMP(6))',[auth.admin_id,String(order.id),JSON.stringify({product_id:productId,quantity,stock_used:quantity,recipient_id:recipient})]);
-        if(Number(order.is_preorder)){
-          const buyer=(await t.execute('SELECT referred_by FROM users WHERE telegram_id=? FOR UPDATE',[order.telegram_id])).rows?.[0],referrerId=String(buyer?.referred_by||''),referrer=referrerId?(await t.execute('SELECT telegram_id FROM users WHERE telegram_id=? FOR UPDATE',[referrerId])).rows?.[0]:null,rateText=String(env.REFERRAL_COMMISSION_RATE||'0.05'),rate=Number(rateText);
-          if(referrer&&Number.isFinite(rate)&&rate>0&&rate<=1){const commission=(await t.execute('SELECT CAST(ROUND(? * ?,8) AS CHAR) AS amount',[String(order.amount||'0'),rateText])).rows?.[0]?.amount||'0',credit=!['0','false','no','off'].includes(String(env.REFERRAL_CREDIT_TO_BALANCE??'true').toLowerCase());await t.execute(credit?'UPDATE users SET referral_earnings=ROUND(COALESCE(referral_earnings,0)+?,8),balance=ROUND(COALESCE(balance,0)+?,8) WHERE telegram_id=?':'UPDATE users SET referral_earnings=ROUND(COALESCE(referral_earnings,0)+?,8) WHERE telegram_id=?',credit?[commission,commission,referrerId]:[commission,referrerId]);}
-        }
+        if(hasTimeline)await t.execute("INSERT INTO order_events (order_id,kind,actor_id,summary,customer_visible,created_at) VALUES (?,'delivery_pending',?,'Inventory reserved; waiting for Delivery Worker confirmation.',1,UTC_TIMESTAMP())",[order.id,auth.admin_id]);
+        await t.execute('INSERT INTO raindeals_web_manager_audit (admin_id,action,target_type,target_id,details,created_at) VALUES (?,\'bulk_inventory_reserve\',\'order\',?,?,UTC_TIMESTAMP(6))',[auth.admin_id,String(order.id),JSON.stringify({product_id:productId,quantity,stock_used:quantity,recipient_id:recipient})]);
         done.push({order_id:Number(order.id),recipient,quantity});
       }
       const inventoryTotal=accounts.length+sharedStock;
@@ -455,7 +538,7 @@ async function route(request,env){
       return{done,skipped,remaining_orders:left,remaining_stock:inventoryTotal,product_name:product.name,switched_to_manual:emptyAutomatic};
     });
     const notifications=[];
-    for(const item of batch.done){const n=await notifyCompletedOrder(env,item.order_id,item.recipient,auth.admin_id);notifications.push({order_id:item.order_id,status:n.status,message:n.message});}
+    for(const item of batch.done){const n=await notifyCompletedOrder(env,item.order_id,item.recipient,auth.admin_id);let finalized={completed:false};if(['sent','already_sent','queued','waiting_for_start'].includes(n.status))finalized=await finalizeBridgeDelivery(env,item.order_id,auth.admin_id,n.status);notifications.push({order_id:item.order_id,status:finalized.completed?'completed':n.status,message:finalized.completed?n.message:(n.message+' Retry delivery from the order details after checking its delivery status.')});}
     return reply({success:true,completed:batch.done.length,skipped:batch.skipped,remaining_orders:batch.remaining_orders,remaining_stock:batch.remaining_stock,has_more:batch.done.length>0&&batch.remaining_orders>0&&batch.remaining_stock>0,product_name:batch.product_name,switched_to_manual:batch.switched_to_manual,notifications,message:`Processed ${batch.done.length} order(s).${batch.switched_to_manual?' Inventory is empty, so future orders now enter manual fulfillment.':''}`});
   }
   const fulfillOrder=path.match(/^\/manage\/orders\/(\d+)\/fulfill$/);
@@ -471,7 +554,6 @@ async function route(request,env){
     const splitSelect=['automatic_quantity','manual_pending_quantity','stock_deducted_quantity','assigned_admin_id','aftercare_policy','warranty_days','subscription_days','term_days','reusable_delivery_account','reusable_delivery_quantity'].filter(c=>orderColumns.includes(c)).map(c=>','+c).join('');
     const timelineEnabled=(await rows(env,"SELECT 1 AS present FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='order_events' LIMIT 1")).length>0;
     const orderTimestamp=orderColumns.includes('updated_at')?',updated_at=UTC_TIMESTAMP()':'';
-    const warrantyUpdate=(orderColumns.includes('subscription_expires_at')?",subscription_expires_at=CASE WHEN term_days>0 AND subscription_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL term_days DAY) ELSE subscription_expires_at END":'')+(orderColumns.includes('warranty_days')&&orderColumns.includes('warranty_expires_at')?",warranty_expires_at=CASE WHEN warranty_days>0 AND warranty_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL warranty_days DAY) ELSE warranty_expires_at END":'')+(orderColumns.includes('coverage_started_at')?',coverage_started_at=COALESCE(coverage_started_at,UTC_TIMESTAMP())':'');
     const completed=await tx(env,async t=>{
       const order=(await t.execute('SELECT id,telegram_id,product_id,product_name,amount,quantity,status,delivery_type,is_preorder,refunded,delivery_telegram_id,delivered_account'+splitSelect+' FROM orders WHERE id=? FOR UPDATE',[orderId])).rows?.[0];
       if(!order)error('Order not found.',404);
@@ -518,24 +600,6 @@ async function route(request,env){
       }
       deliveryText=[order.delivered_account,deliveryText].filter(Boolean).join('\n');
       const splitUpdate=orderColumns.includes('manual_pending_quantity')?',manual_pending_quantity=0,automatic_quantity=COALESCE(automatic_quantity,0)+'+stockUsed+((order.stock_deducted_quantity!=null||newlyDeducted)?',stock_deducted_quantity=COALESCE(stock_deducted_quantity,0)+'+newlyDeducted:''):'';
-      let preorderCommission=null;
-      if(Number(order.is_preorder)){
-        const buyer=(await t.execute('SELECT referred_by FROM users WHERE telegram_id=? FOR UPDATE',[order.telegram_id])).rows?.[0];
-        const referrerId=String(buyer?.referred_by||'');
-        const rateText=String(env.REFERRAL_COMMISSION_RATE||'0.05');
-        const rate=Number(rateText);
-        const referrer=referrerId?(await t.execute('SELECT telegram_id FROM users WHERE telegram_id=? FOR UPDATE',[referrerId])).rows?.[0]:null;
-        if(referrer&&Number.isFinite(rate)&&rate>0&&rate<=1){
-          const creditToBalance=!['0','false','no','off'].includes(String(env.REFERRAL_CREDIT_TO_BALANCE??'true').toLowerCase());
-          const commission=(await t.execute('SELECT CAST(ROUND(? * ?,8) AS CHAR) AS amount',[String(order.amount||'0'),rateText])).rows?.[0]?.amount||'0';
-          if(creditToBalance){
-            await t.execute('UPDATE users SET referral_earnings=ROUND(COALESCE(referral_earnings,0)+?,8),balance=ROUND(COALESCE(balance,0)+?,8) WHERE telegram_id=?',[commission,commission,referrerId]);
-          }else{
-            await t.execute('UPDATE users SET referral_earnings=ROUND(COALESCE(referral_earnings,0)+?,8) WHERE telegram_id=?',[commission,referrerId]);
-          }
-          preorderCommission={referrer_telegram_id:referrerId,amount:String(commission),credited_to_balance:creditToBalance};
-        }
-      }
       const assignmentUpdate=orderColumns.includes('assigned_admin_id')?',assigned_admin_id=COALESCE(assigned_admin_id,?)':'';
       const assignmentTime=orderColumns.includes('assigned_at')?',assigned_at=COALESCE(assigned_at,UTC_TIMESTAMP())':'';
       const reusableUpdate=orderColumns.includes('reusable_delivery_quantity')?',reusable_delivery_quantity=?,reusable_delivery_account=COALESCE(?,reusable_delivery_account)':'';
@@ -543,28 +607,30 @@ async function route(request,env){
       if(reusableUpdate)completionParams.push(Number(order.reusable_delivery_quantity||0),order.reusable_delivery_account||null);
       if(assignmentUpdate)completionParams.push(auth.admin_id);
       completionParams.push(orderId);
-      await t.execute("UPDATE orders SET delivered_account=?,status='completed',is_preorder=0,delivery_telegram_id=?"+splitUpdate+reusableUpdate+orderTimestamp+warrantyUpdate+assignmentUpdate+assignmentTime+' WHERE id=?',completionParams);
+      await t.execute("UPDATE orders SET delivered_account=?,status='delivery_pending',delivery_telegram_id=?"+splitUpdate+reusableUpdate+orderTimestamp+assignmentUpdate+assignmentTime+' WHERE id=?',completionParams);
       if(timelineEnabled){
         if(!order.assigned_admin_id)await t.execute("INSERT INTO order_events (order_id,kind,summary,customer_visible,created_at) VALUES (?,'fulfillment_team','Assigned to the fulfillment team.',1,UTC_TIMESTAMP())",[orderId]);
-        await t.execute("INSERT INTO order_events (order_id,kind,actor_id,summary,customer_visible,created_at) VALUES (?,'completed',?,'Team delivery completed.',1,UTC_TIMESTAMP())",[orderId,auth.admin_id]);
+        await t.execute("INSERT INTO order_events (order_id,kind,actor_id,summary,customer_visible,created_at) VALUES (?,'delivery_pending',?,'Delivery details saved; waiting for Delivery Worker confirmation.',1,UTC_TIMESTAMP())",[orderId,auth.admin_id]);
       }
       const sessionInfo=(await t.execute('SELECT created_at FROM raindeals_web_manager_sessions WHERE token_hash=?',[auth.token_hash])).rows?.[0];
-      await t.execute('INSERT INTO raindeals_web_manager_audit (admin_id,action,target_type,target_id,details,created_at) VALUES (?,?,?,?,?,UTC_TIMESTAMP(6))',[auth.admin_id,'fulfill','order',String(orderId),JSON.stringify({mode,stock_used:stockUsed,recipient_id:recipient,preorder_commission:preorderCommission,session_started_at:sessionInfo?.created_at||null})]);
-      return{recipient,stock_used:stockUsed,product_id:order.product_id,preorder_commission:preorderCommission,switched_to_manual:switchedToManual};
+      await t.execute('INSERT INTO raindeals_web_manager_audit (admin_id,action,target_type,target_id,details,created_at) VALUES (?,?,?,?,?,UTC_TIMESTAMP(6))',[auth.admin_id,'reserve_delivery','order',String(orderId),JSON.stringify({mode,stock_used:stockUsed,recipient_id:recipient,session_started_at:sessionInfo?.created_at||null})]);
+      return{recipient,stock_used:stockUsed,product_id:order.product_id,switched_to_manual:switchedToManual};
     });
     const notification=await notifyCompletedOrder(env,orderId,completed.recipient,auth.admin_id);
+    const finalized=['sent','already_sent','queued','waiting_for_start'].includes(notification.status)?await finalizeBridgeDelivery(env,orderId,auth.admin_id,notification.status):{completed:false};
     if(completed.stock_used)await audit(env,auth.admin_id,'consume','product_inventory',completed.product_id,{order_id:String(orderId),count:completed.stock_used});
-    return reply({success:true,order_id:String(orderId),stock_used:completed.stock_used,notification,switched_to_manual:completed.switched_to_manual,message:notification.message+(completed.switched_to_manual?' Inventory is empty, so future orders now enter manual fulfillment.':'')});
+    return reply({success:true,order_id:String(orderId),stock_used:completed.stock_used,status:finalized.completed?'completed':'delivery_pending',notification,switched_to_manual:completed.switched_to_manual,message:notification.message+(finalized.completed?' Order marked completed.':' Order remains pending delivery confirmation.')+(completed.switched_to_manual?' Inventory is empty, so future orders now enter manual fulfillment.':'')});
   }
   const retryOrderDelivery=path.match(/^\/manage\/orders\/(\d+)\/notify$/);
   if(retryOrderDelivery&&request.method==='POST'){
     const orderId=retryOrderDelivery[1],order=(await rows(env,"SELECT id,telegram_id,delivery_telegram_id,status,delivery_type,refunded,delivered_account FROM orders WHERE id=? LIMIT 1",[orderId]))[0];
     if(!order)error('Order not found.',404);
-    if(String(order.status||'').toLowerCase()!=='completed'||Number(order.refunded)||!String(order.delivered_account||'').trim()||!['manual','hybrid'].includes(String(order.delivery_type||'').toLowerCase()))error('Only completed, non-refunded manual or hybrid deliveries can be retried.',409);
+    if(!['completed','delivery_pending'].includes(String(order.status||'').toLowerCase())||Number(order.refunded)||!String(order.delivered_account||'').trim()||!['manual','hybrid'].includes(String(order.delivery_type||'').toLowerCase()))error('Only pending or completed, non-refunded manual or hybrid deliveries can be retried.',409);
     const recipient=String(order.delivery_telegram_id||order.telegram_id||'');if(!/^\d{1,20}$/.test(recipient))error('This order has no valid Telegram delivery destination.',409);
     const notification=await notifyCompletedOrder(env,orderId,recipient,auth.admin_id);
+    const finalized=['sent','already_sent','queued','waiting_for_start'].includes(notification.status)?await finalizeBridgeDelivery(env,orderId,auth.admin_id,notification.status):{completed:String(order.status)==='completed'};
     await audit(env,auth.admin_id,'retry_delivery','order',orderId,{notification_status:notification.status});
-    return reply({success:notification.status!=='failed',order_id:String(orderId),notification,message:notification.message},notification.status==='failed'?502:200);
+    return reply({success:notification.status!=='failed',order_id:String(orderId),status:finalized.completed?'completed':'delivery_pending',notification,message:notification.message+(finalized.completed?' Order marked completed.':' Order remains pending delivery confirmation.')},notification.status==='failed'?502:200);
   }
   const orderIds=path.match(/^\/manage\/orders\/(\d+)\/delivery-ids$/);
   if(orderIds&&request.method==='GET'){
@@ -611,6 +677,90 @@ async function route(request,env){
     await audit(env,auth.admin_id,'update','api_settings','global',{keys:Object.keys(normalized)});return reply({success:true,message:'API settings saved. The API Worker applies changes within a few seconds.'});
   }
   if(path==='/manage/delivery/test'&&request.method==='POST'){const b=await body(request);const r=await env.API.fetch('https://internal/healthz');const j=await r.json();return reply({configured:!!j.delivery_webhook_configured,message:j.delivery_webhook_configured?'Delivery service is configured. Real order sends use the existing delivery webhook. Standalone test-message sending is not configured.':'Delivery bot is not configured.'});}
+  if(path==='/manage/vendor_offers'&&request.method==='GET'){
+    await ensureVendorSchema(env);
+    const pageNumber=Math.max(1,Math.min(100000,Number(url.searchParams.get('page'))||1)),offset=(pageNumber-1)*30,search=(url.searchParams.get('search')||'').trim().slice(0,100);
+    const filter=search?"WHERE CAST(id AS CHAR) LIKE ? OR CAST(telegram_id AS CHAR) LIKE ? OR product_name LIKE ? OR status LIKE ?":"";
+    const args=search?Array(4).fill(`%${search}%`):[];
+    const found=await rows(env,`SELECT id,request_id,telegram_id,product_name,offer_description,delivery_instructions,payout_method,status,approved_amount,admin_id,admin_note,payout_reference,created_at,updated_at,paid_at FROM bot_vendor_offers ${filter} ORDER BY id DESC LIMIT 31 OFFSET ${offset}`,args);
+    return reply({rows:found.slice(0,30),has_more:found.length>30,page:pageNumber,create:false});
+  }
+  const vendorOfferRoute=path.match(/^\/manage\/vendor_offers\/(\d+)(?:\/(private|approve|reject|paid))?$/);
+  if(vendorOfferRoute){
+    await ensureVendorSchema(env);
+    const offerId=vendorOfferRoute[1],action=vendorOfferRoute[2]||'';
+    if(request.method==='GET'&&!action){
+      const offer=(await rows(env,'SELECT id,request_id,telegram_id,bot_id,product_name,offer_description,delivery_instructions,payout_method,status,approved_amount,admin_id,admin_note,payout_reference,created_at,updated_at,paid_at FROM bot_vendor_offers WHERE id=? LIMIT 1',[offerId]))[0];
+      if(!offer)error('Vendor offer was not found.',404);
+      let productRequest=null;if(offer.request_id)productRequest=(await rows(env,'SELECT id,product_name,requested_details,delivery_requirements,status FROM bot_vendor_requests WHERE id=? LIMIT 1',[offer.request_id]))[0]||null;
+      return reply({offer,request:productRequest});
+    }
+    if(request.method==='GET'&&action==='private'){
+      const offer=(await rows(env,'SELECT id,telegram_id,supply_ciphertext,payout_ciphertext FROM bot_vendor_offers WHERE id=? LIMIT 1',[offerId]))[0];
+      if(!offer)error('Vendor offer was not found.',404);
+      const [supplied_data,payout_details]=await Promise.all([decryptVendorCiphertext(env,offer.supply_ciphertext),offer.payout_ciphertext?decryptVendorCiphertext(env,offer.payout_ciphertext):'']);
+      await audit(env,auth.admin_id,'reveal_private','vendor_offer',offerId,{telegram_id:String(offer.telegram_id)});
+      return reply({supplied_data,payout_details});
+    }
+    if(request.method==='POST'&&action==='reject'){
+      const b=await body(request),reason=String(b.reason||'').trim().slice(0,1000);
+      const result=await tx(env,async t=>{
+        const offer=(await t.execute('SELECT id,bot_id,telegram_id,status FROM bot_vendor_offers WHERE id=? FOR UPDATE',[offerId])).rows?.[0];
+        if(!offer)error('Vendor offer was not found.',404);if(offer.status!=='submitted')error('This offer is no longer awaiting review.',409);
+        await t.execute("UPDATE bot_vendor_offers SET status='rejected',admin_id=?,admin_note=?,updated_at=UTC_TIMESTAMP() WHERE id=?",[auth.admin_id,reason||null,offerId]);
+        const body=`Your RainDeals vendor offer #${offerId} was declined.${reason?`\nReason: ${htmlEscape(reason)}`:''}`;
+        await queueVendorNotice(t,{...offer,id:Number(offerId)},'rejected',body);
+        return true;
+      });
+      await audit(env,auth.admin_id,'reject','vendor_offer',offerId,{reason:reason.slice(0,200)});
+      return reply({success:result,message:'Vendor offer declined.'});
+    }
+    if(request.method==='POST'&&action==='approve'){
+      const b=await body(request),amountText=String(b.amount??'').trim(),amountUnits=decimalUnits(amountText);
+      if(amountUnits<=0n||amountUnits>1000000n*100000000n)error('Payout must be greater than zero and no more than 1,000,000 USDT.');
+      const amount=unitsDecimal(amountUnits);
+      const payoutStatus=await tx(env,async t=>{
+        const offer=(await t.execute('SELECT id,request_id,bot_id,telegram_id,payout_method,status FROM bot_vendor_offers WHERE id=? FOR UPDATE',[offerId])).rows?.[0];
+        if(!offer)error('Vendor offer was not found.',404);if(offer.status!=='submitted')error('This offer is no longer awaiting review.',409);
+        let nextStatus='approved';
+        if(offer.payout_method==='internal'){
+          const user=(await t.execute('SELECT balance FROM users WHERE telegram_id=? FOR UPDATE',[offer.telegram_id])).rows?.[0];
+          if(!user)error('The vendor Telegram account was not found; no wallet credit was made.',404);
+          const before=decimalUnits(user.balance||'0'),balance=unitsDecimal(before+amountUnits);
+          const latest=(await t.execute('SELECT balance FROM bot_wallet_entries WHERE telegram_id=? ORDER BY id DESC LIMIT 1 FOR UPDATE',[offer.telegram_id])).rows?.[0];
+          const ledgerBefore=latest?decimalUnits(latest.balance||'0'):0n;
+          if(!latest||ledgerBefore!==before){
+            const reconcileKey=await hash(`raindeals:vendor_offer:${offerId}:wallet_reconcile`);
+            await t.execute('INSERT INTO bot_wallet_entries (telegram_id,event_key,label,amount,balance,created_at) VALUES (?,?,?,?,?,UTC_TIMESTAMP())',[offer.telegram_id,reconcileKey,latest?'External wallet adjustment / reconciliation':'Opening balance',signedUnitsDecimal(before-ledgerBefore),unitsDecimal(before)]);
+          }
+          const eventKey=await hash(`raindeals:vendor_offer:${offerId}:wallet_payout`);
+          await t.execute('INSERT INTO bot_wallet_entries (telegram_id,event_key,label,amount,balance,created_at) VALUES (?,?,?,?,?,UTC_TIMESTAMP())',[offer.telegram_id,eventKey,`Vendor offer #${offerId} payout`,amount,balance]);
+          await t.execute('UPDATE users SET balance=? WHERE telegram_id=?',[balance,offer.telegram_id]);
+          nextStatus='paid';
+        }
+        await t.execute('UPDATE bot_vendor_offers SET status=?,approved_amount=?,admin_id=?,paid_at=IF(?=\'paid\',UTC_TIMESTAMP(),paid_at),updated_at=UTC_TIMESTAMP() WHERE id=?',[nextStatus,amount,auth.admin_id,nextStatus,offerId]);
+        if(offer.request_id)await t.execute("UPDATE bot_vendor_requests SET status='filled',updated_at=UTC_TIMESTAMP() WHERE id=? AND status='open'",[offer.request_id]);
+        const body=nextStatus==='paid'?`✅ Vendor offer #${offerId} was approved. ${amount} USDT was credited to your RainDeals wallet.`:`✅ Vendor offer #${offerId} was approved for ${amount} USDT. The external payout is being arranged by the admin team.`;
+        await queueVendorNotice(t,{...offer,id:Number(offerId)},nextStatus,body);
+        return nextStatus;
+      });
+      await audit(env,auth.admin_id,'approve','vendor_offer',offerId,{amount,payout_status:payoutStatus});
+      return reply({success:true,status:payoutStatus,message:payoutStatus==='paid'?'Approved and credited to the vendor RainDeals wallet.':'Offer approved. Send the external payout, then record its reference.'});
+    }
+    if(request.method==='POST'&&action==='paid'){
+      const b=await body(request),reference=String(b.reference||'').trim().slice(0,255);
+      if(reference.length<2)error('Enter the external payout transaction/reference.');
+      await tx(env,async t=>{
+        const offer=(await t.execute('SELECT id,bot_id,telegram_id,status,payout_method,approved_amount FROM bot_vendor_offers WHERE id=? FOR UPDATE',[offerId])).rows?.[0];
+        if(!offer)error('Vendor offer was not found.',404);if(offer.status!=='approved'||offer.payout_method==='internal')error('This external payout is not awaiting confirmation.',409);
+        await t.execute("UPDATE bot_vendor_offers SET status='paid',admin_id=?,payout_reference=?,paid_at=UTC_TIMESTAMP(),updated_at=UTC_TIMESTAMP() WHERE id=?",[auth.admin_id,reference,offerId]);
+        await queueVendorNotice(t,{...offer,id:Number(offerId)},'paid',`✅ External payout for vendor offer #${offerId} was marked sent by RainDeals. Reference: ${htmlEscape(reference)}`);
+      });
+      await audit(env,auth.admin_id,'record_external_payout','vendor_offer',offerId,{reference:reference.slice(0,120)});
+      return reply({success:true,message:'External payout and reference recorded.'});
+    }
+    error('Vendor offer action is not configured.',405);
+  }
   if(path==='/manage/api_orders'&&request.method==='GET'){
     const pageNumber=Math.max(1,Math.min(100000,Number(url.searchParams.get('page'))||1)),offset=(pageNumber-1)*30,search=(url.searchParams.get('search')||'').trim().slice(0,100);
     const filter=search?"WHERE CAST(ao.id AS CHAR) LIKE ? OR CAST(ao.client_order_id AS CHAR) LIKE ? OR CAST(ak.telegram_id AS CHAR) LIKE ? OR CAST(ao.order_id AS CHAR) LIKE ?":"";
@@ -717,7 +867,15 @@ async function route(request,env){
     const bc=providerConfig(provider).balance||{},balancePath=bc.balance||bc.path||providerConfig(provider).balance_path;let balanceValue=balancePath?nested(balancePayload,balancePath):undefined;if(balanceValue===undefined&&balancePayload&&typeof balancePayload==='object')for(const key of ['balance','funds','credits','wallet','amount','user_balance','walletBalance','data.balance']){balanceValue=nested(balancePayload,key);if(balanceValue!==undefined)break}
     const balance=Number(balanceValue??0);if(!Number.isFinite(balance)||balance<0)error('Provider balance response could not be read. Configure balance_path and retry.',502);
     const maxAffordable=Math.floor(balance/item.cost),maxQuantity=Math.min(item.stock,maxAffordable);if(quantity>maxQuantity)error(`Quantity exceeds the live stock or wallet limit (${maxQuantity}).`);
-    const name=String(b.name||item.name).trim().slice(0,255),category=String(b.category||item.category).trim().slice(0,255),description=String(b.description||item.description).trim().slice(0,4000),icon=String(b.icon||item.icon||'📦').slice(0,50),instruction=String(b.delivery_instruction||'').trim().slice(0,5000);if(name.length<2||!category)error('Product name and category are required.');
+    const name=String(b.name||item.name).trim().slice(0,255),categoryMode=String(b.category_mode||'provider'),requestedCategory=String(b.category||'').trim().slice(0,255);let category='General';
+    if(categoryMode==='existing'){
+      if(!requestedCategory)error('Choose an existing category.');
+      const match=(await rows(env,'SELECT category FROM products WHERE category=? LIMIT 1',[requestedCategory]))[0];if(!match)error('That category no longer exists. Refresh and choose again.',409);category=String(match.category);
+    }else if(categoryMode==='new'){
+      if(requestedCategory.length<1)error('Enter the new category name.');category=requestedCategory;
+    }else if(categoryMode==='provider')category=String(item.category||'General').trim().slice(0,255)||'General';
+    else if(categoryMode!=='general')error('Choose an existing, new, provider, or General category.');
+    const description=String(b.description||item.description).trim().slice(0,4000),icon=String(b.icon||item.icon||'📦').slice(0,50),instruction=String(b.delivery_instruction||'').trim().slice(0,5000);if(name.length<2)error('Product name is required.');
     const delivery=['automatic','manual','hybrid'].includes(b.delivery_type)?b.delivery_type:'automatic',preorder=String(b.preorder??'0')==='1'?1:0,isActive=String(b.is_active??'1')==='0'?0:1,apiEnabled=String(b.api_enabled??'1')==='0'?0:1,low=Number(b.low_stock_threshold??3);if(!Number.isInteger(low)||low<0||low>1000000)error('Low-stock threshold must be a nonnegative whole number.');const bulk=parseImportBulk(b.bulk_pricing);
     const result=await db(env,"INSERT INTO products (name,icon,description,category,price,stock,delivery_instruction,is_active,api_enabled,delivery_type,manual_fallback,preorder,low_stock_threshold,bulk_pricing,source,provider_id,reseller_service_id,reseller_cost,reseller_name,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?,?,'reseller',?,?,?,?,UTC_TIMESTAMP(),UTC_TIMESTAMP())",[name,icon,description,category,listingPrice,quantity,instruction||null,isActive,apiEnabled,delivery,preorder,low,bulk,provider.id,serviceId,item.cost,provider.name]);
     const productId=result?.insertId||result?.lastInsertId||null;await audit(env,auth.admin_id,'import','reseller_product',productId,{provider_id:Number(id),service_id:serviceId,quantity,provider_cost:item.cost,listing_price:listingPrice});return reply({success:true,product_id:productId,message:`Imported ${name} as a live reseller product.`});
@@ -761,7 +919,7 @@ async function route(request,env){
     const search=(url.searchParams.get('search')||'').slice(0,100);const searchable=visible.filter(c=>['id','telegram_id','name','code','status','product_name','username','full_name','key_prefix'].includes(c));
     const where=id?' WHERE id=?':search&&searchable.length?' WHERE '+searchable.map(c=>`CAST(\`${c}\` AS CHAR) LIKE ?`).join(' OR '):'';
     const params=id?[id]:where?searchable.map(()=>`%${search}%`):[];
-    const extra=name==='orders'?",IF(COALESCE(refunded,0)=0 AND LOWER(COALESCE(delivery_type,'')) IN ('manual','hybrid') AND (LOWER(COALESCE(status,''))='preorder' OR LOWER(COALESCE(status,'')) IN ('pending_manual','processing')),1,0) AS can_fulfill,IF(LOWER(COALESCE(status,''))='completed' AND COALESCE(refunded,0)=0 AND LOWER(COALESCE(delivery_type,'')) IN ('manual','hybrid') AND delivered_account IS NOT NULL AND delivered_account<>'',1,0) AS has_delivery":'';
+    const extra=name==='orders'?",IF(COALESCE(refunded,0)=0 AND LOWER(COALESCE(delivery_type,'')) IN ('manual','hybrid') AND (LOWER(COALESCE(status,''))='preorder' OR LOWER(COALESCE(status,'')) IN ('pending_manual','processing')),1,0) AS can_fulfill,IF(LOWER(COALESCE(status,''))='completed' AND COALESCE(refunded,0)=0 AND LOWER(COALESCE(delivery_type,'')) IN ('manual','hybrid') AND delivered_account IS NOT NULL AND delivered_account<>'',1,0) AS has_delivery,IF(LOWER(COALESCE(status,'')) IN ('delivery_pending','completed') AND COALESCE(refunded,0)=0 AND LOWER(COALESCE(delivery_type,'')) IN ('manual','hybrid') AND delivered_account IS NOT NULL AND delivered_account<>'',1,0) AS can_retry_delivery":'';
     const pageRows=await rows(env,`SELECT ${visible.map(c=>'`'+c+'`').join(',')}${extra} FROM \`${dbTable}\`${where} ORDER BY id DESC LIMIT 31 OFFSET ${offset}`,params);
     let outputRows=pageRows.slice(0,30);
     if(name==='products'&&outputRows.length){const ids=outputRows.map(row=>row.id),placeholders=ids.map(()=>'?').join(',');const shared=await rows(env,`SELECT id,CASE WHEN COALESCE(reusable_delivery,'')='' THEN 0 ELSE COALESCE(reusable_stock,0) END AS reusable_stock FROM products WHERE id IN (${placeholders})`,ids);const sharedMap=new Map(shared.map(row=>[String(row.id),Number(row.reusable_stock||0)]));for(const row of outputRows)row.reusable_stock=sharedMap.get(String(row.id))||0;}
@@ -809,4 +967,4 @@ async function route(request,env){
     await audit(env,auth.admin_id,id?'update':'create',name,id||null,{fields:keys,switched_to_manual:switchedToManual});return reply({success:true,message:switchedToManual?'Saved. No account inventory is loaded, so delivery was switched to manual.':'Saved to the shared database. The main bot must read this data to apply changes.'});}
   error('Action is not configured.',405);
 }
-export default {async fetch(request,env){try{const response=await route(request,env);const headers=new Headers(response.headers);headers.set('cache-control','no-store');headers.set('x-content-type-options','nosniff');headers.set('x-frame-options','DENY');headers.set('referrer-policy','no-referrer');headers.set('content-security-policy',"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");return new Response(response.body,{status:response.status,headers});}catch(e){if(!e.status)console.error('manager_request_failed',String(e.message).replace(/(password|token|secret)[^ ]*/gi,'[redacted]').slice(0,120));return reply({error:e.status?e.message:'Database operation failed. Check the schema and Worker service bindings.'},e.status||503);}},async scheduled(_event,env){try{await cleanExpiredManagerLinkCards(env)}catch(e){console.error('manager_link_expiry_cleanup_failed',String(e?.message||'unknown').slice(0,120))}}};
+export default {async fetch(request,env){const started=Date.now(),method=request.method,path=new URL(request.url).pathname.replace(/\/\d+(?=\/|$)/g,'/:id');try{const response=await route(request,env),elapsed=Date.now()-started;const headers=new Headers(response.headers);headers.set('cache-control','no-store');headers.set('x-content-type-options','nosniff');headers.set('x-frame-options','DENY');headers.set('referrer-policy','no-referrer');headers.set('server-timing',`app;dur=${elapsed}`);headers.set('content-security-policy',"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");if(elapsed>=1200)console.warn('manager_slow_request',JSON.stringify({method,path,status:response.status,duration_ms:elapsed}));return new Response(response.body,{status:response.status,headers});}catch(e){const elapsed=Date.now()-started;if(!e.status)console.error('manager_request_failed',String(e.message).replace(/(password|token|secret)[^ ]*/gi,'[redacted]').slice(0,120));if(elapsed>=1200)console.warn('manager_slow_request',JSON.stringify({method,path,status:e.status||503,duration_ms:elapsed}));return reply({error:e.status?e.message:'Database operation failed. Check the schema and Worker service bindings.'},e.status||503);}},async scheduled(_event,env){try{await cleanExpiredManagerLinkCards(env)}catch(e){console.error('manager_link_expiry_cleanup_failed',String(e?.message||'unknown').slice(0,120))}}};

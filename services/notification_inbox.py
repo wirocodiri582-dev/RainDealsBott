@@ -45,6 +45,8 @@ def _kind(row, plain):
         return 'admin'
     if category == 'broadcast':
         return 'broadcast'
+    if category == 'provider':
+        return 'provider'
     if category == 'wallet_adjustment' or category in ('wallet', 'balance'):
         return 'wallet'
     if category in ('order_progress', 'order_update') and any(
@@ -71,6 +73,14 @@ def _kind(row, plain):
 
 def _summary(kind, plain, order=None, claim=None):
     lower = plain.lower()
+    if kind == 'provider':
+        if 'declin' in lower or 'reject' in lower:
+            return 'Your provider offer was declined. Open Become a Provider to review its status.'
+        if 'paid' in lower or 'credited' in lower or 'payout reference' in lower:
+            return 'Your provider payout was recorded. Open Become a Provider to view the offer status.'
+        if 'approv' in lower:
+            return 'Your provider offer was approved. Open Become a Provider to check its payout status.'
+        return 'Your provider offer has an update. Open Become a Provider to review it.'
     if kind == 'refund':
         if 'declin' in lower or 'reject' in lower:
             return 'Refund request declined. Open the request to review its status and calculation.'
@@ -147,6 +157,7 @@ def _view_row(row, order=None, claim=None):
         order_text = (f'Deposit #{deposit_match.group(1)} · Payment update' if deposit_match else
                       f'Ticket #{ticket_match.group(1)} · Support update' if ticket_match else
                       f"{product_match.group(1)[:65]} · Restock" if product_match else
+                      'Become a Provider · Offer update' if kind == 'provider' else
                       'Wallet · Payment update' if kind == 'deposit' else
                       'Support · Ticket update' if kind == 'support' else
                       'Shop · Restock update' if kind == 'restock' else
@@ -161,6 +172,7 @@ def _view_row(row, order=None, claim=None):
         'subscription': '⏳ Subscription reminder',
         'wallet': '💰 Balance update',
         'broadcast': '📢 Announcement',
+        'provider': '🤝 Provider offer update',
         'account': '👤 Account update',
     }.get(kind, '🔔 RainDeals update')
     return dict(

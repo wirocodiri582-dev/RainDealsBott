@@ -54,6 +54,9 @@ ORDER_NOTIFICATION_CHANNEL_ID = os.getenv(
     "ORDER_NOTIFICATION_CHANNEL_ID",
     "@RainOrdersGroup",
 )
+# Dedicated channel for requests sent to providers and their redacted offers.
+# Leave empty to disable public vendor-channel posts while retaining admin alerts.
+VENDOR_DEAL_CHANNEL_ID = os.getenv("VENDOR_DEAL_CHANNEL_ID", "").strip()
 STOCK_NOTIFICATION_CHANNEL_ID = os.getenv(
     "STOCK_NOTIFICATION_CHANNEL_ID",
     "@RainStockGroup",
@@ -104,6 +107,13 @@ API_KEY_ENCRYPTION_KEY = os.getenv("API_KEY_ENCRYPTION_KEY", "")
 # Stable key for resumable Telegram drafts/screens. Set this separately from
 # BOT_TOKEN so rotating Telegram credentials does not invalidate saved drafts.
 SESSION_RESUME_ENCRYPTION_KEY = os.getenv("SESSION_RESUME_ENCRYPTION_KEY", "")
+
+# Encrypts vendor-supplied account data and external payout details at rest.
+# Prefer a dedicated, stable key; existing stable app keys remain fallbacks.
+VENDOR_DATA_ENCRYPTION_KEY = os.getenv(
+    "VENDOR_DATA_ENCRYPTION_KEY",
+    os.getenv("SESSION_RESUME_ENCRYPTION_KEY", os.getenv("API_KEY_ENCRYPTION_KEY", "")),
+)
 
 # The public Wasmer gateway shown to users in the bot. Example:
 # https://my-reseller-api.wasmer.app.  Do not put the Vercel/Render bot URL

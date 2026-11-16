@@ -263,6 +263,12 @@ def _cancel_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
+                    text="🔄 Switch payment method",
+                    callback_data="deposit_change_method",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="❌ Cancel Deposit",
                     callback_data="deposit_cancel",
                 )
@@ -588,6 +594,7 @@ def _apply_promo_to_user(telegram_id: int, promo_code: str, promo_amount: Decima
         return False, 'Could not redeem the promocode. Check your wallet before retrying.'
 
 
+@router.callback_query(F.data == "deposit_change_method")
 @router.callback_query(F.data == "deposit_start")
 async def deposit_menu(callback: CallbackQuery, state: FSMContext):
     """Display the deposit method selection menu."""

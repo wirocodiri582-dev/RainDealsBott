@@ -22,9 +22,10 @@ export async function ensureAftercareSchema(env){
   if(!schemaPromise)schemaPromise=(async()=>{
     const db=env.TIDB;
     await db.execute("CREATE TABLE IF NOT EXISTS bot_warranty_requests (id INT AUTO_INCREMENT PRIMARY KEY,order_id INT NOT NULL UNIQUE,telegram_id BIGINT NOT NULL,status VARCHAR(20) NOT NULL DEFAULT 'submitted',reason TEXT NOT NULL,evidence JSON NOT NULL,request_type VARCHAR(16) NOT NULL DEFAULT 'warranty',refund_amount DECIMAL(20,8) NULL,used_days INT NULL,remaining_days INT NULL,deactivated_at VARCHAR(200) NULL,admin_id BIGINT NULL,resolution TEXT NULL,created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+    await db.execute("CREATE TABLE IF NOT EXISTS bot_warranty_request_revisions (id INT AUTO_INCREMENT PRIMARY KEY,request_id INT NOT NULL,order_id INT NOT NULL,revision INT NOT NULL,telegram_id BIGINT NOT NULL,status VARCHAR(20) NOT NULL,reason TEXT NOT NULL,evidence JSON NOT NULL,request_type VARCHAR(16) NOT NULL,refund_amount DECIMAL(20,8) NULL,used_days INT NULL,remaining_days INT NULL,deactivated_at VARCHAR(200) NULL,issue_type VARCHAR(32) NULL,product_confirmed TINYINT NOT NULL DEFAULT 0,invoice_snapshot JSON NULL,delivery_snapshot TEXT NULL,proof_image MEDIUMBLOB NULL,proof_mime VARCHAR(32) NULL,admin_id BIGINT NULL,resolution TEXT NULL,created_at DATETIME NOT NULL,updated_at DATETIME NOT NULL,archived_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,KEY ix_warranty_revision_request(request_id),KEY ix_warranty_revision_order(order_id,archived_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
     await db.execute("CREATE TABLE IF NOT EXISTS bot_claim_messages (id INT AUTO_INCREMENT PRIMARY KEY,order_id INT NOT NULL,actor_id BIGINT NOT NULL,role VARCHAR(12) NOT NULL,text TEXT NOT NULL,image MEDIUMBLOB NULL,mime VARCHAR(32) NULL,created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,KEY ix_claim_message_order(order_id))");
     await db.execute("CREATE TABLE IF NOT EXISTS bot_cancellation_requests (order_id INT PRIMARY KEY,telegram_id BIGINT NOT NULL,bot_id BIGINT NOT NULL,reason TEXT NOT NULL,status VARCHAR(20) NOT NULL DEFAULT 'submitted',admin_id BIGINT NULL,resolution TEXT NULL,created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
-    const definitions={products:{term_days:'INT NOT NULL DEFAULT 0',aftercare_policy:'VARCHAR(16) NULL',warranty_days:'INT NOT NULL DEFAULT 0',subscription_days:'INT NOT NULL DEFAULT 0',reusable_delivery:'TEXT NULL',reusable_stock:'INT NOT NULL DEFAULT 0'},orders:{received_at:'DATETIME NULL',subscription_expires_at:'DATETIME NULL',term_days:'INT NOT NULL DEFAULT 0',aftercare_policy:'VARCHAR(16) NULL',warranty_days:'INT NOT NULL DEFAULT 0',subscription_days:'INT NOT NULL DEFAULT 0',coverage_started_at:'DATETIME NULL',warranty_expires_at:'DATETIME NULL',refund_amount:'DECIMAL(20,8) NULL',reusable_delivery_account:'TEXT NULL',reusable_delivery_quantity:'INT NOT NULL DEFAULT 0'},bot_warranty_requests:{request_type:"VARCHAR(16) NOT NULL DEFAULT 'warranty'",refund_amount:'DECIMAL(20,8) NULL',used_days:'INT NULL',remaining_days:'INT NULL',deactivated_at:'VARCHAR(200) NULL',issue_type:"VARCHAR(32) NOT NULL DEFAULT 'other'",product_confirmed:'INT NOT NULL DEFAULT 0',invoice_snapshot:'JSON NULL',delivery_snapshot:'TEXT NULL',proof_image:'MEDIUMBLOB NULL',proof_mime:'VARCHAR(32) NULL',bot_id:'BIGINT NULL'}};
+    const definitions={products:{term_days:'INT NOT NULL DEFAULT 0',aftercare_policy:'VARCHAR(16) NULL',warranty_days:'INT NOT NULL DEFAULT 0',subscription_days:'INT NOT NULL DEFAULT 0',reusable_delivery:'TEXT NULL',reusable_stock:'INT NOT NULL DEFAULT 0'},orders:{received_at:'DATETIME NULL',subscription_expires_at:'DATETIME NULL',term_days:'INT NOT NULL DEFAULT 0',aftercare_policy:'VARCHAR(16) NULL',warranty_days:'INT NOT NULL DEFAULT 0',subscription_days:'INT NOT NULL DEFAULT 0',coverage_started_at:'DATETIME NULL',warranty_expires_at:'DATETIME NULL',refund_amount:'DECIMAL(20,8) NULL',reusable_delivery_account:'TEXT NULL',reusable_delivery_quantity:'INT NOT NULL DEFAULT 0',referral_commission_amount:'DECIMAL(20,8) NULL',referral_commission_to_balance:'TINYINT NULL'},bot_warranty_requests:{request_type:"VARCHAR(16) NOT NULL DEFAULT 'warranty'",refund_amount:'DECIMAL(20,8) NULL',used_days:'INT NULL',remaining_days:'INT NULL',deactivated_at:'VARCHAR(200) NULL',issue_type:"VARCHAR(32) NOT NULL DEFAULT 'other'",product_confirmed:'INT NOT NULL DEFAULT 0',invoice_snapshot:'JSON NULL',delivery_snapshot:'TEXT NULL',proof_image:'MEDIUMBLOB NULL',proof_mime:'VARCHAR(32) NULL',bot_id:'BIGINT NULL'}};
     for(const [table,columns] of Object.entries(definitions)){
       const found=new Set((await rows(db,`SHOW COLUMNS FROM ${table}`)).map(r=>r.Field));
       for(const [column,type] of Object.entries(columns))if(!found.has(column)){
@@ -88,20 +89,22 @@ export async function claimContext(env,id,canDelivery=false){
   await ensureAftercareSchema(env);
   let order=await getOrder(env.TIDB,id);if(!order)fail('Order not found.',404);
   if(await recoverCoverage(env.TIDB,order))order=await getOrder(env.TIDB,id);
-  const [claim,submissions,events,product]=await Promise.all([
+  const [claim,submissions,events,product,revisions]=await Promise.all([
     getClaim(env.TIDB,id),optional(env.TIDB,'SELECT telegram_id,`values`,submitted_at FROM order_requirement_submissions WHERE order_id=?',[id]),
     optional(env.TIDB,'SELECT kind,summary,actor_id,created_at FROM order_events WHERE order_id=? AND customer_visible=1 ORDER BY id ASC LIMIT 100',[id]),
     order.product_id?rows(env.TIDB,'SELECT id,name,description,price,aftercare_policy,warranty_days,subscription_days FROM products WHERE id=?',[order.product_id]):[],
+    optional(env.TIDB,'SELECT revision,status,reason,evidence,request_type,refund_amount,used_days,remaining_days,deactivated_at,issue_type,product_confirmed,admin_id,resolution,proof_mime,created_at,archived_at FROM bot_warranty_request_revisions WHERE order_id=? ORDER BY revision DESC LIMIT 50',[id]),
   ]);
   let delivery=null;
   if(canDelivery){const snap=claim?(await rows(env.TIDB,'SELECT delivery_snapshot FROM bot_warranty_requests WHERE order_id=?',[id]))[0]?.delivery_snapshot:null;delivery=snap||order.delivered_account||'';}
   const q=quote(order),missing=policy(order)==='refund'?(!Number(order.subscription_days)||!order.coverage_started_at):policy(order)==='warranty'&&(!Number(order.warranty_days)||!order.warranty_expires_at);
   const safeOrder={...invoice(order),term_days:order.term_days||0,subscription_expires_at:order.subscription_expires_at||null,received_at:order.received_at||null,status:order.status,refunded:!!Number(order.refunded)};
   const safeClaim=claim?{...claim,evidence:json(claim.evidence),invoice_snapshot:undefined,bot_id:undefined}:null;
+  const safeRevisions=revisions.map(r=>{const evidence=json(r.evidence,{});return{...r,evidence:evidence.kind==='text'?{kind:'text',value:String(evidence.value||'').slice(0,4000)}:evidence.kind==='photo'?{kind:'photo'}:{kind:'none'}}});
   if(safeClaim&&safeClaim.request_type==='warranty'&&safeClaim.status==='completed'&&!canDelivery)safeClaim.resolution='Replacement delivered. Your role cannot view delivery credentials.';
   return {order:safeOrder,invoice:metadataInvoice(claim?.invoice_snapshot,order),product:product[0]||null,
     claim:safeClaim,
-    submitted_details:submissions.map(s=>({...s,values:json(s.values)})),history:events,delivery_content:delivery,
+    submitted_details:submissions.map(s=>({...s,values:json(s.values)})),history:events,revisions:safeRevisions,delivery_content:delivery,
     quote:q,metadata_missing:missing,proof_url:claim?.proof_mime||json(claim?.evidence).kind==='photo'?`/manage/claims/${id}/proof`:null};
 }
 
@@ -164,7 +167,20 @@ export async function claimsRoute(request,env,url,auth,admin,helpers){
         const amount=units(claim.refund_amount);if(amount<=0n||amount>units(order.amount))fail('The saved refund amount is invalid.');
         const buyer=(await rows(db,'SELECT telegram_id,referred_by FROM users WHERE telegram_id=? FOR UPDATE',[order.telegram_id]))[0];if(!buyer)fail('Buyer wallet not found.',409);
         await db.execute('UPDATE users SET balance=COALESCE(balance,0)+? WHERE telegram_id=?',[money(amount),order.telegram_id]);
-        if(buyer.referred_by){const saved=json(claim.invoice_snapshot),rate=units(saved.referral_commission_rate??env.REFERRAL_COMMISSION_RATE??'0.05');if(rate>SCALE)fail('Invalid saved referral commission.');const commission=amount*rate/SCALE,credit=saved.referral_credit_to_balance??(String(env.REFERRAL_CREDIT_TO_BALANCE||'true')!=='false');if(commission>0n)await db.execute('UPDATE users SET referral_earnings=GREATEST(0,COALESCE(referral_earnings,0)-?)'+(credit?',balance=COALESCE(balance,0)-?':'')+' WHERE telegram_id=?',credit?[money(commission),money(commission),buyer.referred_by]:[money(commission),buyer.referred_by]);}
+        if(buyer.referred_by){
+          const saved=json(claim.invoice_snapshot),savedCommission=order.referral_commission_amount;
+          if(savedCommission==null){
+            await audit(db,id,auth.admin_id,'refund_legacy_commission_review',{referrer_telegram_id:String(buyer.referred_by),note:'No purchase-time commission amount was saved; no current-rate estimate was reversed.'});
+          }else{
+            const original=units(order.amount),recorded=units(savedCommission);if(original<=0n||recorded<0n)fail('Saved referral commission is invalid.');
+            const target=recorded*(amount>original?original:amount)/original,creditValue=order.referral_commission_to_balance??saved.referral_credit_to_balance,credit=creditValue===true||Number(creditValue)===1;
+            const referrer=(await rows(db,'SELECT telegram_id,CAST(GREATEST(0,COALESCE(balance,0)) AS CHAR) AS safe_balance,CAST(GREATEST(0,COALESCE(referral_earnings,0)) AS CHAR) AS safe_earnings FROM users WHERE telegram_id=? FOR UPDATE',[buyer.referred_by]))[0];
+            if(referrer&&target>0n){const earnings=units(referrer.safe_earnings||'0'),earningsDebit=earnings<target?earnings:target;let balanceDebit=0n;if(credit){const balance=units(referrer.safe_balance||'0');balanceDebit=balance<target?balance:target;}
+              await db.execute('UPDATE users SET referral_earnings=GREATEST(0,COALESCE(referral_earnings,0)-?)'+(credit?',balance=GREATEST(0,COALESCE(balance,0)-?)':'')+' WHERE telegram_id=?',credit?[money(earningsDebit),money(balanceDebit),buyer.referred_by]:[money(earningsDebit),buyer.referred_by]);
+              if(earningsDebit<target||(credit&&balanceDebit<target)||creditValue==null)await audit(db,id,auth.admin_id,'refund_commission_shortfall',{referrer_telegram_id:String(buyer.referred_by),target:money(target),earnings_reversed:money(earningsDebit),balance_reversed:money(balanceDebit),credit_setting:creditValue==null?'unknown':'saved'});
+            }else if(!referrer)await audit(db,id,auth.admin_id,'refund_referrer_missing',{referrer_telegram_id:String(buyer.referred_by),target:money(target)});
+          }
+        }
         await db.execute("UPDATE orders SET refunded=1,status='refunded',refund_amount=? WHERE id=?",[money(amount),id]);
         next='completed';resolved=`Approved refund: $${money(amount)} USDT credited to your bot wallet.`;summary=resolved;
         await enqueue(db,env,claim,`warranty:${id}:refund`,`💸 <b>Order #${id} · Refund approved</b>\n${summary}`);

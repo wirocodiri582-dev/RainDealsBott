@@ -1,5 +1,6 @@
 """Compact cart, wallet, order aftercare and customer notification controls."""
 import asyncio
+import re
 from html import escape
 from io import BytesIO
 from decimal import Decimal, ROUND_HALF_UP
@@ -135,6 +136,15 @@ async def thread_screen(target,order_id):
     buttons=[]
     for row in rows[-8:]:
         text+=f"\n<b>{row['role'].title()} · {row['date']:%d %b %H:%M} UTC</b>\n{escape(row['text'][:250])}\n"
+        drive_match = re.search(r'https://(?:drive|docs)\.google\.com/[^\s<>]+', row['text'])
+        if drive_match:
+            from services.warranty import validate_drive_link
+            try:
+                drive_link = validate_drive_link(drive_match.group(0).rstrip('.,)'))
+            except ValueError:
+                drive_link = None
+            if drive_link:
+                buttons.append([Button(text='🔗 Open Google Drive proof', url=drive_link)])
         if row['photo']:
             buttons.append([Button(text=f"📷 Evidence #{row['id']}",callback_data=f"ct_proof_{row['id']}")])
     if admin and status in ('submitted','needs_info'):
@@ -203,6 +213,8 @@ async def customer_action(callback:CallbackQuery,state:FSMContext):
                 buttons.append([Button(text='Open wallet',callback_data='deposit_start')])
             elif row['kind']=='restock':
                 buttons.append([Button(text='Open Shop',callback_data='products_menu')])
+            elif row['kind']=='provider':
+                buttons.append([Button(text='🤝 Become a Provider · My offers',callback_data='vendor_my_offers')])
             elif row['kind']=='order' and row.get('order') and row['order'].get('status')=='pending_info':
                 buttons.append([Button(text='🧾 Submit required information',callback_data=f"order_submit_info_{row['order_id']}")])
             elif row['kind'] in ('order','subscription'):
@@ -261,10 +273,14 @@ async def customer_action(callback:CallbackQuery,state:FSMContext):
             await thread_screen(callback,int(value))
         elif action in ('ask','reply'):
             if action=='ask' and user_id not in ADMIN_IDS: raise ValueError('Access denied.')
+            if action=='reply' and user_id in ADMIN_IDS: raise ValueError('Use Ask for information from the admin claim screen.')
             await asyncio.to_thread(tools.claim_conversation,user_id,int(value),action=='ask')
             await state.set_state(CustomerInput.admin_reply if action=='ask' else CustomerInput.claim_reply)
             await state.update_data(customer_order=int(value))
-            await show(callback,'Send your message (5–1,500 characters). You can attach a screenshot with a caption up to 2 MB.',state=state,reply_markup=kb([[Button(text='Back',callback_data=f'ct_thread_{int(value)}')]]))
+            prompt = ('Send your message (5–1,500 characters). For evidence, ask the customer for a Google Drive share link.'
+                      if action=='ask' else
+                      'Send your reply (5–1,500 characters). For proof, upload it to Google Drive, set “Anyone with the link” to Viewer, and send the link. Do not upload photos here.')
+            await show(callback,prompt,state=state,reply_markup=kb([[Button(text='Back',callback_data=f'ct_thread_{int(value)}')]]))
         elif action=='proof':
             data,order_id=await asyncio.to_thread(tools.claim_reply_image,user_id,int(value),user_id in ADMIN_IDS)
             if not data: raise ValueError('Image unavailable.')
@@ -331,6 +347,19 @@ async def customer_input(message:Message,state:FSMContext):
             await asyncio.to_thread(save)
             await state.clear()
             await update_card(message,text='✅ Subscription reminder term saved for new orders.',reply_markup=kb([[Button(text='Product',callback_data=f"manage_{data['customer_product']}")]]))
+        elif mode==CustomerInput.claim_reply.state:
+            if message.photo or not message.text:
+                raise ValueError('Please upload proof to Google Drive, enable Anyone with the link → Viewer, then send the share link as text.')
+            reply_text = message.text.strip()
+            if 'drive.google.com' in reply_text.lower() or 'docs.google.com' in reply_text.lower():
+                from services.warranty import validate_drive_link
+                link_match = re.search(r'https://(?:drive|docs)\.google\.com/[^\s<>]+', reply_text)
+                if not link_match:
+                    raise ValueError('Send the complete Google Drive share link.')
+                validate_drive_link(link_match.group(0).rstrip('.,)'))
+            await asyncio.to_thread(tools.claim_reply,message.from_user.id,data['customer_order'],reply_text,False,None)
+            await state.clear()
+            await thread_screen(message,data['customer_order'])
         else:
             image=None
             if message.photo:

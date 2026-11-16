@@ -30,13 +30,16 @@ SAFE_KEYS = {'deposit_id', 'network', 'invoice_code', 'invoice_expires_at', 'amo
 ADMIN_FAMILIES = {'AddProduct', 'EditProduct', 'AddStock', 'DeleteProduct', 'AddAccounts',
                   'EditAccounts', 'EditBulkPricing', 'DeliverOrder', 'BroadcastState',
                   'AdminUserBalanceState', 'CustomRateState', 'ProviderSetupState',
-                  'ProviderEditState', 'MaintenanceModeState', 'ManagerWebState',
+                  'ProviderEditState', 'MaintenanceModeState', 'ManagerWebState', 'VendorAdmin',
                   'PromoCodeCreation', 'WorkInput'}
 EXTRA_USER_STATES = {'CustomerInput:quantity', 'CustomerInput:cancel_reason', 'CustomerInput:claim_reply', 'Inputs:reason', 'Inputs:deactivated', 'Inputs:evidence', 'Inputs:confirmation',
                      'Inputs:product_confirmation','Inputs:issue_type',
                      'RedeemState:waiting_for_code', 'OrderFilterStates:waiting_date_range',
                      'OrderFilterStates:waiting_export_format', 'OrderFilterStates:waiting_rating',
-                     'OrderFilterStates:waiting_reminder_time'}
+                     'OrderFilterStates:waiting_reminder_time',
+                     'VendorApplication:product_name', 'VendorApplication:description',
+                     'VendorApplication:delivery_instructions', 'VendorApplication:supplied_data',
+                     'VendorApplication:payout_details'}
 
 
 def admin_state(state):

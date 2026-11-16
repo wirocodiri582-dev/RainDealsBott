@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from html import escape
+from urllib.parse import urlsplit
 
 REFUND_RULES = (
     '‼️ <b>REFUND COMPUTATION</b> ‼️\n\n'
@@ -12,6 +13,36 @@ REFUND_RULES = (
     'Remaining days = subscription days − days used. '
     'The estimate is saved when you submit; approval returns it to your bot wallet.'
 )
+
+
+def validate_drive_link(value):
+    """Accept only share-link shaped Google Drive/Docs URLs for claim evidence."""
+    from services.input_forms import InputError, text_value
+    try:
+        value = text_value(value, 500, 20).strip()
+    except InputError:
+        raise
+    try:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path or ""
+        port = parsed.port
+    except ValueError as error:
+        raise InputError("Send a valid Google Drive sharing link.") from error
+    valid_host = host in {"drive.google.com", "docs.google.com"}
+    valid_path = (
+        path.startswith("/file/d/")
+        or path.startswith("/drive/folders/")
+        or path == "/open"
+        or any(path.startswith(f"/{kind}/d/") for kind in ("document", "spreadsheets", "presentation", "forms"))
+    )
+    if (parsed.scheme != "https" or not valid_host or not valid_path
+            or parsed.username is not None or parsed.password is not None
+            or port not in (None, 443)):
+        raise InputError(
+            "Use a Google Drive or Google Docs share link. In Drive, set General access to “Anyone with the link” before submitting."
+        )
+    return value
 
 
 def policy(value):
@@ -99,6 +130,8 @@ def summary_text(ctx, admin=False):
     if evidence.get('kind') == 'text':
         value = evidence.get('value', '')
         text += '\nEvidence: ' + escape(value[:120]) + ('…' if len(value) > 120 else '')
+    elif evidence.get('kind') == 'drive_link':
+        text += '\nEvidence: Google Drive link submitted.'
     if request['resolution']:
         if admin:
             text += '\n\nResponse / replacement:\n' + escape(request['resolution'])
@@ -119,6 +152,9 @@ def request_text(ctx):
         text += '\n\n<b>Deactivated / stopped working (reported)</b>\n' + escape(request['deactivated_at'])
     if request['evidence'].get('kind') == 'text':
         text += '\n\n<b>Evidence</b>\n' + escape(request['evidence'].get('value', ''))
+    elif request['evidence'].get('kind') == 'drive_link':
+        url = escape(request['evidence'].get('url', ''), quote=True)
+        text += f'\n\n<b>Evidence</b>\n<a href="{url}">Open Google Drive proof</a>'
     else:
         text += '\n\nPhoto evidence is available from the warranty screen.'
     return text
@@ -252,9 +288,11 @@ def submit(order_id, user_id, reason, evidence, deactivated_at=None, expected_re
         reason = text_value(reason, 1500, 10)
         if deactivated_at is not None:
             deactivated_at = text_value(deactivated_at, 200)
-        if not isinstance(evidence, dict) or evidence.get('kind') not in ('text', 'photo'):
-            return 'Add evidence as a photo or a description.'
-        if evidence['kind'] == 'text':
+        if not isinstance(evidence, dict) or evidence.get('kind') not in ('text', 'photo', 'drive_link'):
+            return 'Add evidence using a Google Drive share link.'
+        if evidence['kind'] == 'drive_link':
+            evidence = {'kind': 'drive_link', 'url': validate_drive_link(evidence.get('url'))}
+        elif evidence['kind'] == 'text':
             evidence = {'kind': 'text', 'value': text_value(evidence.get('value'), 2000, 10)}
         else:
             evidence = {'kind': 'photo', 'file_id': text_value(evidence.get('file_id'), 500)}
@@ -279,8 +317,8 @@ def submit(order_id, user_id, reason, evidence, deactivated_at=None, expected_re
         mode = policy(order)
         quote = refund_quote(order) if mode == 'refund' else None
         if mode == 'refund':
-            if evidence['kind'] != 'photo' or not deactivated_at:
-                return 'Add a screenshot of deactivation and when it stopped working.'
+            if evidence['kind'] not in ('drive_link', 'photo') or not deactivated_at:
+                return 'Add a Google Drive link to the deactivation proof and when it stopped working.'
             if expected_refund is not None and (not quote or str(quote['refund_amount']) != str(expected_refund)):
                 return 'The refund estimate changed. Review the updated estimate and submit again.'
         saved_invoice = invoice(order)

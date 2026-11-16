@@ -21,7 +21,7 @@ from models.deposit import Deposit
 from services.session_resume import save_resume
 from config import ADMIN_IDS, CHANNEL_LINK, GROUP_LINK, MINI_APP_URL, TOS_LINK
 
-from keyboards.menu import get_main_menu, get_admin_main_menu
+from keyboards.menu import get_main_menu, get_admin_main_menu, get_start_choice_menu
 from utils.ui import show, answer_card, update_card, get_card_location
 
 # Membership check
@@ -196,37 +196,12 @@ def _build_start_welcome(
     user, full_name: str, telegram_id: int, username: str | None,
     bot_username: str,
 ) -> str:
-    balance = _format_balance(getattr(user, "balance_display", getattr(user, "balance", 0)))
-    spent = _format_balance(getattr(user, "total_spent_display", getattr(user, "total_spent", 0)) or 0)
-    earnings = _format_balance(
-        getattr(user, "referral_earnings_display", getattr(user, "referral_earnings", 0)) or 0
-    )
-    referral_count = int(getattr(user, "total_referrals", 0) or 0)
-    referral_code = str(getattr(user, "referral_code", "") or "").strip()
-    referral_url = f"https://t.me/{bot_username}?start=ref_{referral_code}" if bot_username and referral_code else ""
-    referral_link = f'<a href="{safe(referral_url)}">{safe(referral_url)}</a>' if referral_url else "Unavailable"
-    username_text = f"@{safe(username.lstrip('@'))}" if username else "Not set"
     first_name = safe((full_name or "there").split()[0])
     return (
-        "🛍 <b>RainDeals</b>\n"
-        "Quality digital products at great rates\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👋 Welcome back, <b>{first_name}</b>!\n"
-        f"🏷️ Username: {username_text}\n"
-        f"🆔 User ID: <code>{telegram_id}</code>\n"
-        "👑 Membership: 🥉 Bronze\n"
-        f"💰 Balance: ${balance}\n"
-        f"💎 Total Spent: ${spent}\n"
-        f"🤝 Referrals: {referral_count}\n"
-        f"💸 Referral Earnings: ${earnings}\n"
-        f"🔗 Referral Link: {referral_link}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🛍 <b>Choose how you’d like to shop</b>\n"
-        + (
-            "Open the RainDeals website or browse and buy right here in Telegram."
-            if MINI_APP_URL
-            else "Browse and buy RainDeals products right here in Telegram."
-        )
+        f"👋 <b>Hey Dear, {first_name}</b> 🌸\n\n"
+        "<b>Welcome to Raindeals</b> 🛍\n\n"
+        "Get instant access to premium AI tools with fully automatic delivery. ⚡\n\n"
+        "🔘 <b>Please choose an option below to continue.</b> ⤵️"
     )
 
 
@@ -282,11 +257,30 @@ def _load_main_menu_data(
         if not user:
             return None
         from services.notification_inbox import unread_count
+        now = datetime.utcnow()
+        deposit = (
+            db.query(Deposit)
+            .filter(
+                Deposit.telegram_id == telegram_id,
+                Deposit.status.in_(["waiting_hash", "pending"]),
+                or_(Deposit.tx_hash.isnot(None), Deposit.invoice_expires_at > now),
+            )
+            .order_by(Deposit.tx_hash.is_(None), Deposit.id.desc())
+            .first()
+        )
+        deposit_action = None
+        if deposit:
+            deposit_action = {
+                "kind": "status" if deposit.tx_hash is not None else "resume",
+                "id": int(deposit.id),
+                "code": deposit.invoice_code or deposit.order_id,
+            }
         return {
             "text": _build_start_welcome(user, full_name, telegram_id, username, bot_username),
             "chat_id": user.home_menu_chat_id,
             "message_id": user.home_menu_message_id,
             "unread_notifications": unread_count(db,telegram_id),
+            "deposit_action": deposit_action,
         }
     finally:
         db.close()
@@ -381,14 +375,19 @@ async def clear_start_menu(callback: CallbackQuery):
         await callback.answer("Could not clear this menu. Please try again.", show_alert=True)
 
 
+@router.callback_query(F.data == "user_bot_menu")
+@router.callback_query(F.data == "user_view")
 @router.callback_query(F.data == "main_menu")
 async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
     """Back to main menu — edits the current message."""
+    if callback.data == "user_view" and callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
     await state.clear()
     save_resume((callback.from_user.id, callback.message.chat.id), None)
     await callback.answer()
 
-    bot_username = await _get_bot_username(callback.bot)
+    bot_username = ""
     menu_data = await asyncio.to_thread(
         _load_main_menu_data,
         callback.from_user.id,
@@ -402,6 +401,16 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
 
     unread = menu_data.get("unread_notifications",0)
     keyboard = get_admin_main_menu(unread) if callback.from_user.id in ADMIN_IDS else get_main_menu(unread)
+    deposit_action = menu_data.get("deposit_action")
+    if deposit_action:
+        label = (f"⏳ Payment checking · #{deposit_action['id']}"
+                 if deposit_action["kind"] == "status"
+                 else f"💳 Resume payment · {deposit_action['code']}")
+        keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(
+            text=label,
+            callback_data=f"resume_deposit_{deposit_action['id']}",
+            style="success",
+        )])
     target_chat_id = int(menu_data.get("chat_id") or callback.message.chat.id)
     target_message_id = int(menu_data.get("message_id") or callback.message.message_id)
     menu_card = await update_card(
@@ -429,6 +438,27 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
             await callback.message.delete()
         except Exception:
             pass
+
+
+@router.callback_query(F.data == "shop_unavailable")
+async def shop_unavailable(callback: CallbackQuery):
+    await callback.answer(
+        "The RainDeals Mini App is not configured right now. Choose Continue in bot to shop here.",
+        show_alert=True,
+    )
+
+
+@router.callback_query(F.data == "language_menu")
+async def language_menu(callback: CallbackQuery):
+    await callback.answer()
+    await show(
+        callback,
+        "🌐 <b>Language</b>\n\nEnglish is currently active. Other translated language packs are not configured yet.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅ Main menu", callback_data="main_menu")
+        ]]),
+    )
 
 
 @router.callback_query(F.data == "my_profile")
@@ -624,10 +654,15 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
 
     start_payload = (command.args or "").strip() if command else ""
     deep_link_product_id = None
+    vendor_request_id = None
     if start_payload.startswith("product_"):
         product_id_text = start_payload.removeprefix("product_")
         if product_id_text.isdigit():
             deep_link_product_id = int(product_id_text)
+    elif start_payload.startswith("vendor_request_"):
+        request_id_text = start_payload.removeprefix("vendor_request_")
+        if request_id_text.isdigit():
+            vendor_request_id = int(request_id_text)
 
     # ═══════════════════════════════════════════════════════
     # CHANNEL MEMBERSHIP CHECK (skip for admins)
@@ -657,7 +692,7 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
 
     username = message.from_user.username
     full_name = message.from_user.full_name
-    ref_payload = "" if deep_link_product_id is not None else start_payload
+    ref_payload = "" if deep_link_product_id is not None or vendor_request_id is not None else start_payload
     is_admin = telegram_id in ADMIN_IDS
 
     try:
@@ -665,28 +700,28 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         user_task = asyncio.to_thread(
             _get_or_create_user, telegram_id, username, full_name, ref_payload
         )
-        if deep_link_product_id is None:
-            # These reads do not depend on user creation. Start them together
-            # so remote TiDB latency is paid once instead of serially.
-            from services.notification_inbox import count as notification_count
+        admin_dashboard = None
+        if deep_link_product_id is None and is_admin:
+            from handlers.admin import _load_admin_dashboard
 
             results = await asyncio.gather(
                 user_task,
-                asyncio.to_thread(notification_count, telegram_id),
-                asyncio.to_thread(_load_start_deposit_action, telegram_id),
+                asyncio.to_thread(_load_admin_dashboard, full_name, telegram_id),
                 return_exceptions=True,
             )
-            result = results[0]
+            result, admin_dashboard = results
             if isinstance(result, BaseException):
                 raise result
-            unread = results[1]
-            if isinstance(unread, BaseException):
-                logger.warning("Could not load notification badge for /start user=%s", telegram_id)
-                unread = 0
-            deposit_action = results[2]
-            if isinstance(deposit_action, BaseException):
-                logger.warning("Could not load resumable deposit for /start user=%s", telegram_id)
-                deposit_action = None
+            if isinstance(admin_dashboard, BaseException):
+                logger.warning("Could not load admin dashboard during /start", exc_info=admin_dashboard)
+                admin_dashboard = None
+            unread, deposit_action = 0, None
+        elif deep_link_product_id is None:
+            # The landing screen is static. Avoid separate notification,
+            # invoice, and getMe reads here; load the personalized menu only
+            # after the user chooses Continue in bot.
+            result = await user_task
+            unread, deposit_action = 0, None
         else:
             result = await user_task
             unread, deposit_action = 0, None
@@ -715,32 +750,79 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
             previous_cards + list(saved_home),
             int(loading_location[1]),
         ))
+    if is_admin:
+        from handlers.admin import _get_admin_panel_with_providers
+        admin_text = admin_dashboard or (
+            "👑 <b>Rain Deals Admin Panel</b>\n\n"
+            "Welcome to the admin workspace. Choose an option below."
+        )
+        menu_card = await update_card(
+            message,
+            text=admin_text,
+            reply_markup=_get_admin_panel_with_providers(),
+            parse_mode="HTML",
+            delete_input=False,
+            chat_id=loading_location[0] if loading_location else result["profile"].get("home_menu_chat_id"),
+            message_id=loading_location[1] if loading_location else result["profile"].get("home_menu_message_id"),
+            owner_id=telegram_id,
+            disable_web_page_preview=True,
+        )
+        if menu_card:
+            await asyncio.to_thread(
+                _save_home_menu_location,
+                telegram_id,
+                int(menu_card.chat.id),
+                int(menu_card.message_id),
+            )
+        logger.info(
+            "start_timing user_id=%s admin=true loader_ms=%.1f db_ms=%.1f total_ms=%.1f",
+            telegram_id,
+            loader_ms,
+            db_ms,
+            (time.perf_counter() - started_at) * 1000,
+        )
+        return
+    if vendor_request_id is not None:
+        from handlers.vendor import prepare_request_application
+
+        form_text, form_markup = await prepare_request_application(state, vendor_request_id)
+        menu_card = await update_card(
+            message,
+            text=form_text or "This provider request has closed. You can view current requests in the vendor channel.",
+            reply_markup=form_markup,
+            parse_mode="HTML",
+            delete_input=False,
+            chat_id=loading_location[0] if loading_location else result["profile"].get("home_menu_chat_id"),
+            message_id=loading_location[1] if loading_location else result["profile"].get("home_menu_message_id"),
+            owner_id=telegram_id,
+            disable_web_page_preview=True,
+        )
+        if menu_card:
+            await asyncio.to_thread(
+                _save_home_menu_location,
+                telegram_id,
+                int(menu_card.chat.id),
+                int(menu_card.message_id),
+            )
+        logger.info(
+            "start_timing user_id=%s vendor_request=%s loader_ms=%.1f db_ms=%.1f total_ms=%.1f",
+            telegram_id,
+            vendor_request_id,
+            loader_ms,
+            db_ms,
+            (time.perf_counter() - started_at) * 1000,
+        )
+        return
     if deep_link_product_id is not None:
         from handlers.products import product_info
 
         await product_info(message, deep_link_product_id)
         return
 
-    username_started_at = time.perf_counter()
-    try:
-        bot_username = await _get_bot_username(message.bot)
-    except Exception:
-        # A temporary getMe failure must not strand the user on the loader.
-        logger.warning("Could not load bot username while rendering /start", exc_info=True)
-        bot_username = ""
-    username_ms = (time.perf_counter() - username_started_at) * 1000
     user.username = username
     user.full_name = full_name
-    text = _build_start_welcome(user, full_name, telegram_id, username, bot_username)
-    keyboard = get_admin_main_menu(unread) if is_admin else get_main_menu(unread)
-    if deposit_action:
-        if deposit_action["kind"] == "status":
-            label = f"⏳ Payment checking · #{deposit_action['id']}"
-            callback_data = f"resume_deposit_{deposit_action['id']}"
-        else:
-            label = f"💳 Resume payment · {deposit_action['code']}"
-            callback_data = f"resume_deposit_{deposit_action['id']}"
-        keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text=label, callback_data=callback_data, style="success")])
+    text = _build_start_welcome(user, full_name, telegram_id, username, "")
+    keyboard = get_start_choice_menu()
     card_started_at = time.perf_counter()
     menu_card = await update_card(
         message,
@@ -764,13 +846,12 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         )
         menu_save_ms = (time.perf_counter() - menu_save_started_at) * 1000
     logger.info(
-        "start_timing user_id=%s loader_ms=%.1f membership_ms=%.1f db_ms=%.1f username_ms=%.1f "
+        "start_timing user_id=%s loader_ms=%.1f membership_ms=%.1f db_ms=%.1f "
         "card_ms=%.1f menu_save_ms=%.1f visible_ms=%.1f total_ms=%.1f",
         telegram_id,
         loader_ms,
         membership_ms,
         db_ms,
-        username_ms,
         card_ms,
         menu_save_ms,
         (time.perf_counter() - started_at - menu_save_ms / 1000) * 1000,

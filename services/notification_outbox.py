@@ -98,6 +98,7 @@ def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_m
                 'wallet_adjustment' if prefix in ('wallet-adjustment', 'balance-adjustment') else
                 'subscription' if prefix == 'subscription' else
                 'restock' if prefix == 'restock' else
+                'provider' if prefix.startswith('vendor') else
                 'order_progress' if prefix in ('order-progress', 'order_progress') else
                 'order_delivery' if prefix == 'manual-delivery' else
                 'order_update' if prefix in ('delivery-start', 'order-information',

@@ -211,6 +211,77 @@ async def _show_add_product_category_picker(target, state: FSMContext, page: int
     )
 
 
+def _reseller_catalog_keyboard(options: list[dict[str, str | int]], page: int = 0) -> InlineKeyboardMarkup:
+    total_pages = max(1, (len(options) + _ADD_CATEGORY_PAGE_SIZE - 1) // _ADD_CATEGORY_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * _ADD_CATEGORY_PAGE_SIZE
+    rows = []
+    for index, option in enumerate(options[start:start + _ADD_CATEGORY_PAGE_SIZE], start=start):
+        name = str(option["name"])
+        label = name if len(name) <= 31 else name[:28].rstrip() + "…"
+        rows.append([InlineKeyboardButton(
+            text=f"🏷 {label} ({option['count']})",
+            callback_data=f"reseller_catalog_pick_{index}",
+            style="primary",
+        )])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅ Previous", callback_data=f"reseller_catalog_page_{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="reseller_catalog_page_current"))
+        if page + 1 < total_pages:
+            nav.append(InlineKeyboardButton(text="Next ➡", callback_data=f"reseller_catalog_page_{page + 1}"))
+        rows.append(nav)
+    rows.extend([
+        [InlineKeyboardButton(text="➕ Create new catalog", callback_data="reseller_catalog_new")],
+        [InlineKeyboardButton(text="⬅ Back to import options", callback_data="reseller_catalog_options")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_reseller_catalog_choice(target, state: FSMContext):
+    data = await state.get_data()
+    provider_category = str(data.get("provider_category") or "").strip()
+    provider_label = provider_category or "Reseller"
+    await state.set_state(AddProduct.reseller_catalog)
+    await answer_card(
+        target,
+        "🏷 <b>Choose where to list this reseller product</b>\n\n"
+        "The provider item will be imported into your shop catalog. Choose an existing catalog, create a new one, "
+        "keep the provider category, or list it without a catalog.\n\n"
+        f"Provider category: <b>{_esc(provider_label)}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏷 Add to existing catalog", callback_data="reseller_catalog_existing")],
+            [InlineKeyboardButton(text="➕ Create new catalog", callback_data="reseller_catalog_new")],
+            [InlineKeyboardButton(text=f"↪ Use provider category · {provider_label[:24]}", callback_data="reseller_catalog_provider")],
+            [InlineKeyboardButton(text="📦 No catalog (single product)", callback_data="reseller_catalog_none")],
+            [InlineKeyboardButton(text="⬅ Back to provider items", callback_data=f"reseller_selected:{data.get('reseller_id')}")],
+        ]),
+        state=state,
+    )
+
+
+async def _prompt_reseller_import_quantity(target, state: FSMContext):
+    data = await state.get_data()
+    await state.set_state(AddProduct.reseller_quantity)
+    stock = int(data.get("reseller_stock") or 0)
+    stock_display = str(stock) if stock < 999999 else "🟢 In Stock"
+    category = data.get("category") or "Single product (no catalog)"
+    await answer_card(
+        target,
+        f"✅ <b>Catalog:</b> {_esc(str(category))}\n\n"
+        f"🔗 <b>Product:</b> {_esc(str(data.get('reseller_product_name') or data.get('name') or 'Reseller product'))}\n"
+        f"💰 <b>Provider cost:</b> ${Decimal(str(data.get('reseller_cost') or 0)):.2f}\n"
+        f"📦 <b>Provider stock:</b> {stock_display}\n"
+        f"💳 <b>Provider wallet:</b> ${float(data.get('provider_balance') or 0):.2f}\n"
+        f"✅ <b>Maximum affordable quantity:</b> {int(data.get('max_import_quantity') or 0)}\n\n"
+        f"Enter the quantity to list (1–{int(data.get('max_import_quantity') or 0)}).",
+        parse_mode="HTML",
+        state=state,
+    )
+
+
 async def _continue_add_product_after_category(target, state: FSMContext, category: str | None):
     await state.update_data(
         source="own",
@@ -571,56 +642,69 @@ def _get_reseller_credentials(reseller_id: str | None = None) -> dict:
 # ║           START — CREATE PRODUCT FLOW                        ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-async def _show_product_source_selection(target: Message | CallbackQuery, state: FSMContext):
+async def _show_product_source_selection(
+    target: Message | CallbackQuery,
+    state: FSMContext,
+    *,
+    freebie: bool = False,
+):
     """Ask how the product should be cataloged before collecting details."""
     await state.clear()
+    if freebie:
+        await state.update_data(freebie_mode=True)
     await state.set_state(AddProduct.source)
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
+    existing_callback = "freebie:existing_catalog" if freebie else "addproduct:existing_catalog"
+    new_callback = "freebie:new_catalog" if freebie else "addproduct:new_catalog"
+    single_callback = "freebie:single_product" if freebie else "addproduct:single_product"
+    back_callback = "admin_freebies" if freebie else "admin_products"
+    keyboard_rows = [
             [
                 InlineKeyboardButton(
                     text="🏷 Add to Existing Catalog",
-                    callback_data="addproduct:existing_catalog",
+                    callback_data=existing_callback,
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="➕ Create New Catalog",
-                    callback_data="addproduct:new_catalog",
+                    callback_data=new_callback,
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="📦 Add Single Product (No Catalog)",
-                    callback_data="addproduct:single_product",
+                    callback_data=single_callback,
                 )
             ],
-            [
+    ]
+    if not freebie:
+        keyboard_rows.append([
                 InlineKeyboardButton(
                     text="🔗 Import from Reseller",
                     callback_data="addproduct:reseller",
                 )
-            ],
+            ])
+    keyboard_rows.extend([
             [
                 InlineKeyboardButton(
                     text="❌ Cancel",
-                    callback_data="admin_products",
+                    callback_data=back_callback,
                 )
             ]
-        ]
-    )
+        ])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
     text = (
         "╔══════════════════════════════╗\n"
-        "║  📦 CREATE NEW PRODUCT        ║\n"
+        f"║  {'🎁 CREATE FREEBIE' if freebie else '📦 CREATE NEW PRODUCT'}        ║\n"
         "╚══════════════════════════════╝\n\n"
         "Choose how to organize this product before entering its details.\n\n"
         "🏷 <b>Existing Catalog</b> — add it under a category already in your shop.\n"
         "➕ <b>New Catalog</b> — create a category, then add the product.\n"
         "📦 <b>Single Product</b> — add it without a category.\n"
-        "🔗 <b>Import from Reseller</b> — fetch a provider product.\n\n"
-        "👇 <b>Choose the first step:</b>"
+        + ("🎁 <b>Freebie</b> — price is set to $0 and it appears in the Freebies section.\n\n" if freebie else "🔗 <b>Import from Reseller</b> — fetch a provider product.\n\n")
+        + "👇 <b>Choose the first step:</b>"
     )
 
     if isinstance(target, CallbackQuery):
@@ -646,48 +730,65 @@ async def cb_add_product(callback: CallbackQuery, state: FSMContext):
     await _show_product_source_selection(callback, state)
 
 
-@router.callback_query(F.data == "addproduct:existing_catalog")
+@router.callback_query(F.data == "create_freebie")
+async def cb_add_freebie(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Admin only.", show_alert=True)
+        return
+    await callback.answer()
+    await _show_product_source_selection(callback, state, freebie=True)
+
+
+@router.callback_query(F.data.in_({"addproduct:existing_catalog", "freebie:existing_catalog"}))
 async def add_product_existing_catalog(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("❌ Admin only.", show_alert=True)
         return
     options = await asyncio.to_thread(_load_product_category_options)
     await state.clear()
-    await state.update_data(product_category_options=options, category_input=False)
+    await state.update_data(
+        product_category_options=options,
+        category_input=False,
+        freebie_mode=callback.data.startswith("freebie:"),
+    )
     await state.set_state(AddProduct.category)
     await callback.answer()
     await _show_add_product_category_picker(callback, state)
 
 
-@router.callback_query(F.data == "addproduct:new_catalog")
+@router.callback_query(F.data.in_({"addproduct:new_catalog", "freebie:new_catalog"}))
 async def add_product_new_catalog(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("❌ Admin only.", show_alert=True)
         return
     await state.clear()
-    await state.update_data(source="own", category_input=True)
+    freebie = callback.data.startswith("freebie:")
+    await state.update_data(source="own", category_input=True, freebie_mode=freebie)
     await state.set_state(AddProduct.category)
     await callback.answer()
     await answer_card(
         callback,
-        "➕ <b>Create New Catalog</b>\n\n"
+        f"{'🎁 <b>Create Freebie Catalog</b>' if freebie else '➕ <b>Create New Catalog</b>'}\n\n"
         "✏️ <b>Step 1/10: New Catalog</b>\n\n"
         "Send the new category name (up to 255 characters).\n"
         "Example: <code>Gemini AI Pro</code>",
         parse_mode="HTML",
         state=state,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="⬅ Back", callback_data="create_product")
+            InlineKeyboardButton(text="⬅ Back", callback_data="create_freebie" if freebie else "create_product")
         ]]),
     )
 
 
-@router.callback_query(F.data == "addproduct:single_product")
+@router.callback_query(F.data.in_({"addproduct:single_product", "freebie:single_product"}))
 async def add_single_product(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("❌ Admin only.", show_alert=True)
         return
     await callback.answer()
+    if callback.data.startswith("freebie:"):
+        await state.clear()
+        await state.update_data(freebie_mode=True)
     await _continue_add_product_after_category(callback, state, None)
 
 
@@ -988,6 +1089,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, state: FSMC
             return
 
         await state.update_data(reseller_products_cache=products_cache)
+        await state.set_state(AddProduct.reseller_product)
 
         buttons.append([
             InlineKeyboardButton(
@@ -1035,6 +1137,9 @@ async def reseller_product_selected(callback: CallbackQuery, state: FSMContext):
 
     product_token = callback.data.split(":", 1)[1]
     data = await state.get_data()
+    if await state.get_state() != AddProduct.reseller_product.state:
+        await callback.answer("Refresh the provider catalog and select the item again.", show_alert=True)
+        return
     products_cache = data.get("reseller_products_cache", {})
 
     selected = products_cache.get(product_token)
@@ -1102,6 +1207,11 @@ async def reseller_product_selected(callback: CallbackQuery, state: FSMContext):
         reseller_stock,
     )
 
+    provider_category = selected.get("category") or selected.get("productType") or selected.get("type") or "Reseller"
+    if isinstance(provider_category, dict):
+        provider_category = provider_category.get("name") or provider_category.get("title") or "Reseller"
+    provider_category = str(provider_category).strip()[:255] or "Reseller"
+
     await state.update_data(
         source="reseller",
         reseller_service_id=service_id,
@@ -1113,30 +1223,172 @@ async def reseller_product_selected(callback: CallbackQuery, state: FSMContext):
         max_import_quantity=max_import_quantity,
         reseller_name=reseller_name,
         icon=selected.get("emoji", "📦") or "📦",
-        category=selected.get("productType", "reseller") or "reseller",
+        provider_category=provider_category,
+        category=None,
         description=selected.get("description", f"Imported from reseller: {reseller_product_name}"),
         delivery_type="automatic",
     )
-
-    await state.set_state(AddProduct.reseller_quantity)
-
-    stock_display = f"{reseller_stock}" if reseller_stock < 999999 else "🟢 In Stock"
-
-    await answer_card(callback,
-        f"🔗 <b>Selected Reseller Product:</b>\n"
-        f"<b>{_esc(reseller_product_name)}</b>\n\n"
-        f"💰 <b>Provider Cost:</b> ${reseller_cost:.2f}\n"
-        f"📦 <b>Provider Stock:</b> {stock_display}\n"
-        f"💳 <b>Provider Wallet:</b> ${provider_balance:.2f}\n"
-        f"✅ <b>Maximum affordable quantity:</b> {max_import_quantity}\n\n"
-        f"🏪 <b>Provider:</b> {_esc(reseller_name)}\n"
-        f"🆔 <b>Service ID:</b> <code>{_esc(service_id)}</code>\n\n"
-        f"{_divider('─')}\n\n"
-        f"📦 <b>Enter the exact quantity to add (1–{max_import_quantity}):</b>",
-        parse_mode="HTML"
-    )
+    await _show_reseller_catalog_choice(callback, state)
 
     await callback.answer()
+
+
+@router.callback_query(F.data == "reseller_catalog_existing")
+async def reseller_catalog_existing(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Admin only.", show_alert=True)
+        return
+    if await state.get_state() != AddProduct.reseller_catalog.state:
+        await callback.answer("This import has expired. Select the provider item again.", show_alert=True)
+        return
+    options = await asyncio.to_thread(_load_product_category_options)
+    await state.update_data(reseller_category_options=options)
+    if not options:
+        await callback.answer()
+        await answer_card(
+            callback,
+            "No existing catalogs were found. Create a catalog, use the provider category, or list this as a single product.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Create new catalog", callback_data="reseller_catalog_new")],
+                [InlineKeyboardButton(text="↪ Use provider category", callback_data="reseller_catalog_provider")],
+                [InlineKeyboardButton(text="📦 No catalog", callback_data="reseller_catalog_none")],
+                [InlineKeyboardButton(text="⬅ Back", callback_data="reseller_catalog_options")],
+            ]),
+        )
+        return
+    await callback.answer()
+    await answer_card(
+        callback,
+        "🏷 <b>Choose an existing catalog for this reseller product</b>",
+        parse_mode="HTML",
+        reply_markup=_reseller_catalog_keyboard(options),
+        state=state,
+    )
+
+
+@router.callback_query(F.data.regexp(r"^reseller_catalog_page_(?:\d+|current)$"))
+async def reseller_catalog_page(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Admin only.", show_alert=True)
+        return
+    if await state.get_state() != AddProduct.reseller_catalog.state:
+        await callback.answer("This import has expired.", show_alert=True)
+        return
+    if callback.data.endswith("_current"):
+        await callback.answer()
+        return
+    try:
+        page = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Invalid catalog page.", show_alert=True)
+        return
+    data = await state.get_data()
+    options = data.get("reseller_category_options") or []
+    if not options:
+        await callback.answer("Refresh the catalog list.", show_alert=True)
+        return
+    await callback.answer()
+    await answer_card(callback, "🏷 <b>Choose an existing catalog</b>", parse_mode="HTML",
+                      reply_markup=_reseller_catalog_keyboard(options, page), state=state)
+
+
+@router.callback_query(F.data.regexp(r"^reseller_catalog_pick_\d+$"))
+async def reseller_catalog_pick(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Admin only.", show_alert=True)
+        return
+    if await state.get_state() != AddProduct.reseller_catalog.state:
+        await callback.answer("This import has expired.", show_alert=True)
+        return
+    try:
+        index = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Invalid catalog selection.", show_alert=True)
+        return
+    data = await state.get_data()
+    options = data.get("reseller_category_options") or []
+    if index < 0 or index >= len(options):
+        await callback.answer("That catalog is no longer available.", show_alert=True)
+        return
+    category = str(options[index]["name"]).strip()[:255]
+    await state.update_data(category=category)
+    await callback.answer()
+    await _prompt_reseller_import_quantity(callback, state)
+
+
+@router.callback_query(F.data == "reseller_catalog_options")
+async def reseller_catalog_options(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Admin only.", show_alert=True)
+        return
+    if await state.get_state() != AddProduct.reseller_catalog.state:
+        await callback.answer("This import has expired.", show_alert=True)
+        return
+    await callback.answer()
+    await _show_reseller_catalog_choice(callback, state)
+
+
+@router.callback_query(F.data == "reseller_catalog_new")
+async def reseller_catalog_new(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Admin only.", show_alert=True)
+        return
+    if await state.get_state() != AddProduct.reseller_catalog.state:
+        await callback.answer("This import has expired.", show_alert=True)
+        return
+    await callback.answer()
+    await state.set_state(AddProduct.reseller_new_category)
+    await answer_card(
+        callback,
+        "➕ <b>Create a catalog for this reseller product</b>\n\n"
+        "Send the catalog name (1–255 characters), or /cancel to return.",
+        parse_mode="HTML",
+        state=state,
+    )
+
+
+@router.message(AddProduct.reseller_new_category)
+async def reseller_catalog_new_name(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    from services.input_forms import is_cancel
+    value = (message.text or "").strip()
+    if is_cancel(value):
+        await state.set_state(AddProduct.reseller_catalog)
+        await _show_reseller_catalog_choice(message, state)
+        return
+    if not value or len(value) > 255:
+        await answer_card(message, "Send a catalog name from 1 to 255 characters, or /cancel.")
+        return
+    await state.update_data(category=value)
+    await _prompt_reseller_import_quantity(message, state)
+
+
+@router.callback_query(F.data == "reseller_catalog_provider")
+async def reseller_catalog_provider(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Admin only.", show_alert=True)
+        return
+    if await state.get_state() != AddProduct.reseller_catalog.state:
+        await callback.answer("This import has expired.", show_alert=True)
+        return
+    data = await state.get_data()
+    await state.update_data(category=data.get("provider_category") or "Reseller")
+    await callback.answer()
+    await _prompt_reseller_import_quantity(callback, state)
+
+
+@router.callback_query(F.data == "reseller_catalog_none")
+async def reseller_catalog_none(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Admin only.", show_alert=True)
+        return
+    if await state.get_state() != AddProduct.reseller_catalog.state:
+        await callback.answer("This import has expired.", show_alert=True)
+        return
+    await state.update_data(category=None)
+    await callback.answer()
+    await _prompt_reseller_import_quantity(callback, state)
 
 
 @router.message(AddProduct.reseller_quantity)
@@ -1211,11 +1463,25 @@ async def product_icon(message: Message, state: FSMContext):
         await answer_card(message, "❌ <b>Icon too long!</b>\nUse 1-15 characters. An emoji is best: 🎬", parse_mode="HTML")
         return
 
-    await state.update_data(icon=icon)
-    await state.set_state(AddProduct.price)
     data = await state.get_data()
+    await state.update_data(icon=icon)
     category = data.get("category")
     catalog_label = category if category else "Single product (no catalog)"
+    if data.get("freebie_mode"):
+        await state.update_data(price=0, _zero_confirmed=True)
+        await state.set_state(AddProduct.description)
+        await answer_card(
+            message,
+            f"✅ <b>Icon:</b> {_esc(icon)}\n🏷 <b>Catalog:</b> {_esc(catalog_label)}\n"
+            "🎁 <b>Freebie price:</b> $0.00\n\n"
+            f"{_divider('─')}\n\n"
+            "✏️ <b>Next: Description</b>\n\n"
+            "Send the freebie description, or send <code>skip</code>.",
+            parse_mode="HTML",
+            state=state,
+        )
+        return
+    await state.set_state(AddProduct.price)
     await answer_card(
         message,
         f"✅ <b>Icon:</b> {_esc(icon)}\n"
@@ -1382,6 +1648,7 @@ async def _save_reseller_product(message, state, data, price):
 
         if existing_product:
             existing_product.name = data["name"]
+            existing_product.category = data.get("category")
             existing_product.price = price
             existing_product.reseller_cost = reseller_cost
             existing_product.reseller_name = reseller_name
@@ -1441,6 +1708,7 @@ async def _save_reseller_product(message, state, data, price):
     text = (
         f"✅ <b>Reseller Product {action_str}</b>\n\n"
         f"🔗 <b>{_esc(product.name)}</b>\n\n"
+        f"🏷 <b>Catalog:</b> {_esc(product.category or 'Single product (no catalog)')}\n\n"
         f"💰 <b>Reseller Cost:</b>\n${float(reseller_cost or 0.0):.2f}\n\n"
         f"💵 <b>Selling Price:</b>\n${float(product.price):.2f}\n\n"
         f"📦 <b>Stock:</b>\n{stock_display}\n\n"
@@ -1972,15 +2240,17 @@ async def _finish_own_product(message, state):
         logger.exception("Failed to send stock notification for new product %s", pid)
 
     # Build success message
+    is_freebie = bool(data.get("freebie_mode"))
     text_parts = [
         "╔══════════════════════════════╗",
-        "║  ✅ PRODUCT CREATED ✨        ║",
+        "║  ✅ FREEBIE CREATED ✨        ║" if is_freebie else "║  ✅ PRODUCT CREATED ✨        ║",
         "╚══════════════════════════════╝",
         "",
         f"🆔 <b>ID:</b> {pid}",
         f"📦 <b>Name:</b> {product.icon} {_esc(product.name)}",
         f"🏷 <b>Category:</b> {_esc(product.category)}",
-        f"💰 <b>Base Price:</b> ${float(product.price):.2f}",
+        (f"🎁 <b>Freebie price:</b> ${float(product.price):.2f}" if is_freebie
+         else f"💰 <b>Base Price:</b> ${float(product.price):.2f}"),
         f"📊 <b>Stock:</b> {product.stock}",
         f"🚚 <b>Delivery:</b> {product.delivery_type}",
         f"Manual fallback: {'Yes' if product.manual_fallback else 'No'}",
@@ -2018,7 +2288,10 @@ async def _finish_own_product(message, state):
         text_parts.append(f"\n🔑 <b>Accounts loaded:</b> {len(accounts)}")
 
     text_parts.append(f"\n{_divider('═')}")
-    text_parts.append("\n✅ <b>Product is now live!</b>")
+    text_parts.append(
+        "\n✅ <b>Freebie is now live in the Freebies section!</b>"
+        if is_freebie else "\n✅ <b>Product is now live!</b>"
+    )
 
     text = "\n".join(text_parts)
 
@@ -2027,13 +2300,13 @@ async def _finish_own_product(message, state):
             [
                 InlineKeyboardButton(
                     text="📦 Product Manager",
-                    callback_data="admin_products",
+                    callback_data="admin_freebies" if is_freebie else "admin_products",
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="➕ Create Another",
-                    callback_data="create_product",
+                    callback_data="create_freebie" if is_freebie else "create_product",
                 ),
                 InlineKeyboardButton(
                     text="📋 Manage This Product",

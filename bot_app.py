@@ -30,6 +30,7 @@ from handlers.start import router as start_router
 from handlers.restart import router as restart_router
 from handlers.order_workflow import router as order_workflow_router
 from handlers.bot_operations import router as bot_operations_router
+from handlers.vendor import router as vendor_router
 from handlers.customer_tools import router as customer_tools_router
 from handlers.products import _fetch_active_products, router as products_router
 from handlers.orders import router as orders_router
@@ -191,6 +192,7 @@ dp.include_router(restart_router)
 dp.include_router(order_workflow_router)
 dp.include_router(customer_tools_router)
 dp.include_router(bot_operations_router)
+dp.include_router(vendor_router)
 
 dp.include_router(
     products_router

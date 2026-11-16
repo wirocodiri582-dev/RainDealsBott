@@ -10,6 +10,7 @@ from models.bot_resume_session import BotResumeSession
 from models.order_workflow import CheckoutAttempt, OrderEvent, OrderWorkNote
 from models.bot_operations import WarrantyRequest, NotificationJob, ProviderHealth
 from models.api_key import ApiKey, ApiOrder, ApiRateLimitBucket
+from models.vendor_offer import VendorOffer, VendorRequest
 
 
 def _ensure_column(connection, table: str, column: str, definition: str) -> bool:
@@ -83,6 +84,8 @@ def ensure_order_requirements_schema() -> None:
             ApiKey.__table__, ApiOrder.__table__, ApiRateLimitBucket.__table__,
             CartItem.__table__, CartCheckout.__table__, CustomerPreferences.__table__, CustomerJobCursor.__table__,
             ClaimMessage.__table__, CancellationRequest.__table__, WalletEntry.__table__,
+            VendorOffer.__table__,
+            VendorRequest.__table__,
         ]
     try:
         Base.metadata.create_all(bind=engine, tables=required_tables)
@@ -124,6 +127,8 @@ def ensure_order_requirements_schema() -> None:
         _ensure_column(connection, 'orders', 'refund_amount', 'DECIMAL(20,8) NULL')
         _ensure_index(connection, 'bot_notification_jobs', ['bot_id','chat_id','status','error_code','next_attempt_at'], 'ix_notification_destination_backoff')
         _ensure_index(connection, 'bot_notification_jobs', ['bot_id','status','next_attempt_at','id'], 'ix_notification_delivery_queue')
+        _ensure_column(connection, 'bot_vendor_offers', 'request_id', 'INT NULL')
+        _ensure_index(connection, 'bot_vendor_offers', ['request_id'], 'ix_bot_vendor_offers_request_id')
         _ensure_unique_columns(connection, 'deposits', ['tx_hash'], 'uq_deposits_tx_hash')
         _ensure_unique_columns(connection, 'api_orders', ['api_key_id', 'client_order_id'], 'uq_api_order_client_id')
         _ensure_column(connection, 'api_orders', 'request_fingerprint', 'VARCHAR(64) NULL')

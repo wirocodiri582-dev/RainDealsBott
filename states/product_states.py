@@ -27,6 +27,8 @@ class AddProduct(StatesGroup):
     # Reseller flow
     reseller_select = State()
     reseller_product = State()
+    reseller_catalog = State()
+    reseller_new_category = State()
     reseller_quantity = State()
     reseller_price = State()
 

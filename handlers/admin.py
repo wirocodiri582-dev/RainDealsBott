@@ -18,7 +18,8 @@ from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardMarkup,
-    InlineKeyboardButton
+    InlineKeyboardButton,
+    WebAppInfo,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -27,7 +28,7 @@ from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import func, or_, select
 
 from database import SessionLocal
-from config import ADMIN_IDS, MAINTENANCE_PASSWORD_HASH, MANAGER_WEB_URL
+from config import ADMIN_IDS, MAINTENANCE_PASSWORD_HASH, MANAGER_WEB_URL, MINI_APP_URL
 
 from models.user import User
 from models.product import Product
@@ -194,6 +195,30 @@ def _get_admin_panel_with_providers() -> InlineKeyboardMarkup:
     base_markup = get_admin_panel()
     rows = [list(row) for row in base_markup.inline_keyboard]
 
+    shop_buttons = []
+    if MINI_APP_URL:
+        shop_buttons.append(InlineKeyboardButton(
+            text="🛍 Buy via site",
+            web_app=WebAppInfo(url=MINI_APP_URL),
+            style="success",
+        ))
+    shop_buttons.append(InlineKeyboardButton(
+        text="🤖 Buy via bot",
+        callback_data="products_menu",
+        style="primary",
+    ))
+    rows.insert(0, shop_buttons)
+    rows.insert(-1, [InlineKeyboardButton(
+        text="👤 User View",
+        callback_data="user_view",
+        style="primary",
+    )])
+    rows.insert(-1, [InlineKeyboardButton(
+        text="📣 Ask vendors for a product",
+        callback_data="vendor_request_new",
+        style="primary",
+    )])
+
     provider_btn = InlineKeyboardButton(text="🏪 Providers", callback_data="admin_providers")
 
     # Prevent duplicate button if already present
@@ -209,6 +234,7 @@ def _get_admin_panel_with_providers() -> InlineKeyboardMarkup:
         else:
             rows.append([provider_btn])
 
+    rows.insert(-1, [InlineKeyboardButton(text="📦 Vendor Offers", callback_data="vendor_queue_0")])
     rows.insert(-1, [InlineKeyboardButton(text="🛡 Warranty / refund requests", callback_data="warranty_queue_0")])
     rows.insert(-1, [InlineKeyboardButton(text="🔔 Notifications", callback_data="ops_notifications_0")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -347,9 +373,24 @@ def _load_admin_product_rows() -> list[tuple[int, bool, str, str, int]]:
     try:
         rows = db.query(
             Product.id, Product.is_active, Product.icon, Product.name, Product.stock
-        ).order_by(Product.id.desc()).all()
+        ).filter(Product.price > 0).order_by(Product.id.desc()).all()
         return [
             (int(product_id), bool(active), icon or "📦", name, int(stock or 0))
+            for product_id, active, icon, name, stock in rows
+        ]
+    finally:
+        db.close()
+
+
+def _load_admin_freebie_rows() -> list[tuple[int, bool, str, str, int]]:
+    """Fetch only zero-price items for the separate Freebies manager."""
+    db = SessionLocal()
+    try:
+        rows = db.query(
+            Product.id, Product.is_active, Product.icon, Product.name, Product.stock
+        ).filter(Product.price == 0).order_by(Product.id.desc()).all()
+        return [
+            (int(product_id), bool(active), icon or "🎁", name, int(stock or 0))
             for product_id, active, icon, name, stock in rows
         ]
     finally:
@@ -1631,7 +1672,8 @@ async def admin_products(callback: CallbackQuery):
     await callback.answer()
     products = await asyncio.to_thread(_load_admin_product_rows)
     keyboard = [
-        [InlineKeyboardButton(text="➕ New Product", callback_data="create_product")]
+        [InlineKeyboardButton(text="➕ New Product", callback_data="create_product")],
+        [InlineKeyboardButton(text="🎁 Manage Freebies", callback_data="admin_freebies")],
     ]
     for product_id, active, icon, name, stock in products:
         status = "🟢" if active else "🔴"
@@ -1644,7 +1686,31 @@ async def admin_products(callback: CallbackQuery):
     keyboard.append([InlineKeyboardButton(text="⬅ Back", callback_data="admin_panel")])
     await _safe_edit_text(
         callback.message,
-        "📦 <b>Product Management</b>",
+        "📦 <b>Product Management</b>\n\nPaid products are listed here. Manage zero-price freebies from the separate Freebies section.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+    )
+
+
+@router.callback_query(F.data == "admin_freebies")
+async def admin_freebies(callback: CallbackQuery):
+    await callback.answer()
+    freebies = await asyncio.to_thread(_load_admin_freebie_rows)
+    keyboard = [[InlineKeyboardButton(text="➕ Create Freebie", callback_data="create_freebie")]]
+    for product_id, active, icon, name, stock in freebies:
+        status = "🟢" if active else "🔴"
+        keyboard.append([InlineKeyboardButton(
+            text=f"#{product_id} {status} {icon} {name} ({stock})",
+            callback_data=f"manage_{product_id}",
+        )])
+    keyboard.extend([
+        [InlineKeyboardButton(text="📦 Product Manager", callback_data="admin_products")],
+        [InlineKeyboardButton(text="⬅ Back", callback_data="admin_panel")],
+    ])
+    await _safe_edit_text(
+        callback.message,
+        "🎁 <b>Freebies</b>\n\n"
+        "Freebies are zero-price products and can have their own catalog, inventory, and delivery settings.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
     )

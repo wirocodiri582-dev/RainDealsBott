@@ -7,7 +7,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, InlineKeyboardButton as Button, InlineKeyboardMarkup
 from config import ADMIN_IDS
 from services import warranty
-from services.input_forms import InputError, text_value, field_value, is_cancel
+from services.input_forms import InputError, text_value, is_cancel
 from utils.ui import show, answer_card, track_card
 from services.screen_controller import managed_screen
 
@@ -135,7 +135,9 @@ async def render_warranty(target, order_id, admin=False):
         buttons.append([Button(text='💬 Conversation / more proof', callback_data=f'ct_thread_{order_id}')])
         evidence = request['evidence']
         buttons.append([Button(text='🧾 Request details', callback_data=f'warranty_details_{order_id}')])
-        if evidence.get('kind') == 'photo' and evidence.get('file_id'):
+        if evidence.get('kind') == 'drive_link' and evidence.get('url'):
+            buttons.append([Button(text='🔗 Open Google Drive proof', url=evidence['url'])])
+        elif evidence.get('kind') == 'photo' and evidence.get('file_id'):
             buttons.append([Button(text='📷 View evidence', callback_data=f'warranty_photo_{order_id}')])
         if admin and ctx['reviewable'] and request['status'] == 'submitted':
             if not refund or request['refund_amount'] is not None:
@@ -260,13 +262,19 @@ async def warranty_input(message: Message, state: FSMContext):
         if await state.get_state() == Inputs.deactivated.state:
             await state.update_data(warranty_deactivated=text_value(message.text, 200))
             await state.set_state(Inputs.evidence)
-            await answer_card(message, '📷 Upload a screenshot showing deactivation or the error. Hide passwords and unrelated personal details.\n'
-                              + ('A screenshot is required for a refund.' if data['warranty_mode'] == 'refund' else 'You may also describe supporting evidence (10–2000 characters).')
-                              + '\n/cancel to stop.', reply_markup=back(order_id))
+            await answer_card(
+                message,
+                '📁 Upload screenshots/photos to Google Drive, then send the share link.\n\n'
+                'Set <b>General access → Anyone with the link</b> and grant Viewer access.\n'
+                'Do not send images in Telegram. Hide passwords and unrelated personal details.\n'
+                '/cancel to stop.',
+                parse_mode='HTML',
+                reply_markup=back(order_id),
+            )
             return
-        if data['warranty_mode'] == 'refund' and not message.photo:
-            raise InputError('Please upload a screenshot of the deactivation or error as a photo.')
-        evidence = field_value(message, 'photo') if message.photo else {'kind': 'text', 'value': text_value(message.text, 2000, 10)}
+        if message.photo or not message.text:
+            raise InputError('Send the public Google Drive sharing link as text; do not upload the photo here.')
+        evidence = {'kind': 'drive_link', 'url': warranty.validate_drive_link(message.text)}
     except InputError as error:
         await answer_card(message, str(error), reply_markup=back(order_id))
         return
@@ -305,7 +313,7 @@ async def claim_confirmation(target, state, notice=''):
     await state.update_data(warranty_expected_refund=str(ctx['quote']['refund_amount']) if refund and ctx['quote'] else None)
     text = (escape(notice)+'\n\n' if notice else '') + f'🧾 <b>Review claim · Order #{order_id}</b>\n\n'
     text += 'Problem: '+escape(data['warranty_reason'][:600])+'\nDeactivated (reported): '+escape(data['warranty_deactivated'])
-    text += '\nProof: screenshot attached.' if data['warranty_evidence']['kind'] == 'photo' else '\nProof: description attached.'
+    text += '\nProof: Google Drive share link added.'
     if refund:
         text += '\n\n'+warranty.quote_text(ctx['quote'])
     text += '\n\nSubmit for admin review? No credit or replacement is issued before approval.'
@@ -325,27 +333,9 @@ async def submit_claim(callback: CallbackQuery, state: FSMContext):
     if not data.get('warranty_product_confirmed'):
         await answer_card(callback,'Confirm the purchased product first.',reply_markup=back(order_id))
         return
-    proof = None
-    if data['warranty_evidence']['kind'] == 'photo':
-        from io import BytesIO
-        from services.claim_details import proof_mime, MAX_PROOF_BYTES
-        try:
-            file_meta = await callback.bot.get_file(data['warranty_evidence']['file_id'])
-            if file_meta.file_size is None or file_meta.file_size > MAX_PROOF_BYTES:
-                await answer_card(callback, 'Upload a screenshot smaller than 2 MB.', reply_markup=back(order_id))
-                return
-            buffer = BytesIO()
-            async with asyncio.timeout(20):
-                await callback.bot.download(data['warranty_evidence']['file_id'],destination=buffer)
-            proof = buffer.getvalue()
-            proof_mime(proof)
-        except Exception:
-            await answer_card(callback,'Could not save the screenshot for staff review. Try Submit claim again; your form is still saved.',reply_markup=keyboard([
-                [Button(text='Retry submit',callback_data=f'warranty_submit_{order_id}')],[Button(text='Back',callback_data=f'warranty_order_{order_id}')]]))
-            return
     error = await asyncio.to_thread(warranty.submit, order_id, callback.from_user.id,
         data['warranty_reason'], data['warranty_evidence'], data['warranty_deactivated'], data.get('warranty_expected_refund'),
-        issue_type=data.get('warranty_issue_type','other'),product_confirmed=True,proof_bytes=proof)
+        issue_type=data.get('warranty_issue_type','other'),product_confirmed=True)
     if error:
         await claim_confirmation(callback, state, error)
         return

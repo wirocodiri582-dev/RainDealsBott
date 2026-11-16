@@ -5,7 +5,7 @@
     category: "All", search: "", stockOnly: false, sort: "featured", cart: { items: [] },
     unread: 0, botUsername: "", depositMethods: [], currentProductId: null, buyerInfoDraft: {},
     currentView: "store", cartPending: new Map(), productDetails: new Map(),
-    productsRequest: 0, productRequest: 0, catalogLoadedAt: 0, cartReady: false, modal: null,
+    productsRequest: 0, productRequest: 0, catalogLoadedAt: 0, productsRequests: new Map(), cartReady: false, modal: null,
     notificationPage: 0, depositTimer: null, qrObjectUrl: null, currentDepositId: null,
     cartLoadPromise: null,
   };
@@ -98,22 +98,73 @@
     return state.cartLoadPromise;
   }
 
+  function catalogCacheKey(freebies) {
+    const telegramId = tg?.initDataUnsafe?.user?.id;
+    return telegramId ? `raindeals_catalog_v1_${telegramId}_${freebies ? "freebies" : "products"}` : "";
+  }
+
+  function readCatalogCache(freebies) {
+    const key = catalogCacheKey(freebies);
+    if (!key) return null;
+    try {
+      const value = JSON.parse(sessionStorage.getItem(key) || "null");
+      return value && Array.isArray(value.products) && Number(value.savedAt) > 0 ? value : null;
+    } catch { return null; }
+  }
+
+  function saveCatalogCache(freebies, products) {
+    const key = catalogCacheKey(freebies);
+    if (!key) return;
+    try { sessionStorage.setItem(key, JSON.stringify({ savedAt: Date.now(), products })); } catch {}
+  }
+
+  function invalidateCatalogCache() {
+    const telegramId = tg?.initDataUnsafe?.user?.id;
+    if (!telegramId) return;
+    for (const kind of ["products", "freebies"]) {
+      try { sessionStorage.removeItem(`raindeals_catalog_v1_${telegramId}_${kind}`); } catch {}
+    }
+  }
+
   async function loadProducts(freebies = state.freebies, { preserveCategory = false, quiet = false } = {}) {
     state.freebies = freebies;
-    const requestId = ++state.productsRequest;
     const previousCategory = state.category;
-    if (!state.products.length && !quiet) {
-      $("#product-grid").innerHTML = `<div class="loading-card"><span class="spinner"></span><span>Loading products…</span></div>`;
+    const cached = readCatalogCache(freebies);
+    const existing = state.productsRequests.get(Boolean(freebies));
+    if (existing && existing.id === state.productsRequest) return existing.promise;
+    const requestId = ++state.productsRequest;
+    let hasCached = Boolean(cached && Date.now() - cached.savedAt < 10 * 60_000);
+    if (hasCached) {
+      state.products = cached.products;
+      state.catalogLoadedAt = cached.savedAt;
+      state.category = preserveCategory && state.products.some(row => row.category === previousCategory)
+        ? previousCategory : "All";
+      renderStore();
+    } else if (!state.products.length && !quiet) {
+      $("#product-grid").innerHTML = `<div class="loading-card"><span class="spinner"></span><span><b>Refreshing RainDeals catalog</b><small>Getting the latest products and stock…</small><i class="loading-progress"></i></span></div>`;
       $("#empty-state").classList.add("hidden");
     }
-    const data = await api(`/products?freebies=${freebies ? "true" : "false"}`);
-    if (requestId !== state.productsRequest) return;
-    state.catalogLoadedAt = Date.now();
-    state.productDetails.clear();
-    state.products = data.products || [];
-    state.category = preserveCategory && state.products.some(row => row.category === previousCategory)
-      ? previousCategory : "All";
-    renderStore();
+    const promise = (async () => {
+      try {
+        const data = await api(`/products?freebies=${freebies ? "true" : "false"}`);
+        if (requestId !== state.productsRequest) return;
+        state.catalogLoadedAt = Date.now();
+        state.productDetails.clear();
+        state.products = data.products || [];
+        saveCatalogCache(freebies, state.products);
+        state.category = preserveCategory && state.products.some(row => row.category === previousCategory)
+          ? previousCategory : "All";
+        renderStore();
+      } catch (error) {
+        if (!hasCached) throw error;
+        if (!quiet) toast("Showing saved catalog. Refresh when your connection is back.");
+      } finally {
+        const active = state.productsRequests.get(Boolean(freebies));
+        if (active?.id === requestId) state.productsRequests.delete(Boolean(freebies));
+      }
+    })();
+    state.productsRequests.set(Boolean(freebies), { id: requestId, promise });
+    return promise;
   }
 
   async function refreshProducts() {
@@ -591,6 +642,7 @@
     const buyerInfo = buildBuyerInfo();
     try {
       const result = await api("/checkout", { method: "POST", body: JSON.stringify({ buyer_info: buyerInfo }) });
+      invalidateCatalogCache();
       const checkout = result.checkout || {};
       state.buyerInfoDraft = {};
       closeModal();
