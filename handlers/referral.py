@@ -1,24 +1,32 @@
+import logging
+import time
 from datetime import datetime
 from html import escape
 from urllib.parse import quote
 
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardButton, WebAppInfo
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func
 
 from database import SessionLocal
 from models.user import User
 from models.product import Product
-from config import ADMIN_IDS, MINI_APP_URL
+from config import ADMIN_IDS, MAIN_BOT_USERNAME, MINI_APP_URL
 from utils.ui import show, answer_card
 
 router = Router()
+logger = logging.getLogger(__name__)
+_bot_username_cache = MAIN_BOT_USERNAME
 
 
 @router.callback_query(F.data.regexp(r"^freebie_invite_\d{1,10}$"))
 async def freebie_referral_invite(callback: CallbackQuery):
     """Show the referral progress and share link for the selected freebie."""
+    global _bot_username_cache
+    started_at = time.perf_counter()
+    db_ms = 0.0
+    telegram_ms = 0.0
     try:
         product_id = int(str(callback.data).removeprefix("freebie_invite_"))
     except (TypeError, ValueError):
@@ -27,12 +35,13 @@ async def freebie_referral_invite(callback: CallbackQuery):
 
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.telegram_id == callback.from_user.id).first()
-        product = db.query(Product).filter(
+        db_started_at = time.perf_counter()
+        user, product = db.query(User, Product).filter(
+            User.telegram_id == callback.from_user.id,
             Product.id == product_id,
             Product.is_active.is_(True),
             Product.price == 0,
-        ).first()
+        ).first() or (None, None)
         if not user or not product or int(getattr(product, "freebie_referrals_required", 0) or 0) <= 0:
             await callback.answer("This referral offer is no longer available.", show_alert=True)
             return
@@ -41,16 +50,33 @@ async def freebie_referral_invite(callback: CallbackQuery):
         progress = verified_referral_count(db, callback.from_user.id)
         required = int(product.freebie_referrals_required or 0)
         needed = max(0, required - progress)
-        invited = int(db.query(func.count(User.id)).filter(
+        from sqlalchemy import and_, case
+        invite_stats = db.query(
+            func.count(User.id),
+            func.coalesce(func.sum(case((and_(
+                User.miniapp_verified_at.is_(None),
+                User.is_banned.is_(False),
+            ), 1), else_=0)), 0),
+        ).filter(
             User.referred_by == int(user.telegram_id),
-        ).scalar() or 0)
-        awaiting_store = int(db.query(func.count(User.id)).filter(
-            User.referred_by == int(user.telegram_id),
-            User.miniapp_verified_at.is_(None),
-            User.is_banned.is_(False),
-        ).scalar() or 0)
-        bot = await callback.bot.get_me()
-        link = f"https://t.me/{bot.username}?start=ref_{user.referral_code}"
+        ).one()
+        invited = int(invite_stats[0] or 0)
+        awaiting_store = int(invite_stats[1] or 0)
+        db_ms = (time.perf_counter() - db_started_at) * 1000
+        bot_username = _bot_username_cache
+        if not bot_username:
+            # MAIN_BOT_USERNAME avoids a Telegram network round-trip on every
+            # page open. Keep this fallback for deployments that have not set it.
+            telegram_started_at = time.perf_counter()
+            bot = await callback.bot.get_me()
+            telegram_ms += (time.perf_counter() - telegram_started_at) * 1000
+            bot_username = bot.username or ""
+            if bot_username:
+                _bot_username_cache = bot_username
+        if not bot_username:
+            await callback.answer("The invite link is temporarily unavailable.", show_alert=True)
+            return
+        link = f"https://t.me/{bot_username}?start=ref_{user.referral_code}"
         name = escape(str(product.name or "Freebie"))
         user_verified = bool(user.miniapp_verified_at)
         progress_bar = get_progress_bar(min(100, progress * 100 / required), length=10)
@@ -73,9 +99,19 @@ async def freebie_referral_invite(callback: CallbackQuery):
             [InlineKeyboardButton(text="📤 Share invite link", url=share_url)],
             [InlineKeyboardButton(text="🎁 Back to this freebie", callback_data=f"product_{product_id}")],
         ])
+        telegram_started_at = time.perf_counter()
         await show(callback, text, parse_mode="HTML", reply_markup=markup)
+        telegram_ms += (time.perf_counter() - telegram_started_at) * 1000
     finally:
         db.close()
+        total_ms = (time.perf_counter() - started_at) * 1000
+        if db_ms >= 500 or telegram_ms >= 500 or total_ms >= 1000:
+            logger.warning(
+                "freebie_invite_slow db_ms=%.1f telegram_ms=%.1f total_ms=%.1f",
+                db_ms,
+                telegram_ms,
+                total_ms,
+            )
     await callback.answer()
 
 

@@ -2806,8 +2806,17 @@ async def product_info(
                 text=invite_label[:64],
                 callback_data=f"freebie_invite_{product_id}",
                 style="primary",
-            ),
-            InlineKeyboardButton(text="🔄 Check unlock", callback_data=f"product_{product_id}", style="success"),
+            )
+        ])
+        # Keep the long invite CTA on a full-width row. Pairing it with the
+        # much shorter check button makes Telegram render two visibly uneven
+        # columns on narrow screens.
+        buttons.append([
+            InlineKeyboardButton(
+                text="🔄 Check unlock",
+                callback_data=f"product_{product_id}",
+                style="success",
+            )
         ])
     elif max_qty <= 0:
         text += f"\n❌ <b>Currently Unavailable</b>"

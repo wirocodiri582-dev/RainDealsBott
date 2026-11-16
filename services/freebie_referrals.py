@@ -17,56 +17,67 @@ from models.user import User
 
 
 def verified_referral_count(db: Session, telegram_id: int) -> int:
-    referrer_network = db.query(User.miniapp_ip_hash).filter(
+    # Aggregate the eligibility rules in one database round-trip. The previous
+    # implementation issued separate queries for the referrer's network,
+    # approved accounts, unique networks, and legacy accounts on every page
+    # refresh.
+    base_filters = (
+        User.referred_by == int(telegram_id),
+        User.telegram_id != int(telegram_id),
+        User.miniapp_verified_at.isnot(None),
+        User.is_banned.is_(False),
+    )
+    referrer_network = select(User.miniapp_ip_hash).where(
         User.telegram_id == int(telegram_id)
-    ).scalar()
-    base = db.query(User).filter(
-            User.referred_by == int(telegram_id),
-            User.telegram_id != int(telegram_id),
-            User.miniapp_verified_at.isnot(None),
-            User.is_banned.is_(False),
-        )
-    # Admin-approved referrals count individually. Unreviewed fingerprints
-    # count only when exactly one active verified invitee uses that network;
-    # counting DISTINCT fingerprints alone would incorrectly count a shared
-    # network while the UI marks its accounts as pending review.
-    approved = base.filter(
+    ).scalar_subquery()
+
+    approved_count = select(func.count(User.id)).where(
+        *base_filters,
         User.miniapp_referral_review_approved_at.isnot(None),
         User.miniapp_referral_review_rejected_at.is_(None),
-    )
-    approved_count = approved.count()
-    not_approved = base.filter(
+    ).scalar_subquery()
+
+    unreviewed_filters = (
+        *base_filters,
         User.miniapp_referral_review_approved_at.is_(None),
         User.miniapp_referral_review_rejected_at.is_(None),
     )
-    if referrer_network:
-        # Do not count a second Telegram account verified from the inviter's
-        # own observed network unless an admin explicitly reviews it.
-        not_approved = not_approved.filter(or_(
-            User.miniapp_ip_hash.is_(None),
-            User.miniapp_ip_hash != referrer_network,
-        ))
-    singleton_networks = (
-        base.filter(User.miniapp_ip_hash.isnot(None))
-        .with_entities(User.miniapp_ip_hash.label("network_hash"))
-        .group_by(User.miniapp_ip_hash)
-        .having(func.count(User.id) == 1)
-        .subquery()
-    )
-    unique_network_count = not_approved.filter(
+    singleton_networks = select(
+        User.miniapp_ip_hash.label("network_hash")
+    ).where(
+        *base_filters,
+        User.miniapp_ip_hash.isnot(None),
+    ).group_by(
+        User.miniapp_ip_hash
+    ).having(
+        func.count(User.id) == 1
+    ).subquery()
+
+    unique_network_count = select(
+        func.count(func.distinct(User.miniapp_ip_hash))
+    ).where(
+        *unreviewed_filters,
         User.miniapp_ip_hash.isnot(None),
         User.miniapp_ip_hash.in_(select(singleton_networks.c.network_hash)),
-    ).with_entities(
-        func.count(func.distinct(User.miniapp_ip_hash))
-    ).scalar() or 0
-    # Keep pre-rollout verified referrals that never received the one-time
-    # verification prompt. New referrals without a trustworthy fingerprint
-    # must be reviewed, not allowed to increase the reward counter.
-    legacy_without_network = not_approved.filter(
+        or_(
+            referrer_network.is_(None),
+            referrer_network == "",
+            User.miniapp_ip_hash != referrer_network,
+        ),
+    ).scalar_subquery()
+
+    legacy_without_network = select(func.count(User.id)).where(
+        *unreviewed_filters,
         User.miniapp_ip_hash.is_(None),
         User.miniapp_verification_prompted_at.is_(None),
-    ).count()
-    return int(approved_count) + int(unique_network_count) + int(legacy_without_network)
+    ).scalar_subquery()
+
+    result = db.execute(select(
+        approved_count.label("approved_count"),
+        unique_network_count.label("unique_network_count"),
+        legacy_without_network.label("legacy_count"),
+    )).one()
+    return int(result.approved_count or 0) + int(result.unique_network_count or 0) + int(result.legacy_count or 0)
 
 
 def referral_ip_fingerprint(request) -> str | None:
