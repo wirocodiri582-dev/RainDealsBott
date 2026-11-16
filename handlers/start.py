@@ -865,6 +865,9 @@ def _get_or_create_user(
             db.add(user)
             db.flush()
         else:
+            # Referral links are first-join attribution only. Never attach an
+            # inviter to an existing bot account, and do not emit referral
+            # completion notices for repeated /start clicks.
             # Avoid issuing profile updates on every /start when Telegram
             # profile details have not changed.
             if user.username != username:

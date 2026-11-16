@@ -112,6 +112,16 @@ def _summary(kind, plain, order=None, claim=None):
     if kind == 'support':
         return 'Support has replied or updated your ticket. Open Support to continue the conversation.'
     if kind == 'referral':
+        if 'rejected' in lower:
+            match = re.search(r'current completed referrals:\s*(\d+)', plain, re.IGNORECASE)
+            count = f' Completed referrals: {match.group(1)}.' if match else ''
+            return 'This referral was rejected and did not increase eligible progress.' + count
+        if 'review approved' in lower or 'referral was approved' in lower:
+            match = re.search(r'(?:freebie progress|completed referrals|eligible progress)[^0-9]{0,24}(\d+)', plain, re.IGNORECASE)
+            count = f' Eligible referrals: {match.group(1)}.' if match else ''
+            return 'A referral review was approved and the eligible count was updated.' + count
+        if 'pending admin review' in lower or 'review pending' in lower:
+            return 'This referral is not counted yet and is awaiting admin review.'
         if 'not counted' in lower or 'network matches' in lower or 'trusted client network could not be determined' in lower:
             return 'A referral did not increase freebie progress. Open the update for the reason or contact Support for a review.'
         if 'referral completed' in lower:

@@ -96,6 +96,7 @@ class User(Base):
     # Mini App visit. Raw IP addresses are never persisted.
     miniapp_ip_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     miniapp_referral_review_approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    miniapp_referral_review_rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     miniapp_referral_reviewed_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     total_referrals: Mapped[int] = mapped_column(

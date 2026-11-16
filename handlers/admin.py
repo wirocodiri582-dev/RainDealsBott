@@ -2357,6 +2357,29 @@ async def user_ban_toggle(callback: CallbackQuery):
             await callback.answer("User not found.", show_alert=True)
             return
         user.is_banned = not user.is_banned
+        referral_notice = None
+        if user.referred_by and user.miniapp_verified_at:
+            db.flush()
+            from services.freebie_referrals import verified_referral_count
+            from services.notification_outbox import enqueue
+
+            current_count = verified_referral_count(db, int(user.referred_by))
+            changed_at = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+            referral_notice = (
+                int(user.referred_by),
+                f"referral-account-status:{int(user.telegram_id)}:{changed_at}",
+                (
+                    "🚫 <b>Referral blocked · no longer counted</b>\n\n"
+                    f"A referred account (<code>{int(user.telegram_id)}</code>) was blocked. Its referral no longer contributes to eligible progress.\n\n"
+                    f"✅ Current completed referrals: <b>{current_count}</b>. Refresh Refer &amp; Earn to see the current list."
+                    if user.is_banned
+                    else "✅ <b>Referral account unblocked</b>\n\n"
+                    f"A referred account (<code>{int(user.telegram_id)}</code>) was unblocked. Eligible progress has been recalculated and may still require Store verification or referral review.\n\n"
+                    f"✅ Current completed referrals: <b>{current_count}</b>. Refresh Refer &amp; Earn to see the current list."
+                ),
+            )
+        if referral_notice:
+            enqueue(db, referral_notice[1], referral_notice[0], referral_notice[2])
         db.commit()
         status = "🚫 User banned." if user.is_banned else "✅ User unbanned."
         user_name = safe(user.full_name)

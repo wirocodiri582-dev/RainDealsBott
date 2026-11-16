@@ -120,6 +120,7 @@ def current_user(
                                 User.miniapp_verified_at.isnot(None),
                                 User.is_banned.is_(False),
                                 User.miniapp_referral_review_approved_at.is_(None),
+                                User.miniapp_referral_review_rejected_at.is_(None),
                                 User.miniapp_ip_hash == verified_user.miniapp_ip_hash,
                             ).all()
                             for matching_referral in matching_referrals:

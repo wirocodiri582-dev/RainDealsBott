@@ -39,8 +39,12 @@ async def approve_referral_review(callback: CallbackQuery):
         if referred.miniapp_referral_review_approved_at:
             await callback.answer("This referral was already approved.", show_alert=True)
             return
+        if referred.miniapp_referral_review_rejected_at:
+            await callback.answer("This referral was already rejected.", show_alert=True)
+            return
 
         referred.miniapp_referral_review_approved_at = datetime.utcnow()
+        referred.miniapp_referral_review_rejected_at = None
         referred.miniapp_referral_reviewed_by = int(callback.from_user.id)
         referrer = db.query(User).filter(
             User.telegram_id == int(referred.referred_by)
@@ -66,9 +70,16 @@ async def approve_referral_review(callback: CallbackQuery):
             lines.append(f"Next unlock: <b>{count}/{pending[0][1]}</b> verified referrals.")
         enqueue(
             db,
-            f"referral-review:{referred_id}",
+            f"referral-review-approved:{referred_id}",
             int(referred.referred_by),
             "\n\n".join(lines),
+        )
+        enqueue(
+            db,
+            f"referral-participant-approved:{referred_id}",
+            referred_id,
+            "✅ <b>Your referral was approved</b>\n\n"
+            "Your RainDeals Store verification was accepted for this referral. The inviter's completed referral count has been updated.",
         )
         enqueue_admin(
             db,
@@ -88,6 +99,74 @@ async def approve_referral_review(callback: CallbackQuery):
     except Exception:
         pass
     await callback.answer("Referral approved and progress updated.")
+
+
+@router.callback_query(F.data.regexp(r"^admin_referral_reject_\d{1,15}$"))
+async def reject_referral_review(callback: CallbackQuery):
+    """Reject an ineligible referral and notify both affected accounts."""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Admin access only.", show_alert=True)
+        return
+    try:
+        referred_id = int(str(callback.data).removeprefix("admin_referral_reject_"))
+    except ValueError:
+        await callback.answer("Referral review link is invalid.", show_alert=True)
+        return
+
+    from services.freebie_referrals import verified_referral_count
+    from services.notification_outbox import enqueue, enqueue_admin
+
+    db = SessionLocal()
+    try:
+        referred = db.query(User).filter(
+            User.telegram_id == referred_id
+        ).with_for_update().first()
+        if not referred or not referred.referred_by or not referred.miniapp_verified_at:
+            await callback.answer("This referral is no longer eligible for review.", show_alert=True)
+            return
+        if referred.miniapp_referral_review_approved_at:
+            await callback.answer("This referral was already approved.", show_alert=True)
+            return
+        if referred.miniapp_referral_review_rejected_at:
+            await callback.answer("This referral was already rejected.", show_alert=True)
+            return
+
+        referred.miniapp_referral_review_rejected_at = datetime.utcnow()
+        referred.miniapp_referral_reviewed_by = int(callback.from_user.id)
+        count = verified_referral_count(db, int(referred.referred_by))
+        enqueue(
+            db,
+            f"referral-review-rejected:{referred_id}",
+            int(referred.referred_by),
+            "❌ <b>Referral rejected · not counted</b>\n\n"
+            f"Referred account <code>{referred_id}</code> did not pass review. It was excluded from your eligible total.\n\n"
+            f"✅ Current completed referrals: <b>{count}</b>. Open Refer &amp; Earn and refresh to see the updated count.",
+        )
+        enqueue(
+            db,
+            f"referral-participant-rejected:{referred_id}",
+            referred_id,
+            "❌ <b>This referral was not counted</b>\n\n"
+            "An admin reviewed this referral and rejected it, so it did not increase referral rewards. Contact RainDeals Support if you think this decision is wrong.",
+        )
+        enqueue_admin(
+            db,
+            f"referral-review-rejected:{referred_id}",
+            f"❌ Referral account <code>{referred_id}</code> rejected by admin <code>{callback.from_user.id}</code>. "
+            f"Current eligible count for referrer <code>{int(referred.referred_by)}</code>: <b>{count}</b>.",
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer("Referral rejected; both users were notified.")
 
 
 # =====================================================
@@ -161,6 +240,30 @@ async def referrals(callback: CallbackQuery):
         )
         from services.freebie_referrals import verified_referral_count
         miniapp_verified_referrals = verified_referral_count(db, callback.from_user.id)
+        verified_accounts = int(db.query(func.count(User.id)).filter(
+            User.referred_by == int(user.telegram_id),
+            User.telegram_id != int(user.telegram_id),
+            User.miniapp_verified_at.isnot(None),
+            User.is_banned.is_(False),
+        ).scalar() or 0)
+        rejected_referrals = int(db.query(func.count(User.id)).filter(
+            User.referred_by == int(user.telegram_id),
+            User.miniapp_referral_review_rejected_at.isnot(None),
+            User.is_banned.is_(False),
+        ).scalar() or 0)
+        blocked_referrals = int(db.query(func.count(User.id)).filter(
+            User.referred_by == int(user.telegram_id),
+            User.is_banned.is_(True),
+        ).scalar() or 0)
+        awaiting_store = int(db.query(func.count(User.id)).filter(
+            User.referred_by == int(user.telegram_id),
+            User.miniapp_verified_at.is_(None),
+            User.is_banned.is_(False),
+        ).scalar() or 0)
+        pending_review_referrals = max(
+            0,
+            verified_accounts - miniapp_verified_referrals - rejected_referrals,
+        )
         # Use the display property (safe float conversion at the last moment)
         earnings = user.referral_earnings_display
         referral_code = user.referral_code
@@ -242,8 +345,12 @@ async def referrals(callback: CallbackQuery):
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>Statistics</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👥 <b>Friends who started:</b> {total_referrals}\n"
-            f"✅ <b>Completed referrals:</b> {miniapp_verified_referrals}\n"
+            f"👥 <b>Invited:</b> {total_referrals}\n"
+            f"✅ <b>Completed and counted:</b> {miniapp_verified_referrals}\n"
+            f"⏳ <b>Awaiting Store verification:</b> {awaiting_store}\n"
+            f"🟠 <b>Not counted · review pending:</b> {pending_review_referrals}\n"
+            f"❌ <b>Rejected · not counted:</b> {rejected_referrals}\n"
+            f"🚫 <b>Blocked · not counted:</b> {blocked_referrals}\n"
             f"🔐 <b>Your Store verification:</b> {'✅ Complete' if user.miniapp_verified_at else '⏳ Needed to claim referral freebies'}\n"
             f"💰 <b>Total Earnings:</b> ${earnings:,.2f}\n"
         )
@@ -276,27 +383,34 @@ async def referrals(callback: CallbackQuery):
                     if referred_user.username
                     else f"User#{referred_user.telegram_id}"
                 )
-                if not referred_user.miniapp_verified_at:
+                if referred_user.is_banned:
+                    status = "🚫 Blocked · not counted"
+                elif referred_user.miniapp_referral_review_rejected_at:
+                    status = "❌ Rejected · not counted"
+                elif not referred_user.miniapp_verified_at:
                     status = "⏳ Awaiting Store"
                 elif referred_user.miniapp_referral_review_approved_at:
-                    status = "✅ Counted"
+                    status = "✅ Verified · counted"
                 elif referred_user.miniapp_ip_hash:
                     matching_prior = (
                         referred_user.miniapp_ip_hash == user.miniapp_ip_hash
                         or db.query(User.id).filter(
                             User.referred_by == int(user.telegram_id),
                             User.id != int(referred_user.id),
-                            User.id < int(referred_user.id),
                             User.miniapp_verified_at.isnot(None),
                             User.is_banned.is_(False),
                             User.miniapp_ip_hash == referred_user.miniapp_ip_hash,
                         ).first()
                     )
-                    status = "⚠️ Review" if matching_prior else "✅ Counted"
+                    status = (
+                        "🟠 Verified · review pending"
+                        if matching_prior
+                        else "✅ Verified · counted"
+                    )
                 elif referred_user.miniapp_verification_prompted_at is None:
-                    status = "✅ Counted"
+                    status = "✅ Verified · counted"
                 else:
-                    status = "⚠️ Review"
+                    status = "🟠 Verified · review pending"
                 text += f"{icon} {username} · {status}\n"
 
         text += (
@@ -351,6 +465,13 @@ async def referrals(callback: CallbackQuery):
             InlineKeyboardButton(
                 text="📊 Detailed Stats",
                 callback_data="referral_stats",
+            ),
+        )
+
+        builder.row(
+            InlineKeyboardButton(
+                text="🔄 Refresh referral status",
+                callback_data="referrals_menu",
             ),
         )
 

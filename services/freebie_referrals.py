@@ -26,12 +26,19 @@ def verified_referral_count(db: Session, telegram_id: int) -> int:
             User.miniapp_verified_at.isnot(None),
             User.is_banned.is_(False),
         )
-    # Count only one referral per observed network for each referrer. Older
-    # verified referrals without a stored fingerprint remain individually
-    # counted so this rollout doesn't erase existing progress.
-    approved = base.filter(User.miniapp_referral_review_approved_at.isnot(None))
+    # Admin-approved referrals count individually. Unreviewed fingerprints
+    # count only when exactly one active verified invitee uses that network;
+    # counting DISTINCT fingerprints alone would incorrectly count a shared
+    # network while the UI marks its accounts as pending review.
+    approved = base.filter(
+        User.miniapp_referral_review_approved_at.isnot(None),
+        User.miniapp_referral_review_rejected_at.is_(None),
+    )
     approved_count = approved.count()
-    not_approved = base.filter(User.miniapp_referral_review_approved_at.is_(None))
+    not_approved = base.filter(
+        User.miniapp_referral_review_approved_at.is_(None),
+        User.miniapp_referral_review_rejected_at.is_(None),
+    )
     if referrer_network:
         # Do not count a second Telegram account verified from the inviter's
         # own observed network unless an admin explicitly reviews it.
@@ -39,12 +46,16 @@ def verified_referral_count(db: Session, telegram_id: int) -> int:
             User.miniapp_ip_hash.is_(None),
             User.miniapp_ip_hash != referrer_network,
         ))
-    approved_networks = approved.filter(User.miniapp_ip_hash.isnot(None)).with_entities(
-        User.miniapp_ip_hash
+    singleton_networks = (
+        base.filter(User.miniapp_ip_hash.isnot(None))
+        .with_entities(User.miniapp_ip_hash.label("network_hash"))
+        .group_by(User.miniapp_ip_hash)
+        .having(func.count(User.id) == 1)
+        .subquery()
     )
-    unique_networks = not_approved.filter(
+    unique_network_count = not_approved.filter(
         User.miniapp_ip_hash.isnot(None),
-        ~User.miniapp_ip_hash.in_(approved_networks),
+        User.miniapp_ip_hash.in_(singleton_networks.c.network_hash),
     ).with_entities(
         func.count(func.distinct(User.miniapp_ip_hash))
     ).scalar() or 0
@@ -55,7 +66,7 @@ def verified_referral_count(db: Session, telegram_id: int) -> int:
         User.miniapp_ip_hash.is_(None),
         User.miniapp_verification_prompted_at.is_(None),
     ).count()
-    return int(approved_count) + int(unique_networks) + int(legacy_without_network)
+    return int(approved_count) + int(unique_network_count) + int(legacy_without_network)
 
 
 def referral_ip_fingerprint(request) -> str | None:
@@ -131,7 +142,10 @@ def referral_ip_fingerprint(request) -> str | None:
 
 def notify_verified_referral(db: Session, referred_user: User) -> dict:
     """Add a customer inbox update and an admin review alert when warranted."""
-    if not referred_user.referred_by:
+    # This is only meaningful after a new account's first signed Store
+    # verification. Repeated /start or referral-link clicks never call this
+    # path and must not create another customer notification.
+    if not referred_user.referred_by or not referred_user.miniapp_verified_at:
         return {"counted": False, "duplicate_network": False, "count": 0}
 
     referrer = db.query(User).filter(
@@ -179,6 +193,7 @@ def notify_verified_referral(db: Session, referred_user: User) -> dict:
         lines = [
             "⚠️ <b>Referral not counted for freebie progress</b>",
             "This account completed Mini Store verification, but " + reason + ".",
+            "Status: <b>pending admin review</b>.",
             f"🎁 Current eligible progress: <b>{count}</b> verified referral(s).",
         ]
         if unlocked and referrer_verified:
@@ -193,7 +208,7 @@ def notify_verified_referral(db: Session, referred_user: User) -> dict:
             "Shared homes, workplaces, and VPN exits can use one network. If this is a legitimate referral, contact Support for a review."
         )
         body = "\n\n".join(lines)
-        from services.notification_outbox import enqueue_admin
+        from services.notification_outbox import enqueue, enqueue_admin
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
         admin_reason = (
             "The app could not determine a trusted client network. Configure API_TRUSTED_PROXY_CIDRS before counting new referrals."
@@ -209,11 +224,66 @@ def notify_verified_referral(db: Session, referred_user: User) -> dict:
             + admin_reason,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(
-                    text="✅ Approve as a legitimate referral",
+                    text="✅ Approve referral",
                     callback_data=f"admin_referral_approve_{int(referred_user.telegram_id)}",
                     style="success",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="❌ Reject referral",
+                    callback_data=f"admin_referral_reject_{int(referred_user.telegram_id)}",
+                    style="danger",
+                ),
             ]]),
+        )
+        # A second account on the same network can make an earlier
+        # provisional referral ineligible too. Update those invitees and put
+        # each unresolved account in the admin review queue once.
+        if fingerprint and not matches_referrer_network:
+            matching_pending = db.query(User).filter(
+                User.referred_by == int(referrer.telegram_id),
+                User.telegram_id != int(referred_user.telegram_id),
+                User.miniapp_verified_at.isnot(None),
+                User.is_banned.is_(False),
+                User.miniapp_referral_review_approved_at.is_(None),
+                User.miniapp_referral_review_rejected_at.is_(None),
+                User.miniapp_ip_hash == fingerprint,
+            ).all()
+            for matching_user in matching_pending:
+                matching_id = int(matching_user.telegram_id)
+                enqueue(
+                    db,
+                    f"referral-network-review-update:{matching_id}",
+                    matching_id,
+                    "⚠️ <b>Your referral is no longer counted yet</b>\n\n"
+                    "Another account completed Store verification from the same observed network. Both referrals are awaiting admin review, so your inviter's eligible count has been recalculated. You will receive a decision here.",
+                )
+                enqueue_admin(
+                    db,
+                    f"referral-network-review:{matching_id}",
+                    "⚠️ <b>Referral network match · review required</b>\n\n"
+                    f"Referrer ID: <code>{int(referrer.telegram_id)}</code>\n"
+                    f"Referred ID: <code>{matching_id}</code>\n"
+                    "This previously verified referral now shares a network fingerprint with another referral. No raw IP address was stored.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text="✅ Approve referral",
+                            callback_data=f"admin_referral_approve_{matching_id}",
+                            style="success",
+                        ),
+                        InlineKeyboardButton(
+                            text="❌ Reject referral",
+                            callback_data=f"admin_referral_reject_{matching_id}",
+                            style="danger",
+                        ),
+                    ]]),
+                )
+        enqueue(
+            db,
+            f"referral-participant-review:{int(referred_user.telegram_id)}",
+            int(referred_user.telegram_id),
+            "⚠️ <b>Your referral is not counted yet</b>\n\n"
+            "Store verification is complete, but the referral needs an admin review because the network check matched another account or could not be confirmed.\n\n"
+            "You will receive an update after review. Contact RainDeals Support if you think this is a mistake.",
         )
     else:
         lines = [

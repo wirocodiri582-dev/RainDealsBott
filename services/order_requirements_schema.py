@@ -145,6 +145,7 @@ def ensure_order_requirements_schema() -> None:
         _ensure_column(connection, "users", "miniapp_verification_prompted_at", "DATETIME NULL")
         _ensure_column(connection, "users", "miniapp_ip_hash", "VARCHAR(64) NULL")
         _ensure_column(connection, "users", "miniapp_referral_review_approved_at", "DATETIME NULL")
+        _ensure_column(connection, "users", "miniapp_referral_review_rejected_at", "DATETIME NULL")
         _ensure_column(connection, "users", "miniapp_referral_reviewed_by", "BIGINT NULL")
         _ensure_index(connection, "users", ["referred_by", "miniapp_verified_at"], "ix_users_verified_referrals")
         _ensure_index(connection, "users", ["referred_by", "miniapp_ip_hash", "miniapp_verified_at"], "ix_users_referral_network_check")
