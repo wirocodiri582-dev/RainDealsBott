@@ -110,6 +110,7 @@ def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_m
                 'subscription' if prefix == 'subscription' else
                 'restock' if prefix == 'restock' else
                 'provider' if prefix.startswith('vendor') else
+                'referral' if prefix.startswith('referral') else
                 'order_progress' if prefix in ('order-progress', 'order_progress') else
                 'order_delivery' if prefix == 'manual-delivery' else
                 'order_update' if prefix in ('delivery-start', 'order-information',
@@ -118,7 +119,7 @@ def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_m
                 'refund' if prefix in ('refund', 'manager-refund') or (prefix == 'warranty' and 'refund' in str(event).lower()) else
                 'warranty' if prefix == 'warranty' else
                 'deposit' if prefix.startswith('deposit') else
-                'support' if prefix in ('ticket-status', 'manager-ticket', 'claim-reply') else None)
+                'support' if prefix in ('ticket-status', 'ticket-reply', 'manager-ticket', 'claim-reply') else None)
     if category in ('subscription','restock','order_progress') and str(chat_id).isdigit():
         from services.customer_tools import allows
         if not allows(db, int(chat_id), category):

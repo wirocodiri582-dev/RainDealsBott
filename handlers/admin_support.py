@@ -1,3 +1,6 @@
+from datetime import datetime
+from html import escape
+
 from aiogram import Router, F
 from aiogram.types import (
     CallbackQuery,
@@ -6,8 +9,9 @@ from aiogram.types import (
 )
 
 from database import SessionLocal
-from models.ticket import Ticket
-from config import ADMIN_IDS
+from models.ticket import Ticket, TicketMessage
+from models.user import User
+from config import ADMIN_IDS, MAIN_BOT_USERNAME
 
 router = Router()
 
@@ -53,6 +57,7 @@ async def admin_tickets(
         keyboard = []
 
         for ticket in tickets:
+            owner = db.get(User, ticket.user_id)
 
             icon = (
                 "🟢"
@@ -66,7 +71,7 @@ async def admin_tickets(
                         text=
                         f"{icon} "
                         f"#{ticket.id} "
-                        f"{ticket.user_id}",
+                        f"{owner.telegram_id if owner else 'Unknown'}",
                         callback_data=
                         f"ticket_{ticket.id}"
                     )
@@ -100,16 +105,16 @@ async def admin_tickets(
 # OPEN TICKET
 # =====================================================
 
-@router.callback_query(
-    F.data.startswith("ticket_")
-)
+@router.callback_query(F.data.regexp(r"^ticket_\d+$"))
 async def open_ticket(
         callback: CallbackQuery
 ):
 
-    ticket_id = int(
-        callback.data.split("_")[1]
-    )
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+
+    ticket_id = int(callback.data.removeprefix("ticket_"))
 
     db = SessionLocal()
 
@@ -130,48 +135,63 @@ async def open_ticket(
             )
             return
 
-        try:
-
-            user = await callback.bot.get_chat(
-                ticket.user_id
-            )
-
-            full_name = (
-                user.full_name
-            )
-
-            username = (
-                f"@{user.username}"
-                if user.username
-                else "No Username"
-            )
-
-        except:
-
-            full_name = "Unknown"
-            username = "Unknown"
+        owner = db.get(User, ticket.user_id)
+        telegram_id = int(owner.telegram_id) if owner else 0
+        full_name = owner.full_name if owner else "Unknown"
+        username = f"@{owner.username}" if owner and owner.username else "No Username"
+        conversation = db.query(TicketMessage).filter(
+            TicketMessage.ticket_id == ticket.id
+        ).order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc()).limit(30).all()
+        if conversation and conversation[0].sender_role == "customer" and conversation[0].message == ticket.message:
+            conversation = conversation[1:]
+        conversation_text = "\n\n".join(
+            f"{'⚙️ Status' if entry.sender_role == 'system' else '💬 Support' if entry.sender_role == 'admin' else '📝 Customer'} · "
+            f"{entry.created_at.strftime('%d %b %Y, %H:%M UTC') if entry.created_at else '—'}\n"
+            f"{escape(entry.message or '')}"
+            for entry in conversation
+        ) or escape(ticket.admin_response or "No replies yet.")
 
         text = f"""
 🎫 Ticket #{ticket.id}
 
 👤 Name:
-{full_name}
+{escape(full_name)}
 
 🆔 User ID:
-<code>{ticket.user_id}</code>
+<code>{telegram_id}</code>
 
 🔗 Username:
-{username}
+{escape(username)}
 
 📄 Status:
-{ticket.status}
+{escape(ticket.status)}
+
+📂 Category / priority:
+{escape(ticket.category or 'General')} · {escape(ticket.priority or 'Normal')}
 
 💬 Message:
 
-{ticket.message}
+{escape(ticket.message or '')}
+
+🗂 Conversation:
+{conversation_text}
 """
 
         keyboard = []
+
+        bot_username = str(MAIN_BOT_USERNAME or "").strip().lstrip("@")
+        if not bot_username:
+            try:
+                bot_username = str((await callback.bot.get_me()).username or "").strip()
+            except Exception:
+                bot_username = ""
+        if bot_username:
+            keyboard.append([
+                InlineKeyboardButton(
+                    text="💬 Reply privately",
+                    url=f"https://t.me/{bot_username}?start=support_reply_{ticket.id}",
+                )
+            ])
 
         if (
             username != "No Username"
@@ -183,8 +203,7 @@ async def open_ticket(
                     InlineKeyboardButton(
                         text="💬 Open User",
                         url=
-                        f"https://t.me/"
-                        f"{user.username}"
+                        f"https://t.me/{owner.username}"
                     )
                 ]
             )
@@ -227,18 +246,16 @@ async def open_ticket(
 # CLOSE TICKET
 # =====================================================
 
-@router.callback_query(
-    F.data.startswith(
-        "close_ticket_"
-    )
-)
+@router.callback_query(F.data.regexp(r"^close_ticket_\d+$"))
 async def close_ticket(
         callback: CallbackQuery
 ):
 
-    ticket_id = int(
-        callback.data.split("_")[2]
-    )
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+
+    ticket_id = int(callback.data.removeprefix("close_ticket_"))
 
     db = SessionLocal()
 
@@ -259,16 +276,44 @@ async def close_ticket(
             )
             return
 
+        old_status = ticket.status
         ticket.status = "Closed"
+        ticket.updated_at = datetime.utcnow()
+        db.add(TicketMessage(
+            ticket_id=ticket.id,
+            sender_id=int(callback.from_user.id),
+            sender_role="system",
+            message=f"Ticket status changed: {old_status} → Closed.",
+        ))
 
         db.commit()
 
     finally:
         db.close()
 
-    await callback.answer(
-        "✅ Ticket closed."
-    )
+    try:
+        from services.notification_outbox import admin_destination, queue_message
+        with SessionLocal() as db:
+            ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+            owner = db.get(User, ticket.user_id) if ticket else None
+            telegram_id = int(owner.telegram_id) if owner else None
+        if telegram_id:
+            await queue_message(
+                callback.bot,
+                f"ticket-status:{ticket_id}:Closed",
+                telegram_id,
+                f"🎫 Support ticket #{ticket_id} was closed. If you still need help, create a new ticket.",
+            )
+        if admin_destination():
+            await queue_message(
+                callback.bot,
+                f"admin-ticket-status:{ticket_id}:Closed",
+                admin_destination(),
+                f"🎫 Ticket #{ticket_id} status changed: {old_status} → Closed by <code>{callback.from_user.id}</code>.",
+            )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Failed to notify about closed ticket %s", ticket_id)
 
     await admin_tickets(
         callback

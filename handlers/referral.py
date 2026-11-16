@@ -1,14 +1,94 @@
+from datetime import datetime
+from html import escape
+
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardButton
+from aiogram.types import CallbackQuery, InlineKeyboardButton, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func
 
 from database import SessionLocal
 from models.user import User
 from models.referral import Referral
+from config import ADMIN_IDS, MINI_APP_URL
 from utils.ui import show, answer_card
 
 router = Router()
+
+
+@router.callback_query(F.data.regexp(r"^admin_referral_approve_\d{1,15}$"))
+async def approve_referral_review(callback: CallbackQuery):
+    """Let an admin manually clear a shared-network false positive."""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Admin access only.", show_alert=True)
+        return
+    try:
+        referred_id = int(str(callback.data).removeprefix("admin_referral_approve_"))
+    except ValueError:
+        await callback.answer("Referral review link is invalid.", show_alert=True)
+        return
+
+    from services.freebie_referrals import verified_referral_count
+    from services.notification_outbox import enqueue, enqueue_admin
+    from models.product import Product
+
+    db = SessionLocal()
+    try:
+        referred = db.query(User).filter(User.telegram_id == referred_id).with_for_update().first()
+        if not referred or not referred.referred_by or not referred.miniapp_verified_at:
+            await callback.answer("This referral is no longer eligible for review.", show_alert=True)
+            return
+        if referred.miniapp_referral_review_approved_at:
+            await callback.answer("This referral was already approved.", show_alert=True)
+            return
+
+        referred.miniapp_referral_review_approved_at = datetime.utcnow()
+        referred.miniapp_referral_reviewed_by = int(callback.from_user.id)
+        referrer = db.query(User).filter(
+            User.telegram_id == int(referred.referred_by)
+        ).first()
+        count = verified_referral_count(db, int(referred.referred_by))
+        offers = db.query(Product.name, Product.freebie_referrals_required).filter(
+            Product.is_active.is_(True),
+            Product.price == 0,
+            Product.freebie_referrals_required > 0,
+        ).order_by(Product.freebie_referrals_required.asc(), Product.id.asc()).all()
+        unlocked = [str(name or "Freebie") for name, required in offers if int(required or 0) <= count]
+        pending = [(str(name or "Freebie"), int(required or 0)) for name, required in offers if int(required or 0) > count]
+        lines = [
+            f"✅ <b>Referral review approved</b> · Account <code>{referred_id}</code>",
+            f"The referral now counts toward your freebie progress: <b>{count}</b> verified referral(s).",
+        ]
+        if unlocked and referrer and referrer.miniapp_verified_at:
+            lines.append("🎁 <b>Available to claim:</b> " + ", ".join(escape(name) for name in unlocked[:8]))
+            lines.append("Open <b>Freebies</b> in the RainDeals bot to check stock and claim.")
+        elif unlocked:
+            lines.append("🎁 Referral progress meets the offer requirement. The referrer must verify their own account in the RainDeals Store before claiming.")
+        elif pending:
+            lines.append(f"Next unlock: <b>{count}/{pending[0][1]}</b> verified referrals.")
+        enqueue(
+            db,
+            f"referral-review:{referred_id}",
+            int(referred.referred_by),
+            "\n\n".join(lines),
+        )
+        enqueue_admin(
+            db,
+            f"referral-review-approved:{referred_id}",
+            f"✅ Referral account <code>{referred_id}</code> approved by admin <code>{callback.from_user.id}</code>. "
+            f"Current eligible count for referrer <code>{int(referred.referred_by)}</code>: <b>{count}</b>.",
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer("Referral approved and progress updated.")
 
 
 # =====================================================
@@ -146,6 +226,7 @@ async def referrals(callback: CallbackQuery):
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👥 <b>Total Referrals:</b> {total_referrals}\n"
             f"🛍 <b>Mini Store verified:</b> {miniapp_verified_referrals}\n"
+            f"🔐 <b>Your Store verification:</b> {'✅ Complete' if user.miniapp_verified_at else '⏳ Needed to claim referral freebies'}\n"
             f"💰 <b>Total Earnings:</b> ${earnings:,.2f}\n"
         )
 
@@ -192,6 +273,20 @@ async def referrals(callback: CallbackQuery):
         )
 
         builder = InlineKeyboardBuilder()
+
+        if not user.miniapp_verified_at:
+            if MINI_APP_URL:
+                builder.row(InlineKeyboardButton(
+                    text="🛍 Verify in RainDeals Store",
+                    web_app=WebAppInfo(url=MINI_APP_URL),
+                    style="success",
+                ))
+            else:
+                builder.row(InlineKeyboardButton(
+                    text="🛍 Open Store from Main Menu",
+                    callback_data="main_menu",
+                    style="success",
+                ))
 
         builder.row(
             InlineKeyboardButton(

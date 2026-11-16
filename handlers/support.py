@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime
+from html import escape
 
 from aiogram import Router, F
 from aiogram.types import (
@@ -13,7 +14,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, and_
 
 from database import SessionLocal
-from models.ticket import Ticket
+from models.ticket import Ticket, TicketMessage
 from models.user import User
 from config import ADMIN_IDS
 from states.support import SupportState
@@ -91,28 +92,29 @@ async def contact(callback: CallbackQuery):
     await show(
         callback,
         "📞 <b>Contact Admin</b>\n\n"
-        "Click below to open a direct chat with our support team.\n\n"
-        "💡 <i>For complex issues, create a support ticket.</i>",
+        "A direct chat is available, but it is not connected to ticket history.\n\n"
+        "For a tracked reply and a copy in RainDeals Admin Notify, create a support ticket instead.",
         reply_markup=markup
     )
-
 
 # =====================================================
 # SUPPORT MENU
 # =====================================================
 
 @router.callback_query(F.data == "support_ticket")
-async def support_menu(callback: CallbackQuery):
+async def support_menu(callback: CallbackQuery, state: FSMContext):
     """Main support menu with colored buttons."""
+    await state.clear()
     await callback.answer()
 
     db = SessionLocal()
     try:
+        owner_id = db.query(User.id).filter(User.telegram_id == callback.from_user.id).scalar()
         open_tickets = (
             db.query(func.count(Ticket.id))
             .filter(
                 and_(
-                    Ticket.user_id == callback.from_user.id,
+                    Ticket.user_id == owner_id,
                     Ticket.status.in_(["Open", "In Progress"])
                 )
             )
@@ -123,7 +125,7 @@ async def support_menu(callback: CallbackQuery):
             db.query(func.count(Ticket.id))
             .filter(
                 and_(
-                    Ticket.user_id == callback.from_user.id,
+                    Ticket.user_id == owner_id,
                     Ticket.status == "Resolved"
                 )
             )
@@ -132,59 +134,23 @@ async def support_menu(callback: CallbackQuery):
 
         total_tickets = (
             db.query(func.count(Ticket.id))
-            .filter(Ticket.user_id == callback.from_user.id)
+            .filter(Ticket.user_id == owner_id)
             .scalar()
         ) or 0
 
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🎫 Create New Ticket",
-                        callback_data="support_create_ticket",
-                        style="success"  # 🟢 Green — positive action
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text=f"📋 My Tickets ({total_tickets})",
-                        callback_data="support_my_tickets",
-                        style="primary"  # 🔵 Blue
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🔍 Track Ticket",
-                        callback_data="support_track_ticket",
-                        style="primary"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="📞 Direct Contact",
-                        callback_data="contact_info"
-                    ),
-                    InlineKeyboardButton(
-                        text="❓ FAQ",
-                        callback_data="support_faq",
-                        style="primary"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="⭐ Rate Support",
-                        callback_data="support_rate",
-                        style="primary"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="⬅ Main Menu",
-                        callback_data="main_menu"
-                    )
-                ]
-            ]
-        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🎫 Create ticket", callback_data="support_create_ticket", style="success"),
+                InlineKeyboardButton(text=f"📋 My tickets ({total_tickets})", callback_data="support_my_tickets", style="primary"),
+            ],
+            [
+                InlineKeyboardButton(text="🔍 Track by ID", callback_data="support_track_ticket", style="primary"),
+                InlineKeyboardButton(text="❓ FAQ", callback_data="support_faq", style="primary"),
+            ],
+            [InlineKeyboardButton(text="📞 Direct contact", callback_data="contact_info")],
+            [InlineKeyboardButton(text="⭐ Rate Support", callback_data="support_rate", style="primary")],
+            [InlineKeyboardButton(text="⬅ Main Menu", callback_data="main_menu")],
+        ])
 
         stats_text = ""
         if total_tickets > 0:
@@ -203,12 +169,8 @@ async def support_menu(callback: CallbackQuery):
             f"🎫 <b>Support Center</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"{stats_text}"
-            f"Choose an option below:\n\n"
-            f"🟢 <b>Create Ticket</b> — Report an issue\n"
-            f"🔵 <b>My Tickets</b> — View your tickets\n"
-            f"🔵 <b>Track Ticket</b> — Find a ticket\n"
-            f"🔵 <b>FAQ</b> — Common answers\n\n"
-            f"💡 <i>We respond within 2 hours!</i>",
+            "Choose a topic and send one clear message. You can follow up from the ticket screen; replies and status changes will appear in Notifications.\n\n"
+            "For payments, include the deposit or order number. Never send passwords or recovery codes.",
             reply_markup=markup
         )
     finally:
@@ -258,12 +220,13 @@ async def show_ticket_details(message: Message, state: FSMContext):
 
     db = SessionLocal()
     try:
+        owner_id = db.query(User.id).filter(User.telegram_id == message.from_user.id).scalar()
         ticket = (
             db.query(Ticket)
             .filter(
                 and_(
                     Ticket.id == ticket_id,
-                    Ticket.user_id == message.from_user.id
+                    Ticket.user_id == owner_id
                 )
             )
             .first()
@@ -284,24 +247,36 @@ async def show_ticket_details(message: Message, state: FSMContext):
         text = (
             f"🎫 <b>Ticket #{ticket.id} Details</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📂 <b>Category:</b> {ticket.category or 'General'}\n"
-            f"{priority_emoji} <b>Priority:</b> {ticket.priority or 'Medium'}\n"
-            f"📊 <b>Status:</b> {status_emoji} {ticket.status}\n"
+            f"📂 <b>Category:</b> {escape(ticket.category or 'General')}\n"
+            f"{priority_emoji} <b>Priority:</b> {escape(ticket.priority or 'Medium')}\n"
+            f"📊 <b>Status:</b> {status_emoji} {escape(ticket.status)}\n"
             f"🕐 <b>Created:</b> {created}\n"
             f"🔄 <b>Updated:</b> {updated}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📝 <b>Your Message:</b>\n"
-            f"{ticket.message}\n"
+            f"{escape(ticket.message or '')}\n"
         )
 
-        if ticket.admin_response:
+        conversation = db.query(TicketMessage).filter(
+            TicketMessage.ticket_id == ticket.id
+        ).order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc()).limit(20).all()
+        for entry in conversation[1:]:
             text += (
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💬 <b>Admin Response:</b>\n"
-                f"{ticket.admin_response}\n"
+                f"{'⚙️ <b>Status</b>' if entry.sender_role == 'system' else '💬 <b>Support</b>' if entry.sender_role == 'admin' else '📝 <b>You</b>'} · "
+                f"{entry.created_at.strftime('%d %b %Y, %H:%M UTC')}\n"
+                f"{escape(entry.message or '')}\n"
             )
+        if ticket.admin_response and not conversation:
+            text += f"━━━━━━━━━━━━━━━━━━━━━━\n💬 <b>Support:</b>\n{escape(ticket.admin_response)}\n"
 
         builder = InlineKeyboardBuilder()
+        if ticket.status in ("Open", "In Progress", "Reopened"):
+            builder.row(InlineKeyboardButton(
+                text="💬 Add a message",
+                callback_data=f"support_reply_{ticket.id}",
+                style="success",
+            ))
         builder.row(
             InlineKeyboardButton(
                 text="📋 All My Tickets",
@@ -565,68 +540,51 @@ async def handle_rating(callback: CallbackQuery):
         reply_markup=markup
     )
 
+    try:
+        from services.notification_outbox import admin_destination, queue_message
+        destination = admin_destination()
+        if destination:
+            from html import escape
+            import hashlib
+            username = f"@{escape(callback.from_user.username)}" if callback.from_user.username else "No username"
+            rating_key = hashlib.sha256(str(callback.id or callback.from_user.id).encode()).hexdigest()[:16]
+            await queue_message(
+                callback.bot,
+                f"support-rating:{callback.from_user.id}:{rating_key}",
+                destination,
+                f"⭐ Support feedback · <b>{escape(rating_text[rating])}</b> {rating_emoji[rating]}\n"
+                f"👤 {username} · Telegram ID <code>{callback.from_user.id}</code>",
+            )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Could not send support rating to Admin Notify")
+
 
 # =====================================================
 # CREATE TICKET — WITH COLORED CATEGORIES
 # =====================================================
 
 @router.callback_query(F.data == "support_create_ticket")
-async def ticket_categories(callback: CallbackQuery):
+async def ticket_categories(callback: CallbackQuery, state: FSMContext):
     """Show ticket categories with colored buttons."""
+    await state.clear()
     await callback.answer()
 
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔴 Bug Report",
-                    callback_data="ticket_cat_bug",
-                    style="danger"  # 🔴 Red — urgent
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🟠 Order Problem",
-                    callback_data="ticket_cat_order",
-                    style="primary"  # 🔵 Blue
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🟡 Payment Issue",
-                    callback_data="ticket_cat_payment",
-                    style="primary"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🟡 Account Help",
-                    callback_data="ticket_cat_account",
-                    style="primary"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🟢 Suggestion",
-                    callback_data="ticket_cat_suggestion",
-                    style="success"  # 🟢 Green — positive
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🟢 General Question",
-                    callback_data="ticket_cat_other",
-                    style="success"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅ Back",
-                    callback_data="support_ticket"
-                )
-            ]
-        ]
-    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📦 Order problem", callback_data="ticket_cat_order", style="primary"),
+            InlineKeyboardButton(text="💳 Payment issue", callback_data="ticket_cat_payment", style="primary"),
+        ],
+        [
+            InlineKeyboardButton(text="👤 Account help", callback_data="ticket_cat_account", style="primary"),
+            InlineKeyboardButton(text="🔧 Bug report", callback_data="ticket_cat_bug", style="danger"),
+        ],
+        [
+            InlineKeyboardButton(text="💡 Suggestion", callback_data="ticket_cat_suggestion", style="success"),
+            InlineKeyboardButton(text="📋 Other", callback_data="ticket_cat_other", style="success"),
+        ],
+        [InlineKeyboardButton(text="⬅ Back to Support", callback_data="support_ticket")],
+    ])
 
     await show(
         callback,
@@ -701,8 +659,14 @@ async def select_category(callback: CallbackQuery, state: FSMContext):
 def _save_ticket(user_id: int, text: str, category: str, priority: str) -> int:
     db = SessionLocal()
     try:
+        user = db.query(User).filter(User.telegram_id == int(user_id)).with_for_update().first()
+        if not user:
+            raise ValueError("RainDeals account not found. Send /start and try again.")
         ticket = Ticket(
-            user_id=user_id,
+            # tickets.user_id references users.id; all handlers convert from
+            # Telegram ID at the boundary instead of storing two ID types in
+            # the same column.
+            user_id=user.id,
             message=text,
             category=category,
             priority=priority,
@@ -711,6 +675,13 @@ def _save_ticket(user_id: int, text: str, category: str, priority: str) -> int:
             updated_at=datetime.utcnow()
         )
         db.add(ticket)
+        db.flush()
+        db.add(TicketMessage(
+            ticket_id=ticket.id,
+            sender_id=int(user_id),
+            sender_role="customer",
+            message=text,
+        ))
         db.commit()
         db.refresh(ticket)
         return ticket.id
@@ -727,23 +698,30 @@ async def create_ticket(message: Message, state: FSMContext):
     priority = data.get("ticket_priority", "Medium")
     priority_emoji = get_priority_emoji(priority)
 
-    if len(message.text) < 20:
+    ticket_text = (message.text or "").strip()
+    if len(ticket_text) < 20:
         await answer_card(message,
             "⚠️ <b>Message too short!</b>\n\n"
             "Please provide more details (minimum 20 characters)."
         )
         return
 
-    if len(message.text) > 2000:
+    if len(ticket_text) > 2000:
         await answer_card(message,
             "⚠️ <b>Message too long!</b>\n\n"
             "Please keep your message under 2000 characters."
         )
         return
 
-    ticket_id = await asyncio.to_thread(
-        _save_ticket, message.from_user.id, message.text, category, priority
-    )
+    try:
+        ticket_id = await asyncio.to_thread(
+            _save_ticket, message.from_user.id, ticket_text, category, priority
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Could not save support ticket for user_id=%s", message.from_user.id)
+        await answer_card(message, "⚠️ We could not save this ticket. Send /start and try again.")
+        return
 
     await state.clear()
 
@@ -752,8 +730,8 @@ async def create_ticket(message: Message, state: FSMContext):
         f"✅ <b>Ticket Created Successfully!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🎫 <b>Ticket ID:</b> #{ticket_id}\n"
-        f"📂 <b>Category:</b> {category}\n"
-        f"{priority_emoji} <b>Priority:</b> {priority}\n"
+        f"📂 <b>Category:</b> {escape(category)}\n"
+        f"{priority_emoji} <b>Priority:</b> {escape(priority)}\n"
         f"📊 <b>Status:</b> 🆕 Open\n\n"
         f"⏱️ Our team will review your ticket.\n"
         f"💡 Track your ticket in 📋 My Tickets",
@@ -783,68 +761,50 @@ async def create_ticket(message: Message, state: FSMContext):
         message_id=card_message_id,
     )
 
-    # Notify admins
-    from services.notification_outbox import admin_destination
-    for admin in filter(None, [admin_destination()]):
-        try:
-            username = (
-                f"@{message.from_user.username}"
-                if message.from_user.username
-                else "No username"
-            )
-
-            admin_markup = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="✅ In Progress",
-                            callback_data=f"admin_ticket_progress_{ticket_id}",
-                            style="primary"  # 🔵 Blue
-                        ),
-                        InlineKeyboardButton(
-                            text="✅ Resolved",
-                            callback_data=f"admin_ticket_resolve_{ticket_id}",
-                            style="success"  # 🟢 Green
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="❌ Close",
-                            callback_data=f"admin_ticket_close_{ticket_id}",
-                            style="danger"  # 🔴 Red
-                        ),
-                        InlineKeyboardButton(
-                            text="💬 Reply",
-                            callback_data=f"admin_ticket_reply_{ticket_id}",
-                            style="primary"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="👤 View User",
-                            url=f"tg://user?id={message.from_user.id}"
-                        )
-                    ]
-                ]
-            )
-
-            from services.notification_outbox import queue_message
-            await queue_message(message.bot, f"admin-ticket:{ticket_id}",
-                admin,
-                f"🔔 <b>New Support Ticket #{ticket_id}</b>\n"
+    # Every ticket goes through the durable Admin Notify outbox. The private
+    # deep link is the working reply path; text replies sent in the group are
+    # never captured as admin messages.
+    try:
+        from config import MAIN_BOT_USERNAME
+        from services.notification_outbox import admin_destination, queue_message
+        destination = admin_destination()
+        bot_username = str(MAIN_BOT_USERNAME or "").strip().lstrip("@")
+        if not bot_username:
+            bot_username = str((await message.bot.get_me()).username or "").strip()
+        rows = [[
+            InlineKeyboardButton(text="🔄 In Progress", callback_data=f"admin_ticket_progress_{ticket_id}"),
+            InlineKeyboardButton(text="✅ Resolve", callback_data=f"admin_ticket_resolve_{ticket_id}"),
+            InlineKeyboardButton(text="✖ Close", callback_data=f"admin_ticket_close_{ticket_id}"),
+        ]]
+        if bot_username:
+            rows.append([InlineKeyboardButton(
+                text="💬 Reply privately",
+                url=f"https://t.me/{bot_username}?start=support_reply_{ticket_id}",
+            )])
+        rows.append([InlineKeyboardButton(
+            text="👤 Open user", url=f"tg://user?id={message.from_user.id}"
+        )])
+        username = f"@{escape(message.from_user.username)}" if message.from_user.username else "No username"
+        if destination:
+            await queue_message(
+                message.bot,
+                f"admin-ticket:{ticket_id}",
+                destination,
+                f"🎫 <b>New support ticket #{ticket_id}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📂 <b>Category:</b> {category}\n"
-                f"{priority_emoji} <b>Priority:</b> {priority}\n"
+                f"📂 <b>Category:</b> {escape(category)}\n"
+                f"{priority_emoji} <b>Priority:</b> {escape(priority)}\n"
                 f"👤 <b>User:</b> {username}\n"
-                f"🆔 <b>User ID:</b> <code>{message.from_user.id}</code>\n"
+                f"🆔 <b>Telegram ID:</b> <code>{message.from_user.id}</code>\n"
                 f"🕐 <b>Time:</b> {datetime.utcnow().strftime('%d %b %Y, %H:%M UTC')}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📝 <b>Message:</b>\n\n"
-                f"{message.text[:800]}{'...' if len(message.text) > 800 else ''}",
-                reply_markup=admin_markup
+                f"{escape(ticket_text[:1800])}{'…' if len(ticket_text) > 1800 else ''}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
-        except Exception as e:
-            print("Admin ticket notification error:", e)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Admin Notify ticket enqueue failed for ticket_id=%s", ticket_id)
 
 
 # =====================================================
@@ -857,9 +817,10 @@ async def my_tickets(callback: CallbackQuery):
 
     db = SessionLocal()
     try:
+        owner_id = db.query(User.id).filter(User.telegram_id == callback.from_user.id).scalar()
         tickets = (
             db.query(Ticket)
-            .filter(Ticket.user_id == callback.from_user.id)
+            .filter(Ticket.user_id == owner_id)
             .order_by(Ticket.updated_at.desc())
             .limit(15)
             .all()
@@ -928,32 +889,282 @@ async def my_tickets(callback: CallbackQuery):
             f"Total: {len(tickets)}\n"
         )
 
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🎫 New Ticket",
-                        callback_data="support_create_ticket",
-                        style="success"  # 🟢 Green
-                    ),
-                    InlineKeyboardButton(
-                        text="🔍 Track by ID",
-                        callback_data="support_track_ticket",
-                        style="primary"  # 🔵 Blue
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="⬅ Support Menu",
-                        callback_data="support_ticket"
-                    )
-                ]
-            ]
-        )
+        rows = []
+        for ticket in tickets[:10]:
+            label = f"{get_status_emoji(ticket.status)} #{ticket.id} · {ticket.category or 'General'}"
+            rows.append([InlineKeyboardButton(
+                text=label[:64], callback_data=f"support_view_{ticket.id}", style="primary"
+            )])
+        rows.extend([
+            [
+                InlineKeyboardButton(text="🎫 New Ticket", callback_data="support_create_ticket", style="success"),
+                InlineKeyboardButton(text="🔍 Track by ID", callback_data="support_track_ticket", style="primary"),
+            ],
+            [InlineKeyboardButton(text="⬅ Support Menu", callback_data="support_ticket")],
+        ])
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
 
         await show(callback, text, reply_markup=markup)
     finally:
         db.close()
+
+
+def _ticket_for_customer(telegram_id: int, ticket_id: int):
+    db = SessionLocal()
+    try:
+        owner_id = db.query(User.id).filter(User.telegram_id == int(telegram_id)).scalar()
+        if not owner_id:
+            return None
+        ticket = db.query(Ticket).filter(
+            Ticket.id == int(ticket_id), Ticket.user_id == owner_id
+        ).first()
+        if not ticket:
+            return None
+        messages = db.query(TicketMessage).filter(
+            TicketMessage.ticket_id == ticket.id
+        ).order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc()).limit(30).all()
+        return {
+            "id": int(ticket.id), "category": ticket.category or "General",
+            "priority": ticket.priority or "Medium", "status": ticket.status,
+            "message": ticket.message or "", "admin_response": ticket.admin_response or "",
+            "created_at": ticket.created_at, "updated_at": ticket.updated_at,
+            "messages": [(m.sender_role, m.message, m.created_at) for m in messages],
+        }
+    finally:
+        db.close()
+
+
+def _append_ticket_message(ticket_id: int, sender_id: int, role: str, text: str):
+    db = SessionLocal()
+    try:
+        ticket = db.query(Ticket).filter(Ticket.id == int(ticket_id)).with_for_update().first()
+        if not ticket:
+            return None, "Ticket not found."
+        if ticket.status in ("Resolved", "Closed"):
+            return None, "This ticket is closed. Create a new ticket if you still need help."
+        sender = db.query(User).filter(User.telegram_id == int(sender_id)).first()
+        if not sender:
+            return None, "RainDeals account not found. Send /start and try again."
+        if role == "customer" and ticket.user_id != sender.id:
+            return None, "This ticket does not belong to your account."
+        entry = TicketMessage(
+            ticket_id=ticket.id, sender_id=int(sender_id), sender_role=role, message=text
+        )
+        db.add(entry)
+        if role == "admin":
+            ticket.admin_response = text
+        ticket.updated_at = datetime.utcnow()
+        db.flush()
+        result = {"id": int(entry.id), "ticket_id": int(ticket.id),
+                  "customer_telegram_id": int(db.get(User, ticket.user_id).telegram_id)}
+        db.commit()
+        return result, None
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _admin_ticket_keyboard(bot_username: str, ticket_id: int):
+    rows = [[
+        InlineKeyboardButton(text="🔄 In Progress", callback_data=f"admin_ticket_progress_{ticket_id}"),
+        InlineKeyboardButton(text="✅ Resolve", callback_data=f"admin_ticket_resolve_{ticket_id}"),
+        InlineKeyboardButton(text="✖ Close", callback_data=f"admin_ticket_close_{ticket_id}"),
+    ]]
+    if bot_username:
+        rows.append([InlineKeyboardButton(
+            text="💬 Reply privately",
+            url=f"https://t.me/{bot_username}?start=support_reply_{ticket_id}",
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("support_view_"))
+async def view_support_ticket(callback: CallbackQuery):
+    try:
+        ticket_id = int(str(callback.data).removeprefix("support_view_"))
+    except ValueError:
+        await callback.answer("Ticket link is invalid.", show_alert=True)
+        return
+    ticket = await asyncio.to_thread(_ticket_for_customer, callback.from_user.id, ticket_id)
+    if not ticket:
+        await callback.answer("Ticket not found.", show_alert=True)
+        return
+    await callback.answer()
+    created = ticket["created_at"].strftime("%d %b %Y, %H:%M UTC") if ticket["created_at"] else "—"
+    updated = ticket["updated_at"].strftime("%d %b %Y, %H:%M UTC") if ticket["updated_at"] else "—"
+    text = (
+        f"🎫 <b>Ticket #{ticket_id}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📂 {escape(ticket['category'])} · {get_priority_emoji(ticket['priority'])} {escape(ticket['priority'])}\n"
+        f"📊 {get_status_emoji(ticket['status'])} <b>{escape(ticket['status'])}</b>\n"
+        f"🕐 Created {created} · Updated {updated}\n\n"
+        f"📝 <b>Your request</b>\n{escape(ticket['message'])}"
+    )
+    for role, body, created_at in ticket["messages"][1:]:
+        who = "⚙️ Status" if role == "system" else "💬 Support" if role == "admin" else "📝 You"
+        stamp = created_at.strftime("%d %b %Y, %H:%M UTC") if created_at else ""
+        text += f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n{who} · {stamp}\n{escape(body)}"
+    if ticket["admin_response"] and not ticket["messages"]:
+        text += f"\n\n💬 <b>Support reply</b>\n{escape(ticket['admin_response'])}"
+    rows = []
+    if ticket["status"] not in ("Resolved", "Closed"):
+        rows.append([InlineKeyboardButton(
+            text="💬 Add a message", callback_data=f"support_reply_{ticket_id}", style="success"
+        )])
+    rows.extend([
+        [InlineKeyboardButton(text="📋 My Tickets", callback_data="support_my_tickets")],
+        [InlineKeyboardButton(text="⬅ Support Center", callback_data="support_ticket")],
+    ])
+    await show(callback, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("support_reply_"))
+async def start_customer_ticket_reply(callback: CallbackQuery, state: FSMContext):
+    try:
+        ticket_id = int(str(callback.data).removeprefix("support_reply_"))
+    except ValueError:
+        await callback.answer("Ticket link is invalid.", show_alert=True)
+        return
+    ticket = await asyncio.to_thread(_ticket_for_customer, callback.from_user.id, ticket_id)
+    if not ticket:
+        await callback.answer("Ticket not found.", show_alert=True)
+        return
+    if ticket["status"] in ("Resolved", "Closed"):
+        await callback.answer("This ticket is closed. Create a new ticket if you need more help.", show_alert=True)
+        return
+    await callback.answer()
+    await state.update_data(customer_reply_ticket_id=ticket_id)
+    await state.set_state(SupportState.customer_reply)
+    await show(
+        callback,
+        f"💬 <b>Reply to Ticket #{ticket_id}</b>\n\nSend one text update (up to 2,000 characters). It will be added to this ticket and sent to the RainDeals support team.\n\nSend /cancel to stop.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✖ Cancel", callback_data="support_reply_cancel")
+        ]]),
+        state=state,
+    )
+
+
+@router.callback_query(F.data == "support_reply_cancel")
+async def cancel_ticket_reply(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer("Reply cancelled.")
+    await show(callback, "Reply cancelled.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⬅ Support Center", callback_data="support_ticket")
+    ]]))
+
+
+async def _notify_admin_ticket_message(bot, ticket_id: int, message_id: int, sender_id: int, role: str, body: str):
+    from config import MAIN_BOT_USERNAME
+    from services.notification_outbox import admin_destination, queue_message
+    destination = admin_destination()
+    if not destination:
+        return
+    bot_username = str(MAIN_BOT_USERNAME or "").strip().lstrip("@")
+    if not bot_username:
+        bot_username = str((await bot.get_me()).username or "").strip()
+    username = ""
+    if role == "customer":
+        with SessionLocal() as db:
+            user = db.query(User.username).filter(User.telegram_id == int(sender_id)).scalar()
+            if user:
+                username = f"@{escape(user)}"
+    await queue_message(
+        bot,
+        f"admin-ticket-message:{ticket_id}:{message_id}",
+        destination,
+        f"{'📝 Customer update' if role == 'customer' else '💬 Admin reply'} · <b>Ticket #{ticket_id}</b>\n"
+        f"👤 {username or f'<code>{sender_id}</code>'}\n\n{escape(body[:1800])}{'…' if len(body) > 1800 else ''}",
+        reply_markup=_admin_ticket_keyboard(bot_username, ticket_id) if role == "customer" else None,
+    )
+
+
+@router.message(SupportState.customer_reply)
+async def save_customer_ticket_reply(message: Message, state: FSMContext):
+    body = (message.text or "").strip()
+    if not 5 <= len(body) <= 2000:
+        await answer_card(message, "Enter a text update between 5 and 2,000 characters, or send /cancel.")
+        return
+    ticket_id = int((await state.get_data()).get("customer_reply_ticket_id") or 0)
+    try:
+        result, error = await asyncio.to_thread(
+            _append_ticket_message, ticket_id, message.from_user.id, "customer", body
+        )
+    except Exception:
+        result, error = None, "Could not save your message. Please try again."
+    if error:
+        await state.clear()
+        await answer_card(message, escape(error))
+        return
+    await state.clear()
+    await update_card(
+        message,
+        f"✅ <b>Update added to Ticket #{ticket_id}</b>\n\nSupport has been notified. Replies will appear in Notifications and in this ticket.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📋 Open ticket", callback_data=f"support_view_{ticket_id}"),
+            InlineKeyboardButton(text="🎫 Support Center", callback_data="support_ticket"),
+        ]]),
+        parse_mode="HTML",
+    )
+    try:
+        await _notify_admin_ticket_message(message.bot, ticket_id, result["id"], message.from_user.id, "customer", body)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Could not queue ticket reply to Admin Notify ticket_id=%s", ticket_id)
+
+
+@router.message(SupportState.admin_reply)
+async def save_admin_ticket_reply(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        await state.clear()
+        return
+    body = (message.text or "").strip()
+    if not 1 <= len(body) <= 4000:
+        await answer_card(message, "Send a text reply up to 4,000 characters, or use /cancel.")
+        return
+    ticket_id = int((await state.get_data()).get("admin_reply_ticket_id") or 0)
+    try:
+        result, error = await asyncio.to_thread(
+            _append_ticket_message, ticket_id, message.from_user.id, "admin", body
+        )
+    except Exception:
+        result, error = None, "Could not save the reply. Please try again."
+    if error:
+        await state.clear()
+        await answer_card(message, escape(error))
+        return
+    await state.clear()
+    try:
+        from services.notification_outbox import queue_message
+        customer_notice = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📋 View support ticket", callback_data=f"support_view_{ticket_id}")
+        ]])
+        await queue_message(
+            message.bot,
+            f"ticket-reply:{ticket_id}:{result['id']}",
+            result["customer_telegram_id"],
+            f"💬 <b>Support replied to Ticket #{ticket_id}</b>\n\n{escape(body)}",
+            reply_markup=customer_notice,
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Could not notify customer about ticket reply ticket_id=%s", ticket_id)
+    try:
+        await _notify_admin_ticket_message(message.bot, ticket_id, result["id"], message.from_user.id, "admin", body)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Could not notify Admin Notify about ticket reply ticket_id=%s", ticket_id)
+    await update_card(
+        message,
+        f"✅ Reply sent for Ticket #{ticket_id}. The customer will see it in RainDeals Notifications.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅ Admin Panel", callback_data="admin_panel")
+        ]]),
+        parse_mode="HTML",
+    )
 
 
 # =====================================================
@@ -962,13 +1173,14 @@ async def my_tickets(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_ticket_"))
 async def admin_ticket_action(callback: CallbackQuery):
-    await callback.answer()
-
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("❌ Admin access only.", show_alert=True)
         return
 
     parts = callback.data.split("_")
+    if len(parts) != 4 or not parts[3].isdigit():
+        await callback.answer("Invalid support action.", show_alert=True)
+        return
     action = parts[2]
     ticket_id = int(parts[3])
 
@@ -989,60 +1201,75 @@ async def admin_ticket_action(callback: CallbackQuery):
         if action in status_map:
             old_status = ticket.status
             new_status = status_map[action]
+            if old_status == new_status:
+                await callback.answer(f"Ticket is already {new_status}.", show_alert=True)
+                return
             ticket.status = new_status
             ticket.updated_at = datetime.utcnow()
+            user = db.get(User, ticket.user_id)
+            customer_telegram_id = int(user.telegram_id) if user else None
+            db.add(TicketMessage(
+                ticket_id=ticket.id,
+                sender_id=int(callback.from_user.id),
+                sender_role="system",
+                message=f"Ticket status changed: {old_status} → {new_status}.",
+            ))
             db.commit()
 
-            try:
-                user = db.query(User).filter(User.id == ticket.user_id).first()
-                if user:
-                    notify_text = (
-                        f"🔔 <b>Ticket #{ticket.id} Updated</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"📊 <b>Status:</b> {old_status} → {new_status}\n\n"
-                    )
-
-                    if new_status == "Resolved":
-                        notify_text += "✅ Your issue has been resolved!\nPlease rate our support. ⭐"
-                    elif new_status == "In Progress":
-                        notify_text += "🔄 Our team is working on your issue."
-                    elif new_status == "Closed":
-                        notify_text += "❌ This ticket has been closed."
-
-                    notify_markup = InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [
-                                InlineKeyboardButton(
-                                    text="📋 View Tickets",
-                                    callback_data="support_my_tickets",
-                                    style="primary"
-                                ),
-                                InlineKeyboardButton(
-                                    text="⭐ Rate Support",
-                                    callback_data="support_rate",
-                                    style="success"
-                                )
-                            ]
-                        ]
-                    )
-
+            if customer_telegram_id:
+                notify_text = (
+                    f"🎫 <b>Support ticket #{ticket_id} updated</b>\n\n"
+                    f"Status: <b>{escape(old_status)} → {escape(new_status)}</b>\n\n"
+                    + ("✅ Your issue was resolved. If it still needs attention, reply from the ticket details."
+                       if new_status == "Resolved" else
+                       "🔄 Our team is working on your issue."
+                       if new_status == "In Progress" else
+                       "This ticket was closed.")
+                )
+                try:
                     from services.notification_outbox import queue_message
-                    await queue_message(callback.bot,f"ticket-status:{ticket_id}:{new_status}",
-                        user.telegram_id,
+                    await queue_message(
+                        callback.bot,
+                        f"ticket-status:{ticket_id}:{new_status}",
+                        customer_telegram_id,
                         notify_text,
-                        reply_markup=notify_markup
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(text="📋 View ticket", callback_data=f"support_view_{ticket_id}")
+                        ]]),
                     )
-            except Exception as e:
-                print(f"Failed to notify user {ticket.user_id}:", e)
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception("Could not queue customer ticket status update ticket_id=%s", ticket_id)
 
-            await callback.message.edit_text(
-                callback.message.text + "\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ <b>Status:</b> {new_status}",
-                reply_markup=None
-            )
+            try:
+                from services.notification_outbox import admin_destination, queue_message
+                destination = admin_destination()
+                if destination:
+                    await queue_message(
+                        callback.bot,
+                        f"admin-ticket-status:{ticket_id}:{new_status}",
+                        destination,
+                        f"🎫 <b>Ticket #{ticket_id} status changed</b>\n"
+                        f"{escape(old_status)} → <b>{escape(new_status)}</b>\n"
+                        f"Changed by <code>{callback.from_user.id}</code>.",
+                    )
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("Could not queue Admin Notify ticket status ticket_id=%s", ticket_id)
 
-            await callback.answer(f"✅ Ticket #{ticket_id}: {new_status}", show_alert=True)
+            try:
+                if callback.message:
+                    old_text = callback.message.text or "Support ticket"
+                    await callback.message.edit_text(
+                        old_text + f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n✅ Status: <b>{escape(new_status)}</b>",
+                        reply_markup=None,
+                        parse_mode="HTML",
+                    )
+            except Exception:
+                pass
+            await callback.answer(f"Ticket #{ticket_id}: {new_status}", show_alert=True)
+        else:
+            await callback.answer("Use the Reply privately link in Admin Notify to send a customer reply.", show_alert=True)
 
     finally:
         db.close()

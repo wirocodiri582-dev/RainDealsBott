@@ -208,7 +208,15 @@ async def customer_action(callback:CallbackQuery,state:FSMContext):
             elif row['kind']=='deposit':
                 buttons.append([Button(text='Open Wallet',callback_data='deposit_start')])
             elif row['kind']=='support':
-                buttons.append([Button(text='Open Support',callback_data='support_ticket')])
+                if row.get('ticket_id'):
+                    buttons.append([Button(text=f"🎫 Open Ticket #{row['ticket_id']}",callback_data=f"support_view_{row['ticket_id']}")])
+                else:
+                    buttons.append([Button(text='Open Support',callback_data='support_ticket')])
+            elif row['kind']=='referral':
+                buttons.append([Button(text='🎁 Open Freebies',callback_data='freebies_menu'),
+                                Button(text='👥 Refer & Earn',callback_data='referrals_menu')])
+                if row.get('content') and any(term in row['content'].lower() for term in ('not counted', 'network matches', 'network could not be determined')):
+                    buttons.append([Button(text='🆘 Request referral review',callback_data='support_create_ticket')])
             elif row['kind']=='wallet':
                 buttons.append([Button(text='Open wallet',callback_data='deposit_start')])
             elif row['kind']=='restock':

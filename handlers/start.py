@@ -19,14 +19,19 @@ from database import SessionLocal, transaction, retry_on_write_conflict
 from models.user import User
 from models.deposit import Deposit
 from models.order import Order
+from states.support import SupportState
 from services.session_resume import save_resume
 from config import (
     ADMIN_IDS, TOS_LINK,
     LOYALTY_POINTS_PER_USD,
 )
 
-from keyboards.menu import get_main_menu, get_admin_main_menu, get_profile_menu
+from keyboards.menu import (
+    get_main_menu, get_admin_main_menu, get_profile_menu, get_language_menu,
+    get_miniapp_verification_menu,
+)
 from services.featured_product import featured_product as load_featured_product
+from services.menu_i18n import LANGUAGES, language_label, menu_text, normalize_language
 from utils.ui import show, answer_card, update_card, get_card_location
 
 # Membership check
@@ -190,16 +195,17 @@ def _build_audit_profile(user, telegram_id: int) -> str:
 
 def _build_start_welcome(
     user, full_name: str, telegram_id: int, username: str | None,
-    bot_username: str,
+    bot_username: str, language: str = "en",
 ) -> str:
     fallback_name = (str(full_name or "").strip().split() or ["there"])[0]
     greeting_name = str(username or "").strip().lstrip("@") or fallback_name
     first_name = safe(greeting_name)
+    language = normalize_language(language or getattr(user, "language_code", "en"))
     return (
-        f"👋 <b>Hey Dear, {first_name}</b> 🌸\n\n"
-        "<b>Welcome to Raindeals</b> 🛍\n\n"
-        "Get instant access to premium AI tools with fully automatic delivery. ⚡\n\n"
-        "🔘 <b>Please choose an option below to continue.</b> ⤵️"
+        f"👋 <b>{safe(menu_text(language, 'hello'))}, {first_name}</b> 🌸\n\n"
+        f"<b>{safe(menu_text(language, 'welcome'))}</b> 🛍\n\n"
+        f"{safe(menu_text(language, 'intro'))} ⚡\n\n"
+        f"🔘 <b>{safe(menu_text(language, 'prompt'))}</b> ⤵️"
     )
 
 
@@ -272,13 +278,17 @@ def _load_main_menu_data(
                 "id": int(deposit.id),
                 "code": deposit.invoice_code or deposit.order_id,
             }
+        language = normalize_language(getattr(user, "language_code", "en"))
         return {
-            "text": _build_start_welcome(user, full_name, telegram_id, username, bot_username),
+            "text": _build_start_welcome(
+                user, full_name, telegram_id, username, bot_username, language
+            ),
             "chat_id": user.home_menu_chat_id,
             "message_id": user.home_menu_message_id,
             "unread_notifications": 0,
             "deposit_action": deposit_action,
             "featured_product": load_featured_product(db),
+            "language_code": language,
         }
     finally:
         db.close()
@@ -291,6 +301,21 @@ def _save_home_menu_location(telegram_id: int, chat_id: int, message_id: int) ->
         if user:
             user.home_menu_chat_id = int(chat_id)
             user.home_menu_message_id = int(message_id)
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _mark_miniapp_verification_prompted(telegram_id: int) -> None:
+    """Persist the one-time prompt only after Telegram accepted its card."""
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == int(telegram_id)).first()
+        if user and user.miniapp_verified_at is None and user.miniapp_verification_prompted_at is None:
+            user.miniapp_verification_prompted_at = datetime.utcnow()
             db.commit()
     except Exception:
         db.rollback()
@@ -332,6 +357,18 @@ def _load_start_deposit_action(telegram_id: int) -> dict | None:
             "id": deposit.id,
             "code": deposit.invoice_code or deposit.order_id,
         }
+    finally:
+        db.close()
+
+
+def _load_support_ticket_for_reply(ticket_id: int) -> dict | None:
+    from models.ticket import Ticket
+    db = SessionLocal()
+    try:
+        ticket = db.query(Ticket).filter(Ticket.id == int(ticket_id)).first()
+        if not ticket:
+            return None
+        return {"id": int(ticket.id), "status": str(ticket.status or "Open")}
     finally:
         db.close()
 
@@ -402,10 +439,11 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
 
     unread = menu_data.get("unread_notifications",0)
     featured = menu_data.get("featured_product")
+    language = normalize_language(menu_data.get("language_code"))
     keyboard = (
-        get_admin_main_menu(unread, featured)
+        get_admin_main_menu(unread, featured, language)
         if callback.from_user.id in ADMIN_IDS
-        else get_main_menu(unread, featured)
+        else get_main_menu(unread, featured, language)
     )
     deposit_action = menu_data.get("deposit_action")
     if deposit_action:
@@ -446,6 +484,49 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
             pass
 
 
+def _referral_verification_status(telegram_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        return bool(db.query(User.miniapp_verified_at).filter(
+            User.telegram_id == int(telegram_id)
+        ).scalar())
+    finally:
+        db.close()
+
+
+@router.callback_query(F.data == "referral_verify_check")
+async def referral_verify_check(callback: CallbackQuery, state: FSMContext):
+    """Confirm the signed Mini App bootstrap recorded this Telegram account."""
+    verified = await asyncio.to_thread(_referral_verification_status, callback.from_user.id)
+    if not verified:
+        await callback.answer(
+            "Verification was not detected yet. Open the RainDeals Store, wait for it to load, then tap Verify. You can also continue in the bot.",
+            show_alert=True,
+        )
+        await update_card(
+            callback.message,
+            text=(
+                "⚠️ <b>Verification not detected yet</b>\n\n"
+                "Open the RainDeals Store and wait until the shop loads, then return here and tap <b>Verify</b> again.\n\n"
+                "You can continue in the bot; referral freebies remain locked until verification succeeds."
+            ),
+            reply_markup=get_miniapp_verification_menu(),
+            parse_mode="HTML",
+            delete_input=False,
+            owner_id=callback.from_user.id,
+            disable_web_page_preview=True,
+        )
+        return
+    # main_menu_cb acknowledges the callback and restores the normal home card.
+    await main_menu_cb(callback, state)
+
+
+@router.callback_query(F.data == "referral_verify_continue")
+async def continue_after_verification_prompt(callback: CallbackQuery, state: FSMContext):
+    """Let the customer proceed in Telegram while referral eligibility stays gated."""
+    await main_menu_cb(callback, state)
+
+
 @router.callback_query(F.data == "shop_unavailable")
 async def shop_unavailable(callback: CallbackQuery):
     await callback.answer(
@@ -469,17 +550,99 @@ async def open_featured_product(callback: CallbackQuery):
     await product_info(callback, linked_product_id=featured["id"], acknowledge_callback=False)
 
 
+def _load_user_language(telegram_id: int) -> str:
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+        return normalize_language(getattr(user, "language_code", "en"))
+    finally:
+        db.close()
+
+
+def _save_user_language(telegram_id: int, language: str) -> None:
+    language = normalize_language(language)
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+        if user:
+            user.language_code = language
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 @router.callback_query(F.data == "language_menu")
 async def language_menu(callback: CallbackQuery):
     await callback.answer()
+    language = await asyncio.to_thread(_load_user_language, callback.from_user.id)
+    title = menu_text(language, "language")
     await show(
         callback,
-        "🌐 <b>Language</b>\n\nEnglish is currently active. Other translated language packs are not configured yet.",
+        f"🌐 <b>{safe(title)}</b>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="⬅ Main menu", callback_data="main_menu")
-        ]]),
+        reply_markup=get_language_menu(language),
     )
+
+
+@router.callback_query(F.data.startswith("menu_lang_"))
+async def select_menu_language(callback: CallbackQuery):
+    language = str(callback.data or "").removeprefix("menu_lang_")
+    if language not in LANGUAGES:
+        await callback.answer("That language is not available.", show_alert=True)
+        return
+    try:
+        await asyncio.to_thread(_save_user_language, callback.from_user.id, language)
+        menu_data = await asyncio.to_thread(
+            _load_main_menu_data,
+            callback.from_user.id,
+            callback.from_user.full_name,
+            callback.from_user.username,
+            "",
+        )
+    except Exception:
+        logger.exception("Could not save menu language for user %s", callback.from_user.id)
+        await callback.answer("Could not save the language. Please try again.", show_alert=True)
+        return
+    if not menu_data:
+        await callback.answer("User record not found. Send /start again.", show_alert=True)
+        return
+
+    await callback.answer(f"{language_label(language)} selected")
+    featured = menu_data.get("featured_product")
+    keyboard = (
+        get_admin_main_menu(0, featured, language)
+        if callback.from_user.id in ADMIN_IDS
+        else get_main_menu(0, featured, language)
+    )
+    deposit_action = menu_data.get("deposit_action")
+    if deposit_action:
+        label = (
+            f"⏳ Payment checking · #{deposit_action['id']}"
+            if deposit_action["kind"] == "status"
+            else f"💳 Resume payment · {deposit_action['code']}"
+        )
+        keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(
+            text=label,
+            callback_data=f"resume_deposit_{deposit_action['id']}",
+            style="success",
+        )])
+    menu_card = await show(
+        callback,
+        menu_data["text"],
+        reply_markup=keyboard,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    if menu_card:
+        await asyncio.to_thread(
+            _save_home_menu_location,
+            callback.from_user.id,
+            int(menu_card.chat.id),
+            int(menu_card.message_id),
+        )
 
 
 @router.callback_query(F.data == "my_profile")
@@ -700,6 +863,14 @@ def _get_or_create_user(
             if user.full_name != full_name:
                 user.full_name = full_name
 
+        show_miniapp_verification_prompt = False
+        if (
+            load_home_menu
+            and user.miniapp_verified_at is None
+            and user.miniapp_verification_prompted_at is None
+        ):
+            show_miniapp_verification_prompt = True
+
         deposit_action = None
         featured = None
         if load_home_menu:
@@ -740,6 +911,10 @@ def _get_or_create_user(
                 "referral_code": user.referral_code,
                 "home_menu_chat_id": user.home_menu_chat_id,
                 "home_menu_message_id": user.home_menu_message_id,
+                "language_code": normalize_language(getattr(user, "language_code", "en")),
+                "referred_by": user.referred_by,
+                "miniapp_verified_at": user.miniapp_verified_at,
+                "show_miniapp_verification_prompt": show_miniapp_verification_prompt,
             },
         }
 
@@ -809,6 +984,7 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
     start_payload = (command.args or "").strip() if command else ""
     deep_link_product_id = None
     vendor_request_id = None
+    support_reply_ticket_id = None
     if start_payload.startswith("product_"):
         product_id_text = start_payload.removeprefix("product_")
         if product_id_text.isdigit():
@@ -817,6 +993,10 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         request_id_text = start_payload.removeprefix("vendor_request_")
         if request_id_text.isdigit():
             vendor_request_id = int(request_id_text)
+    elif start_payload.startswith("support_reply_"):
+        ticket_id_text = start_payload.removeprefix("support_reply_")
+        if ticket_id_text.isdigit():
+            support_reply_ticket_id = int(ticket_id_text)
 
     # ═══════════════════════════════════════════════════════
     # CHANNEL MEMBERSHIP CHECK (skip for admins)
@@ -851,11 +1031,10 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
 
     try:
         db_started_at = time.perf_counter()
-        load_home_menu = (
-            deep_link_product_id is None
-            and vendor_request_id is None
-            and not is_admin
-        )
+        # Every customer gets the one-time Mini App verification card before
+        # any customer deep-link flow. Admin commands and support reply links
+        # remain on their dedicated fast path.
+        load_home_menu = not is_admin
         user_task = asyncio.to_thread(
             _get_or_create_user,
             telegram_id,
@@ -914,6 +1093,57 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
             previous_cards + list(saved_home),
             int(loading_location[1]),
         ))
+    if support_reply_ticket_id is not None:
+        if not is_admin:
+            await update_card(
+                message,
+                "⛔ This private reply link is for support admins only.",
+                parse_mode="HTML",
+                delete_input=False,
+                chat_id=loading_location[0] if loading_location else message.chat.id,
+                message_id=loading_location[1] if loading_location else None,
+                owner_id=telegram_id,
+            )
+            return
+        ticket_info = await asyncio.to_thread(_load_support_ticket_for_reply, support_reply_ticket_id)
+        if not ticket_info or ticket_info["status"] in {"Resolved", "Closed"}:
+            await update_card(
+                message,
+                f"🎫 <b>Ticket #{support_reply_ticket_id}</b> is not open for replies.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="⬅ Admin Panel", callback_data="admin_panel")
+                ]]),
+                parse_mode="HTML",
+                delete_input=False,
+                chat_id=loading_location[0] if loading_location else message.chat.id,
+                message_id=loading_location[1] if loading_location else None,
+                owner_id=telegram_id,
+            )
+            return
+        await state.update_data(admin_reply_ticket_id=support_reply_ticket_id)
+        await state.set_state(SupportState.admin_reply)
+        reply_card = await update_card(
+            message,
+            f"💬 <b>Reply to Support Ticket #{support_reply_ticket_id}</b>\n\n"
+            "Type the response you want to send to the customer. It will be recorded in the ticket and the user’s Notifications.\n\n"
+            "Send /cancel to stop.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✖ Cancel reply", callback_data="admin_reply_cancel")
+            ]]),
+            parse_mode="HTML",
+            delete_input=False,
+            chat_id=loading_location[0] if loading_location else message.chat.id,
+            message_id=loading_location[1] if loading_location else None,
+            owner_id=telegram_id,
+        )
+        if reply_card:
+            await asyncio.to_thread(
+                _save_home_menu_location,
+                telegram_id,
+                int(reply_card.chat.id),
+                int(reply_card.message_id),
+            )
+        return
     if is_admin:
         from handlers.admin import _get_admin_panel_with_providers
         admin_text = admin_dashboard or (
@@ -940,6 +1170,40 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
             )
         logger.info(
             "start_timing user_id=%s admin=true loader_ms=%.1f db_ms=%.1f total_ms=%.1f",
+            telegram_id,
+            loader_ms,
+            db_ms,
+            (time.perf_counter() - started_at) * 1000,
+        )
+        return
+    if result["profile"].get("show_miniapp_verification_prompt"):
+        verification_text = (
+            "🔐 <b>Verify your RainDeals account once</b>\n\n"
+            "Open the RainDeals Store to verify this Telegram account. When the store finishes loading, return here and tap <b>Verify</b>.\n\n"
+            "You can continue in Telegram. Referral rewards and referral-gated freebies stay unavailable until verification succeeds. "
+            "This prompt will not repeat on every /start."
+        )
+        verification_card = await update_card(
+            message,
+            text=verification_text,
+            reply_markup=get_miniapp_verification_menu(),
+            parse_mode="HTML",
+            delete_input=False,
+            chat_id=loading_location[0] if loading_location else result["profile"].get("home_menu_chat_id"),
+            message_id=loading_location[1] if loading_location else result["profile"].get("home_menu_message_id"),
+            owner_id=telegram_id,
+            disable_web_page_preview=True,
+        )
+        if verification_card:
+            await asyncio.to_thread(
+                _save_home_menu_location,
+                telegram_id,
+                int(verification_card.chat.id),
+                int(verification_card.message_id),
+            )
+            await asyncio.to_thread(_mark_miniapp_verification_prompted, telegram_id)
+        logger.info(
+            "start_timing user_id=%s miniapp_verification_required=true loader_ms=%.1f db_ms=%.1f total_ms=%.1f",
             telegram_id,
             loader_ms,
             db_ms,
@@ -985,11 +1249,12 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
 
     user.username = username
     user.full_name = full_name
-    text = _build_start_welcome(user, full_name, telegram_id, username, "")
+    language = normalize_language(result["profile"].get("language_code", "en"))
+    text = _build_start_welcome(user, full_name, telegram_id, username, "", language)
     keyboard = (
-        get_admin_main_menu(featured_product=result.get("featured_product"))
+        get_admin_main_menu(featured_product=result.get("featured_product"), language=language)
         if is_admin
-        else get_main_menu(featured_product=result.get("featured_product"))
+        else get_main_menu(featured_product=result.get("featured_product"), language=language)
     )
     if deposit_action:
         label = (

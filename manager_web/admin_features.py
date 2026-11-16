@@ -24,7 +24,7 @@ from models.order import Order
 from models.product import Product
 from models.promocode import PromoCode
 from models.rate_control import ProductRateControl, RateControlAssignment
-from models.ticket import Ticket
+from models.ticket import Ticket, TicketMessage
 from models.user import User
 
 
@@ -714,8 +714,24 @@ async def ticket_detail(request: Request, ticket_id: int):
         else:
             user = db.get(User, ticket.user_id)
             tid = user.telegram_id if user else 0
+            messages = db.query(TicketMessage).filter(
+                TicketMessage.ticket_id == ticket.id
+            ).order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc()).limit(50).all()
+            if messages and messages[0].sender_role == "customer" and messages[0].message == ticket.message:
+                messages = messages[1:]
+            conversation = "".join(
+                f'<article class="card"><strong>{"⚙️ Status" if item.sender_role == "system" else "💬 Support" if item.sender_role == "admin" else "📝 Customer"} · '
+                f'{item.created_at.strftime("%d %b %Y, %H:%M UTC") if item.created_at else ""}</strong>'
+                f'<p style="white-space:pre-wrap">{escape(item.message or "")}</p></article>'
+                for item in messages
+            )
+            if not messages and ticket.admin_response:
+                conversation = (
+                    '<article class="card"><strong>💬 Previous support reply</strong>'
+                    f'<p style="white-space:pre-wrap">{escape(ticket.admin_response)}</p></article>'
+                )
             body = f'''<section class="panel"><h2>Ticket #{ticket.id}</h2><p>User <a href="/users/{tid}">{tid}</a> · {escape(ticket.category or "General")} · {escape(ticket.priority or "Normal")} · {escape(ticket.status)}</p>
-            <p style="white-space:pre-wrap">{escape(ticket.message)}</p><p><strong>Previous response:</strong><br>{escape(ticket.admin_response or "None")}</p>
+            <h3>Conversation</h3><article class="card"><strong>📝 Original request</strong><p style="white-space:pre-wrap">{escape(ticket.message or "")}</p></article>{conversation or '<p class="sub">No follow-up messages yet.</p>'}
             <form method="post" action="/tickets/{ticket.id}/respond"><input type="hidden" name="csrf" value="{escape(csrf)}"><label>Reply<textarea name="response" required maxlength="4000"></textarea></label><button class="primary">Send reply and close ticket</button></form></section>'''
     finally:
         db.close()
@@ -755,6 +771,7 @@ async def ticket_respond(request: Request, ticket_id: int):
     response_text = data.get("response", "").strip()
     if not response_text or len(response_text) > 4000:
         raise HTTPException(status_code=400, detail="Reply must contain 1–4,000 characters.")
+    admin_id = _session_admin_id(request)
     db = SessionLocal()
     try:
         ticket = db.query(Ticket).filter(Ticket.id == ticket_id).with_for_update().first()
@@ -764,17 +781,51 @@ async def ticket_respond(request: Request, ticket_id: int):
         if not user:
             raise HTTPException(status_code=404, detail="Ticket owner not found.")
         telegram_id = user.telegram_id
+        old_status = str(ticket.status or "Open")
         ticket.admin_response = response_text
         ticket.status = "Closed"
+        ticket.updated_at = datetime.utcnow()
+        reply = TicketMessage(
+            ticket_id=ticket.id,
+            sender_id=int(admin_id),
+            sender_role="admin",
+            message=response_text,
+        )
+        db.add(reply)
+        if old_status != "Closed":
+            db.add(TicketMessage(
+                ticket_id=ticket.id,
+                sender_id=int(admin_id),
+                sender_role="system",
+                message=f"Ticket status changed: {old_status} → Closed via Manager Web.",
+            ))
+        db.flush()
+        reply_id = int(reply.id)
         db.commit()
     finally:
         db.close()
     try:
         from services.notification_outbox import queue_message
-        response_key = hashlib.sha256(response_text.encode("utf-8")).hexdigest()[:20]
-        await queue_message(request.app.state.main_bot, f"manager-ticket:{ticket_id}:{response_key}",
+        await queue_message(request.app.state.main_bot, f"ticket-reply:{ticket_id}:{reply_id}",
                             telegram_id, "Support replied to your ticket:\n\n" + response_text,
                             parse_mode=None)
     except Exception:
-        core.logger.exception("Ticket reply notification failed for ticket %s", ticket_id)
+        core.logger.exception("Customer ticket reply notification failed for ticket %s", ticket_id)
+    try:
+        from services.notification_outbox import admin_destination, queue_message
+        destination = admin_destination()
+        if destination:
+            notice = (
+                f"💬 Manager Web reply · Ticket #{ticket_id}\n"
+                f"Closed by admin {admin_id}.\n\n{response_text}"
+            )
+            await queue_message(
+                request.app.state.main_bot,
+                f"admin-ticket-web-reply:{ticket_id}:{reply_id}",
+                destination,
+                notice,
+                parse_mode=None,
+            )
+    except Exception:
+        core.logger.exception("Admin Notify ticket reply failed for ticket %s", ticket_id)
     return RedirectResponse(f"/tickets?notice=Reply+saved", status_code=303)

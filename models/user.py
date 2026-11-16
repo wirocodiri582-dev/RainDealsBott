@@ -48,6 +48,12 @@ class User(Base):
 
     username: Mapped[Optional[str]] = mapped_column(String(100))
 
+    # Language selected for home-screen labels. Detailed product content and
+    # transaction messages remain in their authored language.
+    language_code: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="en", server_default="en"
+    )
+
     # Keep one durable home-menu card per Telegram user so /start and
     # Main Menu can edit it even after a bot restart.
     home_menu_chat_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
@@ -83,6 +89,14 @@ class User(Base):
     # Set only after this registered Telegram account has authenticated with
     # fresh Telegram Mini App initData. Used to qualify referral unlocks.
     miniapp_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Show the referral-verification prompt once. Users may continue in the
+    # bot; gated claims can still reopen the Mini App verification action.
+    miniapp_verification_prompted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Keyed one-way fingerprint of the network observed on the first signed
+    # Mini App visit. Raw IP addresses are never persisted.
+    miniapp_ip_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    miniapp_referral_review_approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    miniapp_referral_reviewed_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     total_referrals: Mapped[int] = mapped_column(
         Integer,

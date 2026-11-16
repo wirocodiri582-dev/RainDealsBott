@@ -2102,6 +2102,7 @@ async def admin_back(callback: CallbackQuery, state: FSMContext):
         markup = get_admin_main_menu(
             menu_data.get("unread_notifications", 0),
             menu_data.get("featured_product"),
+            menu_data.get("language_code", "en"),
         )
         deposit_action = menu_data.get("deposit_action")
         if deposit_action:

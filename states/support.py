@@ -9,4 +9,6 @@ from aiogram.fsm.state import State, StatesGroup
 
 class SupportState(StatesGroup):
     waiting_message = State()
-    tracking_ticket = State()  # ← ADD THIS LINE
+    tracking_ticket = State()
+    customer_reply = State()
+    admin_reply = State()

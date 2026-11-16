@@ -47,6 +47,10 @@ def _kind(row, plain):
         return 'broadcast'
     if category == 'provider':
         return 'provider'
+    if category == 'support':
+        return 'support'
+    if category == 'referral' or 'referral' in lower:
+        return 'referral'
     if category == 'wallet_adjustment' or category in ('wallet', 'balance'):
         return 'wallet'
     if category in ('order_progress', 'order_update') and any(
@@ -60,7 +64,7 @@ def _kind(row, plain):
         return 'warranty'
     if category == 'deposit' or 'deposit' in lower or 'payment' in lower or 'invoice' in lower:
         return 'deposit'
-    if category == 'support' or 'support' in lower or 'ticket' in lower:
+    if 'support' in lower or 'ticket' in lower:
         return 'support'
     if category == 'restock' or 'restock' in lower or 'available again' in lower:
         return 'restock'
@@ -107,6 +111,16 @@ def _summary(kind, plain, order=None, claim=None):
         return 'Your payment or invoice has an update. Open Wallet to review it.'
     if kind == 'support':
         return 'Support has replied or updated your ticket. Open Support to continue the conversation.'
+    if kind == 'referral':
+        if 'not counted' in lower or 'network matches' in lower or 'trusted client network could not be determined' in lower:
+            return 'A referral did not increase freebie progress. Open the update for the reason or contact Support for a review.'
+        if 'verify your own account' in lower:
+            return 'Your referral count reached an offer threshold. Verify your RainDeals account before claiming.'
+        if 'unlocked' in lower or 'available to claim' in lower or 'you can claim' in lower:
+            return 'Your verified referrals unlocked a freebie. Open Freebies in the shop to check the offer.'
+        if 'store verification complete' in lower:
+            return 'Your RainDeals Store verification is complete. Open Freebies to see whether an offer is ready to claim.'
+        return 'Your referral verification progress changed. Open the shop or this update to check freebie eligibility.'
     if kind == 'wallet':
         match = re.search(r'(?i)(added|increased|credited|removed|decreased|reduced)\s+(?:by\s+)?\$?([0-9]+(?:\.[0-9]{1,8})?)', plain)
         if match:
@@ -141,9 +155,12 @@ def _view_row(row, order=None, claim=None):
     plain = _plain(row.body)
     kind = _kind(row, plain)
     oid = _order_id(row, plain)
-    content = plain if kind in ('broadcast', 'wallet') else None
+    content = plain if kind in ('broadcast', 'wallet', 'support', 'referral') else None
+    ticket_match = re.search(r'(?i)ticket\s*#\s*(\d{1,12})', plain)
     if kind == 'broadcast' and content and len(content) > 3500:
         content = content[:3500].rstrip() + "…\n\nOpen the original broadcast message to view the full content."
+    if kind == 'referral' and content and len(content) > 2500:
+        content = content[:2500].rstrip() + "…"
     order_text = None
     if order:
         product_name = (order.product_name or 'Product').strip()
@@ -152,7 +169,6 @@ def _view_row(row, order=None, claim=None):
         order_text = f'Order #{oid}'
     else:
         deposit_match = re.search(r'(?i)deposit\s*#\s*(\d{1,12})', plain)
-        ticket_match = re.search(r'(?i)ticket\s*#\s*(\d{1,12})', plain)
         product_match = re.search(r'(?i)back in stock\s+(.+?)\s+price\s*:', plain)
         order_text = (f'Deposit #{deposit_match.group(1)} · Payment update' if deposit_match else
                       f'Ticket #{ticket_match.group(1)} · Support update' if ticket_match else
@@ -173,6 +189,7 @@ def _view_row(row, order=None, claim=None):
         'wallet': '💰 Balance update',
         'broadcast': '📢 Announcement',
         'provider': '🤝 Provider offer update',
+        'referral': '🎁 Referral progress',
         'account': '👤 Account update',
     }.get(kind, '🔔 RainDeals update')
     return dict(
@@ -182,6 +199,7 @@ def _view_row(row, order=None, claim=None):
         content=content,
         kind=kind,
         order_id=order.id if order else oid,
+        ticket_id=int(ticket_match.group(1)) if ticket_match else None,
         created_at=row.created_at,
         unread=row.inbox_read_at is None,
         # Never replay stored keyboards here: legacy admin cards could contain

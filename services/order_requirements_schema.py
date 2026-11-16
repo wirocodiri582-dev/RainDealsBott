@@ -12,6 +12,7 @@ from models.bot_operations import WarrantyRequest, NotificationJob, ProviderHeal
 from models.api_key import ApiKey, ApiOrder, ApiRateLimitBucket
 from models.vendor_offer import VendorOffer, VendorRequest
 from models.bot_menu_setting import BotMenuSetting
+from models.ticket import Ticket, TicketMessage
 
 
 def _ensure_column(connection, table: str, column: str, definition: str) -> bool:
@@ -88,6 +89,7 @@ def ensure_order_requirements_schema() -> None:
             VendorOffer.__table__,
             VendorRequest.__table__,
             BotMenuSetting.__table__,
+            Ticket.__table__, TicketMessage.__table__,
         ]
     try:
         Base.metadata.create_all(bind=engine, tables=required_tables)
@@ -136,10 +138,23 @@ def ensure_order_requirements_schema() -> None:
         _ensure_column(connection, 'api_orders', 'request_fingerprint', 'VARCHAR(64) NULL')
         _ensure_column(connection, "users", "home_menu_chat_id", "BIGINT NULL")
         _ensure_column(connection, "users", "home_menu_message_id", "BIGINT NULL")
+        _ensure_column(connection, "users", "language_code", "VARCHAR(16) NOT NULL DEFAULT 'en'")
         _ensure_column(connection, "products", "required_info", "JSON NULL")
         _ensure_column(connection, "products", "freebie_referrals_required", "INT NOT NULL DEFAULT 0")
         _ensure_column(connection, "users", "miniapp_verified_at", "DATETIME NULL")
+        _ensure_column(connection, "users", "miniapp_verification_prompted_at", "DATETIME NULL")
+        _ensure_column(connection, "users", "miniapp_ip_hash", "VARCHAR(64) NULL")
+        _ensure_column(connection, "users", "miniapp_referral_review_approved_at", "DATETIME NULL")
+        _ensure_column(connection, "users", "miniapp_referral_reviewed_by", "BIGINT NULL")
         _ensure_index(connection, "users", ["referred_by", "miniapp_verified_at"], "ix_users_verified_referrals")
+        _ensure_index(connection, "users", ["referred_by", "miniapp_ip_hash", "miniapp_verified_at"], "ix_users_referral_network_check")
+        # Older support handlers wrote Telegram IDs into tickets.user_id even
+        # though the column references users.id. Convert those legacy rows so
+        # the support inbox, owner checks, and Manager Web can resolve them.
+        connection.execute(text(
+            "UPDATE tickets AS t JOIN users AS u ON u.telegram_id = t.user_id "
+            "SET t.user_id = u.id WHERE t.user_id <> u.id"
+        ))
         _ensure_column(connection, "products", "reusable_delivery", "TEXT NULL")
         _ensure_column(connection, "products", "reusable_stock", "INT NOT NULL DEFAULT 0")
         _ensure_column(connection, "products", "warranty_days", "INT NOT NULL DEFAULT 0")

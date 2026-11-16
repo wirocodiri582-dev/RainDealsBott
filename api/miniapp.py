@@ -68,17 +68,48 @@ def _verify_init_data(init_data: str) -> dict:
         raise _auth_error()
 
 
-def current_user(init_data: str | None = Header(default=None, alias="X-Telegram-Init-Data")) -> dict:
+def current_user(
+    request: Request,
+    init_data: str | None = Header(default=None, alias="X-Telegram-Init-Data"),
+) -> dict:
     auth = _verify_init_data(init_data or "")
     with SessionLocal() as db:
-        user = db.query(User).filter(User.telegram_id == auth["id"]).first()
+        user = db.query(User).filter(User.telegram_id == auth["id"]).with_for_update().first()
         if not user or user.is_banned:
             raise HTTPException(status_code=403, detail={"error": "account_unavailable", "message": "Send /start to the RainDeals bot to activate your account."})
-        # _verify_init_data has already checked Telegram's signature and
-        # freshness window; store that account-level verification once.
+        # Telegram signed initData proves the account identity. Record it only
+        # once, along with a keyed network fingerprint for referral abuse
+        # checks. No raw IP or forwarded header is persisted.
         if user.miniapp_verified_at is None:
+            # Serialize first-time referrals from the same inviter while their
+            # fingerprints are recorded. Without this parent-row lock, two
+            # concurrent Mini App opens can miss each other's network hash.
+            if user.referred_by:
+                db.query(User.id).filter(
+                    User.telegram_id == int(user.referred_by)
+                ).with_for_update().first()
+            if user.referred_by and user.miniapp_verification_prompted_at is None:
+                user.miniapp_verification_prompted_at = datetime.utcnow()
             user.miniapp_verified_at = datetime.utcnow()
+            from services.freebie_referrals import referral_ip_fingerprint
+            user.miniapp_ip_hash = referral_ip_fingerprint(request)
             db.commit()
+            try:
+                from services.freebie_referrals import (
+                    notify_claimant_verification,
+                    notify_verified_referral,
+                )
+                with SessionLocal() as notification_db:
+                    verified_user = notification_db.query(User).filter(
+                        User.telegram_id == auth["id"]
+                    ).first()
+                    if verified_user:
+                        if verified_user.referred_by or int(verified_user.total_referrals or 0) > 0:
+                            notify_claimant_verification(notification_db, verified_user)
+                        notify_verified_referral(notification_db, verified_user)
+                        notification_db.commit()
+            except Exception:
+                logger.exception("Could not record Mini App referral verification for user_id=%s", auth["id"])
         return {"id": int(user.telegram_id), "telegram_user": auth["telegram_user"]}
 
 
