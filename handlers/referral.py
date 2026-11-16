@@ -8,7 +8,6 @@ from sqlalchemy import func
 
 from database import SessionLocal
 from models.user import User
-from models.referral import Referral
 from config import ADMIN_IDS, MINI_APP_URL
 from utils.ui import show, answer_card
 
@@ -152,53 +151,72 @@ async def referrals(callback: CallbackQuery):
             await callback.answer("❌ User not found.", show_alert=True)
             return
 
-        total_referrals = user.total_referrals
+        # The users table is the source of truth. The legacy Referral table
+        # is not written by /start, and the cached counter can drift.
+        total_referrals = int(
+            db.query(func.count(User.id))
+            .filter(User.referred_by == int(user.telegram_id))
+            .scalar()
+            or 0
+        )
         from services.freebie_referrals import verified_referral_count
         miniapp_verified_referrals = verified_referral_count(db, callback.from_user.id)
         # Use the display property (safe float conversion at the last moment)
         earnings = user.referral_earnings_display
         referral_code = user.referral_code
 
-        # Calculate referral level progress
-        if total_referrals >= 100:
+        # Reward progress uses completed, eligible Store verifications.
+        progress_referrals = miniapp_verified_referrals
+        if progress_referrals >= 100:
             next_level = "MAX"
             progress = 100
             referrals_needed = 0
-        elif total_referrals >= 50:
+        elif progress_referrals >= 50:
             next_level = "🌟 Legendary (100+)"
-            progress = ((total_referrals - 50) / 50) * 100
-            referrals_needed = 100 - total_referrals
-        elif total_referrals >= 25:
+            progress = ((progress_referrals - 50) / 50) * 100
+            referrals_needed = 100 - progress_referrals
+        elif progress_referrals >= 25:
             next_level = "👑 Royal (50+)"
-            progress = ((total_referrals - 25) / 25) * 100
-            referrals_needed = 50 - total_referrals
-        elif total_referrals >= 10:
+            progress = ((progress_referrals - 25) / 25) * 100
+            referrals_needed = 25 - progress_referrals
+        elif progress_referrals >= 10:
             next_level = "💎 Elite (25+)"
-            progress = ((total_referrals - 10) / 15) * 100
-            referrals_needed = 25 - total_referrals
-        elif total_referrals >= 3:
+            progress = ((progress_referrals - 10) / 15) * 100
+            referrals_needed = 25 - progress_referrals
+        elif progress_referrals >= 3:
             next_level = "🌳 Established (10+)"
-            progress = ((total_referrals - 3) / 7) * 100
-            referrals_needed = 10 - total_referrals
+            progress = ((progress_referrals - 3) / 7) * 100
+            referrals_needed = 10 - progress_referrals
         else:
             next_level = "🌿 Growing (3+)"
-            progress = (total_referrals / 3) * 100 if total_referrals > 0 else 0
-            referrals_needed = 3 - total_referrals
+            progress = (progress_referrals / 3) * 100 if progress_referrals > 0 else 0
+            referrals_needed = 3 - progress_referrals
 
-        # Get recent referrals from the Referral table
+        # Recent referral rows are the referred users themselves.
         recent_referrals = (
-            db.query(Referral)
-            .filter(Referral.referrer_id == user.id)
-            .order_by(Referral.created_at.desc())
+            db.query(User)
+            .filter(User.referred_by == int(user.telegram_id))
+            .order_by(User.id.desc())
             .limit(5)
             .all()
         )
 
-        # Leaderboard position
+        referral_counts = (
+            db.query(
+                User.referred_by.label("referrer_telegram_id"),
+                func.count(User.id).label("referral_count"),
+            )
+            .filter(User.referred_by.isnot(None))
+            .group_by(User.referred_by)
+            .subquery()
+        )
         leaderboard_position = (
-            db.query(func.count())
-            .select_from(User)
-            .filter(User.total_referrals > user.total_referrals)
+            db.query(func.count(User.id))
+            .outerjoin(
+                referral_counts,
+                referral_counts.c.referrer_telegram_id == User.telegram_id,
+            )
+            .filter(func.coalesce(referral_counts.c.referral_count, 0) > total_referrals)
             .scalar()
         ) + 1
 
@@ -212,8 +230,8 @@ async def referrals(callback: CallbackQuery):
         bot = await callback.bot.get_me()
         referral_link = f"https://t.me/{bot.username}?start={referral_code}"
 
-        emoji = get_referral_emoji(total_referrals)
-        title = get_referral_title(total_referrals)
+        emoji = get_referral_emoji(progress_referrals)
+        title = get_referral_title(progress_referrals)
 
         text = (
             f"{emoji} <b>Referral Dashboard</b> {emoji}\n"
@@ -224,8 +242,8 @@ async def referrals(callback: CallbackQuery):
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>Statistics</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👥 <b>Total Referrals:</b> {total_referrals}\n"
-            f"🛍 <b>Mini Store verified:</b> {miniapp_verified_referrals}\n"
+            f"👥 <b>Friends who started:</b> {total_referrals}\n"
+            f"✅ <b>Completed referrals:</b> {miniapp_verified_referrals}\n"
             f"🔐 <b>Your Store verification:</b> {'✅ Complete' if user.miniapp_verified_at else '⏳ Needed to claim referral freebies'}\n"
             f"💰 <b>Total Earnings:</b> ${earnings:,.2f}\n"
         )
@@ -251,16 +269,35 @@ async def referrals(callback: CallbackQuery):
             )
 
             icons = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-            for i, ref in enumerate(recent_referrals):
-                referred_user = db.query(User).filter(User.id == ref.referred_id).first()
-                if referred_user:
-                    icon = icons[i] if i < 3 else "👤"
-                    username = (
-                        f"@{referred_user.username}"
-                        if referred_user.username
-                        else f"User#{referred_user.id}"
+            for i, referred_user in enumerate(recent_referrals):
+                icon = icons[i] if i < 3 else "👤"
+                username = (
+                    f"@{referred_user.username}"
+                    if referred_user.username
+                    else f"User#{referred_user.telegram_id}"
+                )
+                if not referred_user.miniapp_verified_at:
+                    status = "⏳ Awaiting Store"
+                elif referred_user.miniapp_referral_review_approved_at:
+                    status = "✅ Counted"
+                elif referred_user.miniapp_ip_hash:
+                    matching_prior = (
+                        referred_user.miniapp_ip_hash == user.miniapp_ip_hash
+                        or db.query(User.id).filter(
+                            User.referred_by == int(user.telegram_id),
+                            User.id != int(referred_user.id),
+                            User.id < int(referred_user.id),
+                            User.miniapp_verified_at.isnot(None),
+                            User.is_banned.is_(False),
+                            User.miniapp_ip_hash == referred_user.miniapp_ip_hash,
+                        ).first()
                     )
-                    text += f"{icon} {username}\n"
+                    status = "⚠️ Review" if matching_prior else "✅ Counted"
+                elif referred_user.miniapp_verification_prompted_at is None:
+                    status = "✅ Counted"
+                else:
+                    status = "⚠️ Review"
+                text += f"{icon} {username} · {status}\n"
 
         text += (
             f"\n━━━━━━━━━━━━━━━━━━━━━━\n"

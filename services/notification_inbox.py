@@ -114,6 +114,10 @@ def _summary(kind, plain, order=None, claim=None):
     if kind == 'referral':
         if 'not counted' in lower or 'network matches' in lower or 'trusted client network could not be determined' in lower:
             return 'A referral did not increase freebie progress. Open the update for the reason or contact Support for a review.'
+        if 'referral completed' in lower:
+            match = re.search(r'eligible progress is now\s+(\d+)', plain, re.IGNORECASE)
+            count = f' Eligible referrals: {match.group(1)}.' if match else ''
+            return 'One invited friend completed Store verification.' + count
         if 'verify your own account' in lower:
             return 'Your referral count reached an offer threshold. Verify your RainDeals account before claiming.'
         if 'unlocked' in lower or 'available to claim' in lower or 'you can claim' in lower:

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from html import escape
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
@@ -17,6 +17,9 @@ from models.user import User
 
 
 def verified_referral_count(db: Session, telegram_id: int) -> int:
+    referrer_network = db.query(User.miniapp_ip_hash).filter(
+        User.telegram_id == int(telegram_id)
+    ).scalar()
     base = db.query(User).filter(
             User.referred_by == int(telegram_id),
             User.telegram_id != int(telegram_id),
@@ -29,7 +32,20 @@ def verified_referral_count(db: Session, telegram_id: int) -> int:
     approved = base.filter(User.miniapp_referral_review_approved_at.isnot(None))
     approved_count = approved.count()
     not_approved = base.filter(User.miniapp_referral_review_approved_at.is_(None))
-    unique_networks = not_approved.filter(User.miniapp_ip_hash.isnot(None)).with_entities(
+    if referrer_network:
+        # Do not count a second Telegram account verified from the inviter's
+        # own observed network unless an admin explicitly reviews it.
+        not_approved = not_approved.filter(or_(
+            User.miniapp_ip_hash.is_(None),
+            User.miniapp_ip_hash != referrer_network,
+        ))
+    approved_networks = approved.filter(User.miniapp_ip_hash.isnot(None)).with_entities(
+        User.miniapp_ip_hash
+    )
+    unique_networks = not_approved.filter(
+        User.miniapp_ip_hash.isnot(None),
+        ~User.miniapp_ip_hash.in_(approved_networks),
+    ).with_entities(
         func.count(func.distinct(User.miniapp_ip_hash))
     ).scalar() or 0
     # Keep pre-rollout verified referrals that never received the one-time
@@ -126,8 +142,11 @@ def notify_verified_referral(db: Session, referred_user: User) -> dict:
 
     duplicate_network = False
     fingerprint = getattr(referred_user, "miniapp_ip_hash", None)
+    matches_referrer_network = bool(
+        fingerprint and fingerprint == getattr(referrer, "miniapp_ip_hash", None)
+    )
     if fingerprint:
-        duplicate_network = bool(db.query(User.id).filter(
+        duplicate_network = matches_referrer_network or bool(db.query(User.id).filter(
             User.referred_by == int(referrer.telegram_id),
             User.telegram_id != int(referred_user.telegram_id),
             User.miniapp_verified_at.isnot(None),
@@ -153,6 +172,8 @@ def notify_verified_referral(db: Session, referred_user: User) -> dict:
         reason = (
             "the trusted client network could not be determined by the server"
             if network_unavailable
+            else "its observed network matches your own verified Store account"
+            if matches_referrer_network
             else "its observed network matches another referral on your link"
         )
         lines = [
@@ -177,7 +198,7 @@ def notify_verified_referral(db: Session, referred_user: User) -> dict:
         admin_reason = (
             "The app could not determine a trusted client network. Configure API_TRUSTED_PROXY_CIDRS before counting new referrals."
             if network_unavailable
-            else "The referral was verified but excluded from freebie progress because a previous referral for this referrer has the same keyed network fingerprint. No raw IP address was stored."
+            else "The referral was verified but excluded from freebie progress because its keyed network fingerprint matches the inviter or another referral. No raw IP address was stored."
         )
         enqueue_admin(
             db,
@@ -196,8 +217,9 @@ def notify_verified_referral(db: Session, referred_user: User) -> dict:
         )
     else:
         lines = [
-            "✅ <b>Referral verified</b>",
-            f"Your freebie progress is now <b>{count}</b> verified referral(s).",
+            "✅ <b>Referral completed</b>",
+            "Your friend joined with your invite and finished Store verification.",
+            f"Your eligible progress is now <b>{count}</b> completed referral(s).",
         ]
         if unlocked and referrer_verified:
             lines.append("🎁 <b>Unlocked:</b> " + ", ".join(escape(name) for name in unlocked[:8]))
@@ -218,7 +240,7 @@ def notify_verified_referral(db: Session, referred_user: User) -> dict:
     from services.notification_outbox import enqueue
     enqueue(
         db,
-        f"referral-verification:{int(referred_user.telegram_id)}",
+        f"referral-{'network-review' if duplicate_network or network_unavailable else 'completed'}:{int(referred_user.telegram_id)}",
         int(referrer.telegram_id),
         body,
     )

@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import desc
+from sqlalchemy import desc, func
 
 import config
 from config import BOT_TOKEN, MAIN_BOT_USERNAME
@@ -77,6 +77,7 @@ def current_user(
         user = db.query(User).filter(User.telegram_id == auth["id"]).with_for_update().first()
         if not user or user.is_banned:
             raise HTTPException(status_code=403, detail={"error": "account_unavailable", "message": "Send /start to the RainDeals bot to activate your account."})
+        newly_verified = user.miniapp_verified_at is None
         # Telegram signed initData proves the account identity. Record it only
         # once, along with a keyed network fingerprint for referral abuse
         # checks. No raw IP or forwarded header is persisted.
@@ -107,10 +108,31 @@ def current_user(
                         if verified_user.referred_by or int(verified_user.total_referrals or 0) > 0:
                             notify_claimant_verification(notification_db, verified_user)
                         notify_verified_referral(notification_db, verified_user)
+                        if verified_user.miniapp_ip_hash:
+                            # If an inviter verifies after their invitees, run
+                            # the same-network check again now that both sides
+                            # have a server-observed fingerprint. This can
+                            # withdraw an earlier provisional count and queue
+                            # the proper user/admin review update.
+                            matching_referrals = notification_db.query(User).filter(
+                                User.referred_by == int(verified_user.telegram_id),
+                                User.telegram_id != int(verified_user.telegram_id),
+                                User.miniapp_verified_at.isnot(None),
+                                User.is_banned.is_(False),
+                                User.miniapp_referral_review_approved_at.is_(None),
+                                User.miniapp_ip_hash == verified_user.miniapp_ip_hash,
+                            ).all()
+                            for matching_referral in matching_referrals:
+                                notify_verified_referral(notification_db, matching_referral)
                         notification_db.commit()
             except Exception:
                 logger.exception("Could not record Mini App referral verification for user_id=%s", auth["id"])
-        return {"id": int(user.telegram_id), "telegram_user": auth["telegram_user"]}
+        return {
+            "id": int(user.telegram_id),
+            "telegram_user": auth["telegram_user"],
+            "newly_verified": newly_verified,
+            "referred": bool(user.referred_by),
+        }
 
 
 def _money(value) -> str:
@@ -366,12 +388,19 @@ def bootstrap(request: Request, auth=Depends(current_user)):
             "profile": {"telegram_id": int(user.telegram_id), "name": user.full_name or "RainDeals customer",
                         "username": user.username, "balance": _money(user.balance),
                         "spent": _money(user.total_spent), "deposited": _money(user.total_deposited),
-                        "orders": int(user.total_orders or 0), "referrals": int(user.total_referrals or 0),
+                        "orders": int(user.total_orders or 0),
+                        "referrals": int(db.query(func.count(User.id)).filter(
+                            User.referred_by == int(user.telegram_id)
+                        ).scalar() or 0),
                         "verified_referrals": verified_referral_count(db, auth["id"]),
                         "referral_earnings": _money(user.referral_earnings), "referral_link": referral_link},
             "unread_notifications": int(notification_inbox.count(auth["id"])),
             "main_bot_username": username,
             "deposit_methods": _deposit_method_rows(),
+            "verification": {
+                "just_completed": bool(auth.get("newly_verified")),
+                "referred": bool(auth.get("referred")),
+            },
         }
 
 

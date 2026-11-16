@@ -588,7 +588,7 @@
         <div class="profile-stats"><div><small>Balance</small><strong>${money(p.balance)} USDT</strong></div><div><small>Orders</small><strong>${Number(p.orders || 0)}</strong></div><div><small>Total spent</small><strong>${money(p.spent)} USDT</strong></div><div><small>Deposited</small><strong>${money(p.deposited)} USDT</strong></div></div>
         <div class="row-line"><div><strong>Telegram ID</strong><small>RainDeals account</small></div><span class="amount">${esc(p.telegram_id)}</span></div>
       </div>
-      <div class="panel-card referral-card"><h2 class="panel-heading">🤝 Invite friends</h2><p>For freebie unlocks, a friend counts after starting from your link and opening the RainDeals Mini Store.</p><div class="referral-link"><code>${esc(p.referral_link || "Referral link unavailable")}</code><button class="text-button" data-action="copy-referral" ${p.referral_link ? "" : "disabled"}>Copy</button></div><div class="referral-stats"><span><strong>${Number(p.referrals || 0)}</strong><small>Started</small></span><span><strong>${Number(p.verified_referrals || 0)}</strong><small>Mini Store verified</small></span><span><strong>${money(p.referral_earnings)} USDT</strong><small>Earned</small></span></div><button class="primary-button wide-button" style="margin-top:12px" data-action="share-referral" ${p.referral_link ? "" : "disabled"}>Share invite link</button></div>
+      <div class="panel-card referral-card"><h2 class="panel-heading">🤝 Invite friends</h2><p>Invitees count as completed after opening the RainDeals Store and passing verification. Shared-network matches may need admin review.</p><div class="referral-link"><code>${esc(p.referral_link || "Referral link unavailable")}</code><button class="text-button" data-action="copy-referral" ${p.referral_link ? "" : "disabled"}>Copy</button></div><div class="referral-stats"><span><strong>${Number(p.referrals || 0)}</strong><small>Invited</small></span><span><strong>${Number(p.verified_referrals || 0)}</strong><small>Completed</small></span><span><strong>${money(p.referral_earnings)} USDT</strong><small>Earned</small></span></div><button class="primary-button wide-button" style="margin-top:12px" data-action="share-referral" ${p.referral_link ? "" : "disabled"}>Share invite link</button></div>
       <button class="order-card" data-view="notifications"><div class="order-top"><strong>🔔 Notifications</strong><span>${Number(state.unread || 0)} unread ›</span></div><p>Recent payment, order, support, and account updates.</p></button>
       <button class="order-card" data-action="notification-preferences"><div class="order-top"><strong>⚙️ Notification preferences</strong><span>›</span></div><p>Choose which bot updates you receive.</p></button>
       <button class="secondary-button wide-button" data-action="open-bot">Support &amp; account help in Telegram</button>`;
@@ -676,6 +676,7 @@
     if (target.dataset.add) { event.stopPropagation(); addProduct(target.dataset.add); return; }
     if (target.dataset.action === "add-product") { addProduct(target.dataset.id); return; }
     if (target.dataset.action === "open-bot") { openBot(); return; }
+    if (target.id === "return-to-bot") { if (tg?.close) tg.close(); else openBot(); return; }
     if (target.dataset.action === "keep-shopping") { closeModal(); setView("store"); return; }
     if (target.dataset.action === "review-checkout") { renderCart(true); return; }
     if (target.dataset.action === "cart-review-cancel") { renderCart(false); return; }
@@ -761,8 +762,14 @@
       state.profile = data.profile; state.unread = data.unread_notifications || 0;
       state.botUsername = data.main_bot_username || "";
       state.depositMethods = data.deposit_methods || [];
-      syncHeader();
       $("#loading").classList.add("hidden");
+      if (data.verification?.just_completed) {
+        document.body.classList.add("verification-only");
+        $("#verification-success").classList.remove("hidden");
+        tg?.BackButton?.hide();
+        return;
+      }
+      syncHeader();
       $("#main").classList.remove("hidden"); $("#bottom-nav").classList.remove("hidden");
       renderProfile();
       loadProducts(false).catch(error => {

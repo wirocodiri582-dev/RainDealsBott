@@ -816,6 +816,7 @@ def _get_or_create_user(
     full_name: str,
     ref_payload: str,
     load_home_menu: bool = True,
+    require_valid_referral: bool = False,
 ) -> dict:
     with transaction() as db:
         user = db.query(User).filter(User.telegram_id == telegram_id).first()
@@ -826,6 +827,7 @@ def _get_or_create_user(
             is_new = True
             referred_by = None
 
+            referrer = None
             if ref_payload:
                 referral_code = ref_payload.removeprefix("ref_")
                 referrer = (
@@ -834,10 +836,17 @@ def _get_or_create_user(
                     .with_for_update()
                     .first()
                 )
-                if referrer is not None and referrer.telegram_id != telegram_id:
-                    referred_by = referrer.telegram_id
-                    referrer.total_referrals = (referrer.total_referrals or 0) + 1
-                    referral_bonus = True
+            # Before the membership gate, only persist a genuine referral
+            # start. This avoids creating empty/unattributed accounts for
+            # arbitrary start parameters.
+            if require_valid_referral and (
+                referrer is None or int(referrer.telegram_id) == int(telegram_id)
+            ):
+                return None
+            if referrer is not None and referrer.telegram_id != telegram_id:
+                referred_by = referrer.telegram_id
+                referrer.total_referrals = (referrer.total_referrals or 0) + 1
+                referral_bonus = True
 
             user = User(
                 telegram_id=telegram_id,
@@ -998,6 +1007,44 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         if ticket_id_text.isdigit():
             support_reply_ticket_id = int(ticket_id_text)
 
+    username = message.from_user.username
+    full_name = message.from_user.full_name
+    is_admin = telegram_id in ADMIN_IDS
+    ref_payload = (
+        ""
+        if deep_link_product_id is not None
+        or vendor_request_id is not None
+        or support_reply_ticket_id is not None
+        else start_payload
+    )
+
+    # A new referred user may have to join required chats before /start can
+    # finish. Save the valid inviter relationship now, or the membership
+    # retry (which no longer carries Telegram's start payload) loses it.
+    if ref_payload and not is_admin:
+        try:
+            await asyncio.to_thread(
+                _get_or_create_user,
+                telegram_id,
+                username,
+                full_name,
+                ref_payload,
+                False,
+                True,
+            )
+        except Exception:
+            logger.exception("Failed to persist referral start for user %s", telegram_id)
+            await update_card(
+                message,
+                "❌ <b>Could not save your invite</b>\n\nPlease send /start again so we can record the referral correctly.",
+                parse_mode="HTML",
+                delete_input=False,
+                chat_id=loading_location[0] if loading_location else message.chat.id,
+                message_id=loading_location[1] if loading_location else None,
+                owner_id=telegram_id,
+            )
+            return
+
     # ═══════════════════════════════════════════════════════
     # CHANNEL MEMBERSHIP CHECK (skip for admins)
     # ═══════════════════════════════════════════════════════
@@ -1023,11 +1070,6 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
                 owner_id=telegram_id,
             )
             return
-
-    username = message.from_user.username
-    full_name = message.from_user.full_name
-    ref_payload = "" if deep_link_product_id is not None or vendor_request_id is not None else start_payload
-    is_admin = telegram_id in ADMIN_IDS
 
     try:
         db_started_at = time.perf_counter()

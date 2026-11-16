@@ -205,6 +205,11 @@ h1, h2, h3, p { margin-top: 0; }
 .auth-icon { width: 74px; height: 74px; display: grid; place-items: center; margin-bottom: 14px; border-radius: 26px; background: #e8f1ff; font-size: 36px; }
 .auth-error h1 { margin-bottom: 8px; font-size: 23px; }
 .auth-error p { max-width: 320px; margin-bottom: 18px; color: var(--muted); font-size: 13px; line-height: 1.55; }
+.verification-success { min-height: 100dvh; padding: 30px 24px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; background: radial-gradient(circle at 50% 34%, #e6f5ed 0, #f3f6fc 52%); }
+.verification-success .verification-mark { width: 76px; height: 76px; display: grid; place-items: center; margin-bottom: 22px; border-radius: 26px; background: #e1f5e9; color: #17864d; font-size: 42px; font-weight: 800; box-shadow: 0 12px 30px rgba(23,134,77,.12); }
+.verification-success h1 { max-width: 340px; margin: 2px 0 10px; font-size: 27px; letter-spacing: -.04em; }
+.verification-success > p:not(.eyebrow) { max-width: 340px; margin-bottom: 22px; color: var(--muted); font-size: 14px; line-height: 1.6; }
+body.verification-only .topbar { display: none; }
 .hidden { display: none !important; }
 
 @media (min-width: 650px) {

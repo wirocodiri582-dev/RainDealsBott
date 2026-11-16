@@ -6,9 +6,9 @@
   <meta name="theme-color" content="#f3f6fc">
   <meta name="description" content="Browse the RainDeals digital store in Telegram.">
   <title>RainDeals Store</title>
-  <link rel="stylesheet" href="/miniapp/assets/styles.css?v=20261116-3">
+  <link rel="stylesheet" href="/miniapp/assets/styles.css?v=20261116-4">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script defer src="/miniapp/assets/app.js?v=20261116-3"></script>
+  <script defer src="/miniapp/assets/app.js?v=20261116-4"></script>
 </head>
 <body>
   <div class="app-shell">
@@ -30,6 +30,13 @@
       <p>This store uses your Telegram account securely. Open the Mini App from the RainDeals bot to continue.</p>
       <button class="primary-button" id="open-bot">Open Telegram bot</button>
     </div>
+    <section id="verification-success" class="verification-success hidden" aria-live="polite">
+      <div class="verification-mark">✓</div>
+      <p class="eyebrow">RAINDEALS ACCOUNT CHECK</p>
+      <h1>Store verification complete</h1>
+      <p>Your Telegram account is verified. Return to the RainDeals bot to continue. The shop is not opened during this check.</p>
+      <button class="primary-button wide-button" id="return-to-bot">↩ Return to RainDeals bot</button>
+    </section>
 
     <main id="main" class="main-content hidden">
       <section id="store-view" class="view active">
