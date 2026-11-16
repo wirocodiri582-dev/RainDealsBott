@@ -747,14 +747,19 @@ async def order_requirement_input(message: Message, state: FSMContext):
     else:
         await answer_card(message, f"✅ Information saved for Order #{order_id}. The team will complete delivery."
                           + (f"\n\nDelivered now:\n<code>{_esc(result['delivery'])}</code>" if result.get("delivery") else ""), parse_mode="HTML")
-        channel = getattr(config, "ADMIN_ORDER_NOTIFICATION_CHANNEL_ID", "")
-        if channel:
-            try:
-                await queue_message(message.bot, f"order-information:{order_id}", channel,
-                    f"🧾 <b>Buyer information received</b>\nOrder: <code>#{order_id}</code>\n"
-                    f"Buyer: <code>{message.from_user.id}</code>\nOpen Admin → Orders to review.", parse_mode="HTML")
-            except Exception:
-                logger.exception("Failed to notify admins of order information submission")
+        try:
+            from services.notification_outbox import enqueue_admin_once
+            await asyncio.to_thread(
+                enqueue_admin_once,
+                f"order-information:{order_id}",
+                "🧾 <b>Buyer information received</b>\n"
+                f"📦 Order: <code>#{order_id}</code>\n"
+                f"👤 Buyer: <code>{message.from_user.id}</code>\n"
+                "Open Admin → Orders to review the submitted details.",
+                message.bot.id,
+            )
+        except Exception:
+            logger.exception("Failed to notify admins of order information submission")
 
 @router.callback_query(F.data.startswith("order_detail_"))
 async def order_detail(callback: CallbackQuery):

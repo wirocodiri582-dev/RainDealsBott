@@ -16,7 +16,8 @@ def main_bot_id():
 
 def admin_destination():
     import config
-    return str(getattr(config, 'ADMIN_ORDER_NOTIFICATION_CHANNEL_ID', '') or
+    return str(getattr(config, 'ADMIN_NOTIFY_CHANNEL_ID', '') or
+               getattr(config, 'ADMIN_ORDER_NOTIFICATION_CHANNEL_ID', '') or
                getattr(config, 'NOTIFICATION_CHANNEL_ID', '')).strip()
 
 
@@ -27,6 +28,16 @@ def enqueue_admin(db, event, body, **kwargs):
         logger.warning('Admin notification destination is not configured')
         return
     enqueue(db, f'admin:{event}', destination, body, **kwargs)
+
+
+def enqueue_admin_once(event, body, bot_id=None):
+    """Durably enqueue one idempotent operational alert to Admin Notify."""
+    destination = admin_destination()
+    if not destination:
+        logger.warning('Admin notification destination is not configured; event=%s', event)
+        return False
+    enqueue_once(f'admin:{event}', destination, body, bot_id=bot_id)
+    return True
 
 
 def legacy_admin_alert(row):

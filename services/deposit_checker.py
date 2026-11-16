@@ -2337,20 +2337,21 @@ async def _notify_attempt_limit(bot, result_info: dict) -> None:
     except Exception:
         logger.exception("Failed to notify user %s about cancelled deposit", telegram_id)
 
-    notification_channel = getattr(config, "NOTIFICATION_CHANNEL_ID", "")
-    if notification_channel:
-        try:
-            await queue_message(bot, f"deposit-attempt-limit:{result_info.get('deposit_id')}",
-                notification_channel,
-                "⚠️ <b>Deposit Verification Cancelled</b>\n\n"
-                f"🆔 Deposit: <code>#{result_info.get('deposit_id')}</code>\n"
-                f"👤 User: <code>{telegram_id}</code>\n"
-                f"📡 Network: <code>{result_info.get('network') or 'Unknown'}</code>\n"
-                f"🔁 Checks used: <code>{result_info.get('attempts', MAX_CHECK_ATTEMPTS)}</code>",
-                parse_mode="HTML",
-            )
-        except Exception:
-            logger.exception("Failed to post cancelled deposit alert to %s", notification_channel)
+    try:
+        from services.notification_outbox import enqueue_admin_once
+        await asyncio.to_thread(
+            enqueue_admin_once,
+            f"deposit-attempt-limit:{result_info.get('deposit_id')}",
+            "⚠️ <b>Deposit verification needs review</b>\n"
+            f"🆔 Deposit: <code>#{result_info.get('deposit_id')}</code>\n"
+            f"👤 User: <code>{telegram_id}</code>\n"
+            f"📡 Network: <code>{result_info.get('network') or 'Unknown'}</code>\n"
+            f"🔁 Automatic checks: {result_info.get('attempts', MAX_CHECK_ATTEMPTS)}\n"
+            "Open Admin → Deposits and verify the saved transaction reference.",
+            bot.id,
+        )
+    except Exception:
+        logger.exception("Failed to queue Admin Notify deposit verification alert")
 
 
 # ================================================================

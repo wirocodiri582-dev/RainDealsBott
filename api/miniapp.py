@@ -63,7 +63,7 @@ def _verify_init_data(init_data: str) -> dict:
         telegram_id = int(telegram_user.get("id", 0))
         if telegram_id <= 0:
             raise ValueError("missing user")
-        return {"id": telegram_id, "telegram_user": telegram_user}
+        return {"id": telegram_id, "telegram_user": telegram_user, "auth_date": auth_date}
     except (ValueError, TypeError, json.JSONDecodeError):
         raise _auth_error()
 
@@ -74,6 +74,11 @@ def current_user(init_data: str | None = Header(default=None, alias="X-Telegram-
         user = db.query(User).filter(User.telegram_id == auth["id"]).first()
         if not user or user.is_banned:
             raise HTTPException(status_code=403, detail={"error": "account_unavailable", "message": "Send /start to the RainDeals bot to activate your account."})
+        # _verify_init_data has already checked Telegram's signature and
+        # freshness window; store that account-level verification once.
+        if user.miniapp_verified_at is None:
+            user.miniapp_verified_at = datetime.utcnow()
+            db.commit()
         return {"id": int(user.telegram_id), "telegram_user": auth["telegram_user"]}
 
 
@@ -116,6 +121,17 @@ def _product_rows(user_id: int, freebies: bool = False, *, product_id: int | Non
         # separately for every product. Newly added products are still read
         # from the database on each catalog request.
         custom_prices = _get_catalog_custom_prices(user_id, [int(p.id) for p in products])
+        claimant = db.query(User).filter(User.telegram_id == int(user_id)).first()
+        claimant_verified = bool(claimant and claimant.miniapp_verified_at)
+        has_gated_freebies = any(
+            Decimal(str(p.price or 0)) == 0
+            and int(getattr(p, "freebie_referrals_required", 0) or 0) > 0
+            for p in products
+        )
+        verified_referrals = 0
+        if has_gated_freebies:
+            from services.freebie_referrals import verified_referral_count
+            verified_referrals = verified_referral_count(db, user_id)
         output = []
         for product in products:
             try:
@@ -137,6 +153,14 @@ def _product_rows(user_id: int, freebies: bool = False, *, product_id: int | Non
                 bulk = _get_bulk_price(product.bulk_pricing, 1) if custom_price is None and product.bulk_pricing else None
                 if bulk is not None:
                     price = shop_money(bulk)
+                referral_requirement = (
+                    max(0, int(getattr(product, "freebie_referrals_required", 0) or 0))
+                    if Decimal(str(product.price or 0)) == 0 else 0
+                )
+                freebie_unlocked = (
+                    referral_requirement == 0
+                    or (claimant_verified and verified_referrals >= referral_requirement)
+                )
                 output.append({
                     "id": int(product.id), "name": str(product.name or "Product")[:255],
                     "icon": str(product.icon or "📦")[:50],
@@ -147,10 +171,14 @@ def _product_rows(user_id: int, freebies: bool = False, *, product_id: int | Non
                     "category": (str(product.category or "General").strip() or "General")[:100],
                     "price": _money(price), "currency": "USDT", "stock": available,
                     "sellable_stock": sellable, "in_stock": available > 0,
-                    "purchasable": sellable > 0,
+                    "purchasable": sellable > 0 and freebie_unlocked,
                     "preorder": is_preorder,
                     "delivery_type": str(product.delivery_type or "manual"),
                     "required_info": _requirements(product),
+                    "freebie_referrals_required": referral_requirement,
+                    "verified_referrals": verified_referrals if referral_requirement else 0,
+                    "claimant_miniapp_verified": claimant_verified if referral_requirement else True,
+                    "freebie_unlocked": freebie_unlocked,
                 })
             except Exception:
                 logger.exception("Mini App product omitted due to invalid catalog configuration product_id=%s", product.id)
@@ -302,11 +330,13 @@ def bootstrap(request: Request, auth=Depends(current_user)):
         username = getattr(request.app.state, "main_bot_username", MAIN_BOT_USERNAME)
         referral_code = str(user.referral_code or "").strip()
         referral_link = f"https://t.me/{username}?start=ref_{referral_code}" if username and referral_code else ""
+        from services.freebie_referrals import verified_referral_count
         return {
             "profile": {"telegram_id": int(user.telegram_id), "name": user.full_name or "RainDeals customer",
                         "username": user.username, "balance": _money(user.balance),
                         "spent": _money(user.total_spent), "deposited": _money(user.total_deposited),
                         "orders": int(user.total_orders or 0), "referrals": int(user.total_referrals or 0),
+                        "verified_referrals": verified_referral_count(db, auth["id"]),
                         "referral_earnings": _money(user.referral_earnings), "referral_link": referral_link},
             "unread_notifications": int(notification_inbox.count(auth["id"])),
             "main_bot_username": username,

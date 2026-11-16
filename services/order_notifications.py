@@ -11,7 +11,7 @@ import config
 from sqlalchemy import text
 
 from database import SessionLocal, engine, transaction
-from services.notification_outbox import enqueue
+from services.notification_outbox import admin_destination, enqueue
 from models.order import Order
 
 
@@ -126,7 +126,7 @@ def _format_order(order: dict) -> str:
 
 async def order_notification_loop(bot) -> None:
     """Read unsent orders from the database and notify the dedicated group."""
-    channel_id = getattr(config, "ADMIN_ORDER_NOTIFICATION_CHANNEL_ID", "").strip()
+    channel_id = admin_destination()
     if not channel_id:
         logger.warning("Admin order notifications are disabled: no group ID configured")
         return

@@ -72,6 +72,11 @@ class Product(Base):
     # Buyer information requested after checkout, e.g. email, phone, photo.
     # List entries: {"type": "email|phone|photo|contact|text", "label": "..."}.
     required_info: Mapped[Optional[list]] = mapped_column(JSON, nullable=True, default=None)
+    # Number of distinct referred Telegram accounts that must open the signed
+    # RainDeals Mini App before a zero-price product can be claimed.
+    freebie_referrals_required: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     warranty_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default='0')
     # NULL preserves the earlier warranty_days policy; new setup explicitly chooses.
     aftercare_policy: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
@@ -231,6 +236,7 @@ class Product(Base):
             "icon": self.icon,
             "description": self.description,
             "category": self.category,
+            "freebie_referrals_required": self.freebie_referrals_required,
             "delivery_instruction": self.delivery_instruction,
             "aftercare_policy": self.aftercare_policy,
             "warranty_days": self.warranty_days,

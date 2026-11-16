@@ -212,7 +212,7 @@
           <span class="product-icon">${esc(product.icon || "📦")}</span>
         </div>
         <div class="product-info">
-          <div class="product-category">${esc(product.category)}</div>
+          <div class="product-category">${product.freebie_referrals_required ? `🔒 ${Number(product.verified_referrals || 0)}/${Number(product.freebie_referrals_required)} verified` : esc(product.category)}</div>
           <h3 class="product-name">${esc(product.name)}</h3>
           <div class="product-foot"><div class="product-price">${money(product.price)} <small>USDT</small></div><button class="add-button" data-add="${product.id}" aria-label="Add ${esc(product.name)} to cart" ${!product.purchasable ? "disabled" : ""}>+</button></div>
         </div>
@@ -244,6 +244,13 @@
 
   function productSheet(product) {
     const unsupported = productInputWarning(product);
+    const gatedFreebie = Number(product.freebie_referrals_required || 0) > 0;
+    const gateLocked = gatedFreebie && !product.freebie_unlocked;
+    const gateCopy = gateLocked
+      ? (!product.claimant_miniapp_verified
+        ? "Reopen the RainDeals Mini Store to verify this Telegram session."
+        : `Verified referrals: ${Number(product.verified_referrals || 0)}/${Number(product.freebie_referrals_required)}. Each friend must start from your referral link and open the Mini Store.`)
+      : `Unlocked with ${Number(product.freebie_referrals_required || 0)} verified Mini Store referral(s).`;
     openModal(`
       <div class="modal-art">${esc(product.icon || "📦")}</div>
       <p class="eyebrow" style="margin-top:15px">${esc(product.category)} · ${product.preorder ? "PREORDER" : product.in_stock ? "IN STOCK" : "SOLD OUT"}</p>
@@ -251,9 +258,10 @@
       <p class="modal-description">${esc(product.description || "Digital product, delivered securely through RainDeals.")}</p>
       ${product.description_truncated ? `<button class="text-button" data-action="full-product-details" data-product-id="${Number(product.id)}">Read full description</button>` : ""}
       <div class="modal-price">${money(product.price)} <small>USDT</small></div>
+      ${gatedFreebie ? `<div class="soft-note" style="margin:12px 0">🔐 ${esc(gateCopy)}</div>` : ""}
       ${(product.required_info || []).map(field => `<div class="soft-note">Before checkout: ${esc(field.label)} (${esc(field.type)})</div>`).join("")}
       ${product.preorder ? `<div class="soft-note" style="margin:12px 0">This item is currently out of stock. Your order will be queued for manual fulfillment when accepted.</div>` : ""}
-      ${unsupported ? `<div class="soft-note" style="margin:12px 0">This item needs a photo or Telegram contact. Open the bot to complete that secure form.</div><button class="primary-button wide-button" data-action="open-bot">Continue in Telegram</button>` : `<button class="primary-button wide-button" data-action="add-product" data-id="${product.id}" ${!product.purchasable ? "disabled" : ""}>${product.preorder ? "Add preorder to cart" : "Add to cart"}</button>`}
+      ${gateLocked ? `<button class="primary-button wide-button" data-action="share-referral" ${state.profile?.referral_link ? "" : "disabled"}>🤝 Invite friends to unlock</button>` : unsupported ? `<div class="soft-note" style="margin:12px 0">This item needs a photo or Telegram contact. Open the bot to complete that secure form.</div><button class="primary-button wide-button" data-action="open-bot">Continue in Telegram</button>` : `<button class="primary-button wide-button" data-action="add-product" data-id="${product.id}" ${!product.purchasable ? "disabled" : ""}>${product.preorder ? "Add preorder to cart" : "Add to cart"}</button>`}
       <button class="secondary-button wide-button" style="margin-top:8px" data-close-modal>Keep browsing</button>
     `, "product");
   }
@@ -580,7 +588,7 @@
         <div class="profile-stats"><div><small>Balance</small><strong>${money(p.balance)} USDT</strong></div><div><small>Orders</small><strong>${Number(p.orders || 0)}</strong></div><div><small>Total spent</small><strong>${money(p.spent)} USDT</strong></div><div><small>Deposited</small><strong>${money(p.deposited)} USDT</strong></div></div>
         <div class="row-line"><div><strong>Telegram ID</strong><small>RainDeals account</small></div><span class="amount">${esc(p.telegram_id)}</span></div>
       </div>
-      <div class="panel-card referral-card"><h2 class="panel-heading">🤝 Invite friends</h2><p>Share your personal RainDeals referral link.</p><div class="referral-link"><code>${esc(p.referral_link || "Referral link unavailable")}</code><button class="text-button" data-action="copy-referral" ${p.referral_link ? "" : "disabled"}>Copy</button></div><div class="referral-stats"><span><strong>${Number(p.referrals || 0)}</strong><small>Friends</small></span><span><strong>${money(p.referral_earnings)} USDT</strong><small>Earned</small></span></div><button class="primary-button wide-button" style="margin-top:12px" data-action="share-referral" ${p.referral_link ? "" : "disabled"}>Share invite link</button></div>
+      <div class="panel-card referral-card"><h2 class="panel-heading">🤝 Invite friends</h2><p>For freebie unlocks, a friend counts after starting from your link and opening the RainDeals Mini Store.</p><div class="referral-link"><code>${esc(p.referral_link || "Referral link unavailable")}</code><button class="text-button" data-action="copy-referral" ${p.referral_link ? "" : "disabled"}>Copy</button></div><div class="referral-stats"><span><strong>${Number(p.referrals || 0)}</strong><small>Started</small></span><span><strong>${Number(p.verified_referrals || 0)}</strong><small>Mini Store verified</small></span><span><strong>${money(p.referral_earnings)} USDT</strong><small>Earned</small></span></div><button class="primary-button wide-button" style="margin-top:12px" data-action="share-referral" ${p.referral_link ? "" : "disabled"}>Share invite link</button></div>
       <button class="order-card" data-view="notifications"><div class="order-top"><strong>🔔 Notifications</strong><span>${Number(state.unread || 0)} unread ›</span></div><p>Recent payment, order, support, and account updates.</p></button>
       <button class="order-card" data-action="notification-preferences"><div class="order-top"><strong>⚙️ Notification preferences</strong><span>›</span></div><p>Choose which bot updates you receive.</p></button>
       <button class="secondary-button wide-button" data-action="open-bot">Support &amp; account help in Telegram</button>`;

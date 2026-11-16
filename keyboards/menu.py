@@ -91,7 +91,6 @@ def get_profile_menu(unread_count: int = 0) -> InlineKeyboardMarkup:
         notice_label += f" · {min(int(unread_count), 99)}"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Deposit Balance", callback_data="deposit_start", style="success")],
-        [InlineKeyboardButton(text="📨 Live OTP / Mail Reader", callback_data="profile_mail_reader", style="primary")],
         [
             InlineKeyboardButton(text="✅ My Orders", callback_data="orders_menu", style="primary"),
             InlineKeyboardButton(text="🆘 Support", callback_data="support_ticket", style="primary"),

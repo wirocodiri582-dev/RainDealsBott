@@ -67,6 +67,12 @@ def change(user_id, product_id, quantity):
         is_free = Decimal(str(product.price)) == 0
         if is_free:
             quantity = 1
+            from services.freebie_referrals import freebie_eligibility
+            gate = freebie_eligibility(db, user_id, product)
+            if not gate["unlocked"]:
+                if not gate["claimant_verified"]:
+                    raise ValueError('Open the RainDeals Mini App once to verify your Telegram account before claiming this freebie.')
+                raise ValueError(f'This freebie unlocks after {gate["required"]} referred account(s) open the RainDeals Mini App. Verified: {gate["verified_referrals"]}/{gate["required"]}.')
         if product.source == 'reseller':
             available = _reseller_stock(product)
             if quantity > available:
@@ -123,8 +129,20 @@ def _quote(db, user_id):
                 bulk = _get_bulk_price(product.bulk_pricing, item.quantity) if custom is None and product.bulk_pricing else None
                 if bulk is not None:
                     price = _money(bulk)
+                gate = None
+                if Decimal(str(product.price)) == 0:
+                    from services.freebie_referrals import freebie_eligibility
+                    gate = freebie_eligibility(db, user_id, product)
+                    if not gate["unlocked"]:
+                        if not gate["claimant_verified"]:
+                            error = 'Open the RainDeals Mini App once to verify your Telegram account before claiming this freebie.'
+                        else:
+                            error = (f'This freebie unlocks after {gate["required"]} referred account(s) open the RainDeals Mini App. '
+                                     f'Verified: {gate["verified_referrals"]}/{gate["required"]}.')
                 try:
-                    if product.source != 'reseller':
+                    if error:
+                        pass
+                    elif product.source != 'reseller':
                         plan = plan_delivery(product, item.quantity)
                     else:
                         available = _reseller_stock(product)
@@ -144,6 +162,7 @@ def _quote(db, user_id):
             'warranty_days': getattr(product, 'warranty_days', 0),
             'subscription_days': getattr(product, 'subscription_days', 0),
             'term_days': getattr(product, 'term_days', 0),
+            'freebie_referrals_required': getattr(product, 'freebie_referrals_required', 0),
         }
         settings_fingerprint = hashlib.sha256(json.dumps(
             settings, sort_keys=True, separators=(',', ':'), ensure_ascii=False, default=str

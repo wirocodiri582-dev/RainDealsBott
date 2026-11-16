@@ -14,12 +14,13 @@ from aiogram.types import (
     CallbackQuery,
     Message,
     InlineKeyboardMarkup,
-    InlineKeyboardButton
+    InlineKeyboardButton,
+    WebAppInfo,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from sqlalchemy import JSON, String, cast, update
+from sqlalchemy import JSON, String, cast, update, func
 from sqlalchemy.exc import SQLAlchemyError
 
 import config
@@ -1439,30 +1440,37 @@ def _stock_event_text(kind: str, product, **kwargs) -> str:
     if kind == "restock":
         added = kwargs["added"]
         return (
-            f"🔥 <b>BACK IN STOCK</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n\n"
-            f"📦 <b>{_esc(product.name)}</b>\n\n"
-            f"🆔 Product ID: <code>#{product.id}</code>\n"
-            f"🟢 Added: <b>+{added}</b> units\n"
-            f"💎 Price: <b>${price:.2f}</b>\n"
-            f"📦 Total available: <b>{stock}</b>\n\n"
-            "Order now while it’s available."
+            "👑🟥🟥🟥🟥🟥\n\n"
+            "🎉 <b>FRESH STOCK ADDED!</b>\n\n"
+            f"⚡ <b>{_esc(product.name)}</b>\n\n"
+            f"📦 <b>Stock Added:</b> +{added} items\n"
+            f"✅ <b>Available Now:</b> {stock} in stock\n"
+            f"💰 <b>Price:</b> ${price:.2f} USDT"
         )
 
     if kind == "limited_stock":
+        delivery_mode = str(product.delivery_type or "manual").lower()
+        delivery_label = (
+            "Instant Automated" if delivery_mode == "automatic" else
+            "Automatic + Manual fallback" if delivery_mode == "hybrid" else
+            "Manual delivery"
+        )
         return (
-            f"⚠️ <b>LOW STOCK</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n\n"
-            f"📦 <b>{_esc(product.name)}</b>\n"
-            f"🆔 Product ID: <code>#{product.id}</code>\n"
-            f"💎 Price: <b>${price:.2f}</b>\n"
-            f"📦 Only <b>{stock}</b> left."
+            "⚠️ <b>LOW STOCK ALERT — HURRY!</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"⚡ <b>{_esc(product.name)}</b>\n\n"
+            f"🔔 <b>Remaining Stock:</b> Only <b>{stock} left</b>!\n"
+            f"💵 <b>Price:</b> ${price:.2f} USDT\n"
+            f"⚡ <b>Delivery:</b> {_esc(delivery_label)}"
         )
 
     return ""
 
 
-async def _send_stock_channel_message(bot, text: str, product_id: int | None = None, can_buy: bool = True):
+async def _send_stock_channel_message(
+    bot, text: str, product_id: int | None = None, can_buy: bool = True,
+    event_key: str | None = None,
+):
     """Queue stock posts so Telegram network latency never blocks bot actions."""
     if not text:
         return
@@ -1476,12 +1484,15 @@ async def _send_stock_channel_message(bot, text: str, product_id: int | None = N
         return
 
     task = asyncio.create_task(
-        _deliver_stock_channel_message(bot, text, destinations, product_id, can_buy)
+        _deliver_stock_channel_message(bot, text, destinations, product_id, can_buy, event_key)
     )
     task.add_done_callback(_log_stock_notification_task)
 
 
-async def _deliver_stock_channel_message(bot, text: str, destinations: list, product_id: int | None, can_buy: bool):
+async def _deliver_stock_channel_message(
+    bot, text: str, destinations: list, product_id: int | None, can_buy: bool,
+    event_key: str | None = None,
+):
     global _stock_bot_username
     if not destinations:
         return
@@ -1503,11 +1514,12 @@ async def _deliver_stock_channel_message(bot, text: str, destinations: list, pro
         except Exception:
             logger.exception("Could not create product deep link for stock notification")
 
-    from uuid import uuid4
-    event = f'stock:{product_id}:{uuid4().hex}'
+    if not event_key:
+        from uuid import uuid4
+        event_key = f'stock:{product_id}:{uuid4().hex}'
     # Destination rejection/backoff and retries are handled by the durable outbox.
     for target in destinations:
-        await asyncio.to_thread(enqueue_once, event, target, text, bot.id, markup)
+        await asyncio.to_thread(enqueue_once, event_key, target, text, bot.id, markup)
 
 
 def _log_stock_notification_task(task: asyncio.Task):
@@ -1574,6 +1586,34 @@ async def _scan_stock_changes(bot, products: list):
             product_id=product.id,
             can_buy=kwargs.get("stock", 0) > 0,
         )
+        if kind in {"new_product", "restock"}:
+            try:
+                from services.notification_outbox import enqueue_admin_once
+                updated = getattr(product, "updated_at", None)
+                event_stamp = updated.isoformat() if updated else str(kwargs.get("stock", 0))
+                if kind == "new_product":
+                    admin_event = f"product-added:{product.id}"
+                    admin_body = (
+                        "🆕 <b>New product added</b>\n"
+                        f"📦 <b>{_esc(product.name)}</b> · <code>#{product.id}</code>\n"
+                        f"🏷 Category: {_esc(product.category or 'General')}\n"
+                        f"💰 Price: ${_money(product.price):.2f} USDT\n"
+                        f"📊 Available stock: {kwargs.get('stock', 0)}\n"
+                        f"🚚 Delivery: {_esc(str(product.delivery_type or 'manual').title())}\n"
+                        f"🔌 API: {'On' if getattr(product, 'api_enabled', False) else 'Off'}"
+                    )
+                else:
+                    admin_event = f"product-stock:{product.id}:{event_stamp}"
+                    admin_body = (
+                        "📦 <b>Product stock replenished</b>\n"
+                        f"⚡ <b>{_esc(product.name)}</b> · <code>#{product.id}</code>\n"
+                        f"➕ Added: <b>{kwargs.get('added', 0)}</b>\n"
+                        f"✅ Available now: <b>{kwargs.get('stock', 0)}</b>\n"
+                        f"💰 Price: ${_money(product.price):.2f} USDT"
+                    )
+                await asyncio.to_thread(enqueue_admin_once, admin_event, admin_body, bot.id)
+            except Exception:
+                logger.exception("Could not queue Admin Notify product event product_id=%s", product.id)
         if kind == "restock":
             await _notify_restock_subscribers(bot, product, int(kwargs.get("stock", 0)))
 
@@ -1601,7 +1641,24 @@ async def notify_new_product(bot, product):
         _stock_event_text("new_product", product, stock=stock),
         product_id=product.id,
         can_buy=stock > 0,
+        event_key=f"public-new-product:{product.id}",
     )
+    try:
+        from services.notification_outbox import enqueue_admin_once
+        await asyncio.to_thread(
+            enqueue_admin_once,
+            f"product-added:{product.id}",
+            "🆕 <b>New product added</b>\n"
+            f"📦 <b>{_esc(product.name)}</b> · <code>#{product.id}</code>\n"
+            f"🏷 Category: {_esc(product.category or 'General')}\n"
+            f"💰 Price: ${_money(product.price):.2f} USDT\n"
+            f"📊 Available stock: {_real_stock(product)}\n"
+            f"🚚 Delivery: {_esc(str(product.delivery_type or 'manual').title())}\n"
+            f"🔌 API: {'On' if getattr(product, 'api_enabled', False) else 'Off'}",
+            bot.id,
+        )
+    except Exception:
+        logger.exception("Could not queue Admin Notify product-added alert product_id=%s", product.id)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -1674,8 +1731,12 @@ async def _show_freebies_categories(callback: CallbackQuery, products: list, pag
         product = entry[2]
         config = _get_category_config(product.category)
         stock_badge = _catalog_stock_badge(product, _real_stock(product))
+        referral_badge = (
+            f"🔒{int(getattr(product, 'freebie_referrals_required', 0) or 0)} refs · "
+            if int(getattr(product, 'freebie_referrals_required', 0) or 0) > 0 else ""
+        )
         rows.append([InlineKeyboardButton(
-            text=f"🎁 {product.icon or config['icon']} {product.name} — FREE | {stock_badge}"[:64],
+            text=f"🎁 {referral_badge}{product.icon or config['icon']} {product.name} · {stock_badge}"[:64],
             callback_data=f"product_{product.id}",
             style=config["style"],
         )])
@@ -1830,8 +1891,12 @@ async def _show_freebies_catalog(
     for product in page_products:
         config = _get_category_config(product.category)
         stock_badge = _catalog_stock_badge(product, _real_stock(product))
+        referral_badge = (
+            f"🔒{int(getattr(product, 'freebie_referrals_required', 0) or 0)} refs · "
+            if int(getattr(product, 'freebie_referrals_required', 0) or 0) > 0 else ""
+        )
         keyboard.append([InlineKeyboardButton(
-            text=f"🎁 {product.icon or config['icon']} {product.name} — FREE | {stock_badge}"[:64],
+            text=f"🎁 {referral_badge}{product.icon or config['icon']} {product.name} · {stock_badge}"[:64],
             callback_data=f"product_{product.id}",
             style=config["style"],
         )])
@@ -2603,6 +2668,10 @@ async def product_info(
 
     display_price = custom_price if custom_price is not None else _money(product.price)
     is_free = display_price == 0
+    freebie_gate = None
+    if Decimal(str(product.price or 0)) == 0 and int(getattr(product, "freebie_referrals_required", 0) or 0) > 0:
+        from services.freebie_referrals import freebie_eligibility_snapshot
+        freebie_gate = await asyncio.to_thread(freebie_eligibility_snapshot, user_id, product_id)
     has_instruction = bool(product.delivery_instruction)
 
     text = (
@@ -2622,6 +2691,18 @@ async def product_info(
     else:
         label = "Custom Price" if custom_price is not None else "Base Price"
         text += f"  💰 <b>{label}:</b> <code>${display_price:.2f}</code> each\n"
+
+    if freebie_gate:
+        needed = max(0, freebie_gate["required"] - freebie_gate["verified_referrals"])
+        text += "\n🔐 <b>Freebie unlock</b>\n"
+        if not freebie_gate["claimant_verified"]:
+            text += "Open the RainDeals Mini Store once to verify your Telegram account.\n"
+        text += (
+            f"Verified referrals: <b>{freebie_gate['verified_referrals']}/{freebie_gate['required']}</b>.\n"
+            "A referral counts after that person starts through your referral link and opens the Mini Store.\n"
+        )
+        if needed:
+            text += f"Invite <b>{needed}</b> more verified friend(s) to unlock this freebie.\n"
 
     text += (
         f"  📦 <b>Stock:</b> {_stock_indicator(stock_count)}\n"
@@ -2680,6 +2761,18 @@ async def product_info(
         buttons.append([InlineKeyboardButton(
             text="🛍 Browse Products", callback_data=catalog_home_callback, style="primary"
         )])
+    elif freebie_gate and not freebie_gate["unlocked"]:
+        if not freebie_gate["claimant_verified"] and config.MINI_APP_URL:
+            buttons.append([InlineKeyboardButton(
+                text="🛍 Verify in RainDeals Mini Store",
+                web_app=WebAppInfo(url=config.MINI_APP_URL), style="success",
+            )])
+        elif not freebie_gate["claimant_verified"]:
+            buttons.append([InlineKeyboardButton(text="🏠 Open the shop from Main Menu", callback_data="main_menu", style="primary")])
+        buttons.append([
+            InlineKeyboardButton(text="👥 Refer & Earn", callback_data="referrals_menu", style="primary"),
+            InlineKeyboardButton(text="🔄 Check unlock", callback_data=f"product_{product_id}", style="success"),
+        ])
     elif max_qty <= 0:
         text += f"\n❌ <b>Currently Unavailable</b>"
         buttons.append([
@@ -3071,6 +3164,18 @@ def _do_purchase(
 
         if float(product.price) == 0:
             quantity = 1
+            required_referrals = max(0, int(getattr(product, "freebie_referrals_required", 0) or 0))
+            if required_referrals:
+                from services.freebie_referrals import freebie_eligibility
+                gate = freebie_eligibility(db, telegram_id, product)
+                if not gate["unlocked"]:
+                    if not gate["claimant_verified"]:
+                        return {"error": "Open the RainDeals Mini Store once to verify your Telegram account before claiming this freebie."}
+                    return {"error": (
+                        f"This freebie requires {gate['required']} verified referrals. "
+                        f"Your progress is {gate['verified_referrals']}/{gate['required']}. "
+                        "Each referred friend must open the RainDeals Mini Store."
+                    )}
             already_claimed = (
                                       db.query(Order)
                                       .filter(
@@ -3713,31 +3818,83 @@ async def _do_reseller_purchase_unlocked(
 
 
 async def _notify_admins_low_stock(bot, alert: dict, order_id: int):
-    from services.notification_outbox import admin_destination
-    for admin_id in filter(None, [admin_destination()]):
-        try:
-            await asyncio.to_thread(enqueue_once, f"low-stock:{order_id}", admin_id,
-                                   f"⚠️ <b>LOW STOCK ALERT</b>\n\n{_divider('─', 24)}\n\n"
-                                   f"📦 <b>Product:</b> {alert['product_name']}\n🆔 <b>ID:</b> #{alert['product_id']}\n"
-                                   f"📊 <b>Remaining:</b> {alert['stock']}\n🔔 <b>Threshold:</b> {alert['threshold']}\n\n"
-                                   f"⚡ <i>Stock has dropped below the alert threshold.</i>", bot.id)
-        except Exception:
-            logger.exception("Failed to notify admin %s of low stock", admin_id)
+    try:
+        from services.notification_outbox import enqueue_admin_once
+        await asyncio.to_thread(
+            enqueue_admin_once,
+            f"low-stock:{order_id}",
+            f"⚠️ <b>LOW STOCK ALERT</b>\n\n{_divider('─', 24)}\n\n"
+            f"📦 <b>Product:</b> {_esc(alert['product_name'])}\n"
+            f"🆔 <b>ID:</b> #{alert['product_id']}\n"
+            f"📊 <b>Remaining:</b> {alert['stock']}\n"
+            f"🔔 <b>Threshold:</b> {alert['threshold']}\n\n"
+            "⚡ <i>Stock has reached the configured alert threshold.</i>",
+            bot.id,
+        )
+    except Exception:
+        logger.exception("Failed to queue Admin Notify low-stock alert order_id=%s", order_id)
 
 
 async def _notify_stock_purchase(bot, buyer_id: int, result: dict):
-    """Announce a completed purchase without exposing buyer/order details."""
-    stock = result.get("stock")
-    has_stock = stock == "In Stock" or (isinstance(stock, (int, float)) and stock > 0)
+    """Post a product link only on its first sale and sell-through milestones."""
+    product_id = int(result.get("product_id") or 0)
+    quantity = max(1, int(result.get("quantity") or 1))
+    if not product_id:
+        return
+    milestone = await asyncio.to_thread(_product_link_milestone, product_id, quantity)
+    if not milestone:
+        return
+    label, sold, stock, percent = milestone
     await _send_stock_channel_message(
         bot,
-        f"🛍 <b>PRODUCT PURCHASED</b>\n\n"
-        f"📦 <b>{_esc(result['name'])}</b>\n"
-        f"➖ Quantity sold: <b>{result['quantity']}x</b>\n"
-        f"📊 Remaining stock: <b>{result.get('stock', 'Unknown')}</b>",
-        product_id=result.get("product_id"),
-        can_buy=has_stock,
+        f"🔥 <b>{label}</b>\n\n"
+        f"⚡ <b>{_esc(result.get('name') or 'Product')}</b>\n"
+        f"📊 {sold} sold · {stock} currently available"
+        + (f" · {percent}% sold" if percent is not None else ""),
+        product_id=product_id,
+        can_buy=stock > 0,
+        event_key=f"public-product-link:{product_id}:{label.casefold().replace(' ', '-')}",
     )
+
+
+def _product_link_milestone(product_id: int, quantity: int):
+    """Return an announcement at the first order and 30/60/90% sell-through."""
+    db = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.id == product_id).first()
+        if not product or (getattr(product, "source", "own") or "own") == "reseller":
+            return None
+        sold = int(
+            db.query(func.coalesce(func.sum(Order.quantity), 0))
+            .filter(
+                Order.product_id == product_id,
+                Order.refunded.is_(False),
+                Order.status.notin_(("cancelled", "failed", "refunded")),
+            )
+            .scalar() or 0
+        )
+        stock = max(0, int(_real_stock(product) or 0))
+        if sold <= 0:
+            return None
+        if sold == quantity:
+            return "First order", sold, stock, None
+
+        # Current stock plus all non-refunded sales estimates the inventory
+        # batch size. A stable outbox key makes each milestone one-time.
+        batch_size = sold + stock
+        if batch_size <= 0:
+            return None
+        previous_sold = max(0, sold - quantity)
+        crossed = [
+            threshold for threshold in (30, 60, 90)
+            if previous_sold * 100 < batch_size * threshold <= sold * 100
+        ]
+        if crossed:
+            threshold = max(crossed)
+            return f"{threshold}% sold", sold, stock, threshold
+        return None
+    finally:
+        db.close()
 
 
 async def _notify_referral_commission(bot, commission: dict, order_id: int):
@@ -3807,7 +3964,7 @@ async def _purchase_notifications(callback, telegram_id, product_id, result):
             uid = str(telegram_id)
             username = callback.from_user.username
             if username:
-                masked_user = f"@{username[:2]}***{username[-1:]}" if len(username) > 3 else f"@{username}"
+                masked_user = f"@{username[:1]}{'*' * max(4, len(username) - 2)}{username[-1:] if len(username) > 1 else ''}"
             else:
                 masked_user = f"{uid[:4]}***{uid[-3:]}" if len(uid) >= 7 else uid
             delivery_status = (
@@ -3816,14 +3973,12 @@ async def _purchase_notifications(callback, telegram_id, product_id, result):
                 else "⏳ Delivery processing"
             )
             group_msg = (
-                "🛍 <b>PRODUCT ORDER</b>\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                f"🧾 <b>Order:</b> <code>#{result['order_id']}</code>\n"
-                f"👤 <b>User:</b> <code>{_esc(masked_user)}</code>\n"
+                "🎉 <b>New Order!</b>\n\n"
+                f"🎉 <b>By:</b> {_esc(masked_user)}\n"
                 f"📦 <b>Product:</b> {_esc(result['name'])}\n"
-                f"🔢 <b>Quantity:</b> {result['quantity']}\n"
-                f"💰 <b>Total:</b> ${result['total_price']:.2f}\n\n"
-                f"{delivery_status}"
+                f"✨ <b>QTY:</b> {result['quantity']}\n"
+                f"💰 <b>Total Paid:</b> ${result['total_price']:.2f} USDT\n"
+                f"🆔 <b>Order:</b> <code>#{result['order_id']}</code> · {delivery_status}"
             )
             await asyncio.to_thread(enqueue_once, f"public-order:{result['order_id']}", ORDER_NOTIFICATION_CHANNEL_ID, group_msg, callback.bot.id)
         except Exception:

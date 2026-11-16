@@ -239,6 +239,12 @@ async def product_accounts(
 
     await state.clear()
 
+    try:
+        from handlers.products import notify_new_product
+        await notify_new_product(message.bot, product)
+    except Exception:
+        logger.exception("Failed to queue product-added notifications for product_id=%s", product.id)
+
     await answer_card(message,
         f"""
 ✅ Product Added

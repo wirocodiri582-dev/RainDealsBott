@@ -41,6 +41,7 @@ class EditProduct(StatesGroup):
     name = State()
     category = State()
     required_info = State()
+    freebie_referrals = State()
 
 
 class AddStock(StatesGroup):

@@ -129,5 +129,48 @@ def credit_verified(db, original, amount, inr_amount=None, conversion_rate=None)
     deposit.status = 'completed'
     for name, value in extras.items():
         setattr(deposit, name, value)
+
+    # Queue all successful-deposit notices in the same transaction as the
+    # wallet credit. This also covers deposits verified later by background
+    # reconciliation, where no Telegram message handler is waiting.
+    from html import escape
+    import config
+    from services.notification_outbox import enqueue, enqueue_admin
+    display_name = str(wallet.username or "").strip().lstrip("@")
+    admin_name = f"@{escape(display_name)}" if display_name else f"<code>{wallet.telegram_id}</code>"
+    public_name = (f"@{escape(display_name[:1])}*****" if display_name
+                   else f"{str(wallet.telegram_id)[:4]}***")
+    network_label = {
+        "BEP20": "USDT BEP20",
+        "POLYGON": "USDT Polygon",
+        "BINANCE": "Binance Pay",
+        "UPI": "UPI",
+    }.get(str(deposit.network or "").upper(), escape(str(deposit.network or "Unknown")))
+    amount_text = f"${amount.quantize(Decimal('0.01')):.2f} USDT"
+    admin_body = (
+        "💎 <b>New Deposit!</b>\n\n"
+        f"🎉 <b>By:</b> {admin_name}\n"
+        f"🆔 <b>Telegram ID:</b> <code>{wallet.telegram_id}</code>\n"
+        f"💰 <b>Amount:</b> {amount_text}\n"
+        f"💳 <b>Method:</b> {network_label}\n"
+        f"🧾 <b>Deposit:</b> <code>#{deposit.id}</code>\n"
+        f"🔑 <b>Reference:</b> <code>{escape(str(deposit.tx_hash or '')[:18])}…</code>"
+    )
+    enqueue_admin(db, f"deposit-completed:{deposit.id}", admin_body)
+
+    if getattr(config, "GROUP_NOTIFICATIONS", False) and getattr(config, "GROUP_ID", None):
+        public_body = (
+            "💎 <b>New Deposit!</b>\n\n"
+            f"🎉 <b>By:</b> {public_name}\n"
+            f"💰 <b>Amount:</b> {amount_text}\n"
+            f"💳 <b>Method:</b> {network_label}"
+        )
+        enqueue(
+            db,
+            f"deposit-completed:{deposit.id}",
+            config.GROUP_ID,
+            public_body,
+            bot_id=int(config.BOT_TOKEN.split(":", 1)[0]),
+        )
     db.commit()
     return True

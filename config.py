@@ -64,8 +64,12 @@ STOCK_NOTIFICATION_CHANNEL_ID = os.getenv(
 # Dedicated admin order-alert group.  This can be a public @username or a
 # private group ID such as -1001234567890.  New orders are read from the
 # database and sent here once; stock updates are never sent here.
-# NOTIFICATION_CHANNEL_ID remains the fallback so existing deployments do not
-# need an immediate environment-variable change.
+# Admin operational alerts (deposits, product/stock changes, support, vendor,
+# refunds, and orders) are routed to this single destination.
+ADMIN_NOTIFY_CHANNEL_ID = os.getenv(
+    "ADMIN_NOTIFY_CHANNEL_ID",
+    "@raindealsadminnotify",
+).strip()
 ADMIN_ORDER_NOTIFICATION_CHANNEL_ID = os.getenv(
     "ADMIN_ORDER_NOTIFICATION_CHANNEL_ID",
     os.getenv("NOTIFICATION_CHANNEL_ID", "@RainNotify"),

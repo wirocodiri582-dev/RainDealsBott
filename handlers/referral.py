@@ -73,6 +73,8 @@ async def referrals(callback: CallbackQuery):
             return
 
         total_referrals = user.total_referrals
+        from services.freebie_referrals import verified_referral_count
+        miniapp_verified_referrals = verified_referral_count(db, callback.from_user.id)
         # Use the display property (safe float conversion at the last moment)
         earnings = user.referral_earnings_display
         referral_code = user.referral_code
@@ -143,6 +145,7 @@ async def referrals(callback: CallbackQuery):
             f"📊 <b>Statistics</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👥 <b>Total Referrals:</b> {total_referrals}\n"
+            f"🛍 <b>Mini Store verified:</b> {miniapp_verified_referrals}\n"
             f"💰 <b>Total Earnings:</b> ${earnings:,.2f}\n"
         )
 
@@ -184,6 +187,7 @@ async def referrals(callback: CallbackQuery):
             f"<code>{referral_link}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"💡 <i>Share your link to earn rewards!</i>\n"
+            f"🎁 <i>Freebie referrals count after your friend opens the RainDeals Mini Store.</i>\n"
             f"🎁 <i>You earn 10% of your referrals' activity.</i>"
         )
 

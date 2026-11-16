@@ -1703,6 +1703,12 @@ async def _save_reseller_product(message, state, data, price):
 
     await state.clear()
 
+    if action_str == "Created":
+        try:
+            await notify_new_product(message.bot, product)
+        except Exception:
+            logger.exception("Failed to notify Admin Notify about imported product %s", pid)
+
     stock_display = f"{product.stock}" if product.stock < 999999 else "🟢 In Stock"
 
     text = (

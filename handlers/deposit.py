@@ -1609,44 +1609,6 @@ async def process_txid(message: Message, state: FSMContext):
     # SUCCESS
     # ═══════════════════════════════════════════════════════════════
     if success:
-
-        # ╔══════════════════════════════════════════════════════════╗
-        # ║  GROUP NOTIFICATION — TOP-UP (DEPOSIT)                 ║
-        # ╚══════════════════════════════════════════════════════════╝
-        if getattr(config, 'GROUP_NOTIFICATIONS', False) and hasattr(config, 'GROUP_ID'):
-            try:
-                now = datetime.now().strftime("%d-%b-%Y %I:%M %p IST")
-                uid = str(message.from_user.id)
-                masked_uid = f"{uid[:4]}***{uid[-3:]}" if len(uid) >= 7 else uid
-
-                network_map = {
-                    "BEP20": "BSC",
-                    "POLYGON": "MATIC",
-                    "BINANCE": "BINANCE",
-                    "UPI": "UPI",
-                }
-                network_short = network_map.get(network, network.upper())
-
-                group_msg = (
-                    "<code>$ journalctl --wallet</code>\n"
-                    "<code>New wallet event detected.</code>\n"
-                    "<code>━━━━━━━━━━━━━━━━━━━━━━</code>\n"
-                    f"<code>ACTION      TOP-UP</code>\n"
-                    f"<code>USER        {masked_uid}</code>\n"
-                    f"<code>NETWORK     {network_short}</code>\n"
-                    f"<code>STATUS      CONFIRMED</code>\n"
-                    f"<code>TIME        {now}</code>\n"
-                    "<code>━━━━━━━━━━━━━━━━━━━━━━</code>\n"
-                    "<code>Wallet synchronized.</code>"
-                )
-                await queue_message(message.bot, f"deposit-completed:{deposit_id}",
-                    chat_id=config.GROUP_ID,
-                    text=group_msg,
-                    parse_mode="HTML",
-                )
-            except Exception:
-                logger.exception("Failed to send group deposit notification")
-
         credit_note = ""
         if result_info.get("reason") == "verified_partial_credit":
             try:

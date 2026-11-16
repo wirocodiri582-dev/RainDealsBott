@@ -35,6 +35,8 @@ from services.input_forms import is_cancel
 from services.session_resume import save_resume
 from handlers.products import (
     _real_stock,
+    _stock_state,
+    _stock_state_lock,
     _send_stock_channel_message,
     _notify_restock_subscribers,
     invalidate_products_cache,
@@ -317,17 +319,62 @@ def _build_stockctl_sync_text(product) -> str:
     return "<pre>" + safe("\n".join(lines)) + "</pre>"
 
 
-async def _notify_stock_change(bot, pid: int):
-    """Fetch product by ID, build stockctl sync notification, and send to channel."""
+async def _notify_stock_change(bot, pid: int, added: int | None = None):
+    """Queue a clear public stock update and a durable Admin Notify alert."""
     product = await asyncio.to_thread(_load_product, pid)
 
     if not product:
         logger.warning("_notify_stock_change: Product %s not found", pid)
         return
 
-    text = _build_stockctl_sync_text(product)
     stock = _real_stock(product)
-    await _send_stock_channel_message(bot, text, product_id=product.id, can_buy=stock > 0)
+    updated = getattr(product, "updated_at", None)
+    event_stamp = updated.isoformat() if updated else str(stock)
+    threshold = int(product.low_stock_threshold if product.low_stock_threshold is not None else DEFAULT_LOW_STOCK_THRESHOLD)
+    async with _stock_state_lock:
+        previous_state = _stock_state.get(product.id)
+        previous_stock = previous_state.get("last") if previous_state else None
+        _stock_state[product.id] = {
+            "last": stock,
+            "low_stock_notified": stock <= threshold,
+        }
+    if added and added > 0:
+        public_text = (
+            "👑🟥🟥🟥🟥🟥\n\n"
+            "🎉 <b>FRESH STOCK ADDED!</b>\n\n"
+            f"⚡ <b>{safe(product.name)}</b>\n\n"
+            f"📦 <b>Stock Added:</b> +{int(added)} items\n"
+            f"✅ <b>Available Now:</b> {stock} in stock\n"
+            f"💰 <b>Price:</b> ${float(product.price or 0):.2f} USDT"
+        )
+        await _send_stock_channel_message(
+            bot, public_text, product_id=product.id, can_buy=stock > 0,
+            event_key=f"public-stock-added:{product.id}:{event_stamp}",
+        )
+    elif previous_stock is not None and previous_stock > threshold >= stock > 0:
+        from handlers.products import _stock_event_text
+        await _send_stock_channel_message(
+            bot,
+            _stock_event_text("limited_stock", product, stock=stock),
+            product_id=product.id,
+            can_buy=True,
+            event_key=f"public-low-stock:{product.id}:{event_stamp}",
+        )
+    try:
+        from services.notification_outbox import enqueue_admin_once
+        await asyncio.to_thread(
+            enqueue_admin_once,
+            f"product-stock:{product.id}:{event_stamp}",
+            "📦 <b>Product stock updated</b>\n"
+            f"⚡ <b>{safe(product.name)}</b> · <code>#{product.id}</code>\n"
+            f"🏷 Category: {safe(_get_category_label(product))}\n"
+            f"➕ Available now: <b>{stock}</b>\n"
+            f"💰 Price: ${float(product.price or 0):.2f} USDT\n"
+            f"🚚 Delivery: {safe(str(product.delivery_type or 'manual').title())}",
+            bot.id,
+        )
+    except Exception:
+        logger.exception("Could not queue Admin Notify stock update product_id=%s", pid)
     if stock > 0:
         await _notify_restock_subscribers(bot, product, stock)
 
@@ -506,6 +553,10 @@ def _build_product_panel(product: Product):
         f"{safe(policy_label(product))}\n"
         f"📦 <b>Bulk pricing:</b> {'Configured' if product.bulk_pricing else 'Base price only'}\n"
     )
+    is_freebie = Decimal(str(product.price or 0)) == 0
+    if is_freebie:
+        required_referrals = max(0, int(getattr(product, 'freebie_referrals_required', 0) or 0))
+        text += f"🎁 <b>Freebie unlock:</b> {required_referrals} verified referrals\n" if required_referrals else "🎁 <b>Freebie unlock:</b> No referral requirement\n"
     if manual_fallback_only(product):
         text += "👨‍💼 <b>Fallback route:</b> automatic inventory is empty; orders within sellable stock go to manual fulfillment.\n"
     elif manual_allowed(product) and available_stock <= 0 and not product.preorder:
@@ -543,6 +594,11 @@ def _build_product_panel(product: Product):
         [tile('🗑 Delete Product', 'delete_product', 'danger')],
         [InlineKeyboardButton(text='⬅ Back', callback_data='admin_products', style='primary')],
     ]
+    if is_freebie:
+        rows.insert(-2, [tile(
+            f'🎁 Unlock: {int(getattr(product, "freebie_referrals_required", 0) or 0)} referrals',
+            'edit_freebie_referrals',
+        )])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -785,7 +841,7 @@ async def reusable_stock_quantity(message: Message, state: FSMContext):
     await state.clear()
     invalidate_products_cache()
     try:
-        await _notify_stock_change(message.bot, product_id)
+        await _notify_stock_change(message.bot, product_id, added=result.get("added"))
     except Exception:
         logger.exception("Failed to notify after reusable stock update")
     await answer_card(message,
@@ -958,7 +1014,7 @@ async def accounts_apply_import(callback: CallbackQuery, state: FSMContext):
     invalidate_products_cache()
     await callback.answer("Stock updated.")
     try:
-        await _notify_stock_change(callback.bot, pid)
+        await _notify_stock_change(callback.bot, pid, added=result.get("added"))
     except Exception:
         logger.exception("Failed to notify after stock import")
     await callback.message.edit_text(
@@ -1117,9 +1173,11 @@ async def replace_accounts_save(message: Message, state: FSMContext):
         f"New unique accounts: <b>{len(unique_lines)}</b>\n"
         f"Blank rows ignored: <b>{blank_count}</b>\n"
         f"Duplicate rows skipped: <b>{len(submitted) - len(unique_lines)}</b>\n\n"
-        ("This clears the current account pool. Account contents are hidden from this preview. Confirm to continue."
-         if clear_requested else
-         "This replaces the current account pool. Account contents are hidden from this preview. Confirm to continue."),
+        + (
+            "This clears the current account pool. Account contents are hidden from this preview. Confirm to continue."
+            if clear_requested else
+            "This replaces the current account pool. Account contents are hidden from this preview. Confirm to continue."
+        ),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"⚠️ Replace with {len(unique_lines)} accounts", callback_data="accounts_apply_replace")],
@@ -1833,6 +1891,92 @@ async def cancel_required_info_edit(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Edit cancelled.")
 
 
+@router.callback_query(F.data.regexp(r"^edit_freebie_referrals_\d+$"))
+async def edit_freebie_referrals_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    try:
+        pid = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Invalid product.", show_alert=True)
+        return
+    product = await asyncio.to_thread(_load_product, pid)
+    if not product or Decimal(str(product.price or 0)) != 0:
+        await callback.answer("This setting is only available for freebie products.", show_alert=True)
+        return
+    await state.update_data(edit_freebie_referrals_pid=pid)
+    await state.set_state(EditProduct.freebie_referrals)
+    current = max(0, int(getattr(product, "freebie_referrals_required", 0) or 0))
+    await answer_card(
+        callback,
+        "🎁 <b>Freebie referral unlock</b>\n\n"
+        "Enter how many referred accounts must open the RainDeals Mini App to unlock this freebie.\n"
+        "Each referred account is counted once after its Telegram Mini App identity is verified.\n\n"
+        f"Current requirement: <b>{current}</b>\n"
+        "Send <code>0</code> to remove the requirement, or a number from 1 to 10,000.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="Cancel", callback_data="cancel_edit_freebie_referrals"
+        )]]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cancel_edit_freebie_referrals")
+async def cancel_freebie_referrals_edit(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    pid = data.get("edit_freebie_referrals_pid")
+    await state.clear()
+    if pid:
+        await _refresh_manage_panel(callback, int(pid))
+    else:
+        await callback.answer("Edit cancelled.")
+
+
+@router.message(EditProduct.freebie_referrals)
+async def save_freebie_referrals_edit(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    pid = data.get("edit_freebie_referrals_pid")
+    raw = (message.text or "").strip()
+    if raw.lower() in {"cancel", "/cancel", "stop"}:
+        await state.clear()
+        product = await asyncio.to_thread(_load_product, int(pid)) if pid else None
+        if product:
+            panel_text, markup = _build_product_panel(product)
+            await answer_card(message, panel_text, reply_markup=markup, parse_mode="HTML")
+        else:
+            await answer_card(message, "Edit cancelled.")
+        return
+    if not raw.isdigit() or int(raw) > 10_000:
+        await answer_card(message, "Send a whole number from 0 to 10,000. Nothing was changed.")
+        return
+    db = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.id == int(pid)).first() if pid else None
+        if not product or Decimal(str(product.price or 0)) != 0:
+            await answer_card(message, "This product is no longer a freebie. Reopen its manager.")
+            return
+        product.freebie_referrals_required = int(raw)
+        db.commit()
+        invalidate_products_cache()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed updating freebie referral requirement product_id=%s", pid)
+        await answer_card(message, "Could not save the referral requirement. Please try again.")
+        return
+    finally:
+        db.close()
+        await state.clear()
+    product = await asyncio.to_thread(_load_product, int(pid))
+    if product:
+        panel_text, markup = _build_product_panel(product)
+        await answer_card(message, panel_text, reply_markup=markup, parse_mode="HTML")
+
+
 @router.message(EditProduct.required_info)
 async def save_required_info_edit(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -2035,7 +2179,7 @@ async def set_stock(message: Message):
         db.close()
 
     try:
-        await _notify_stock_change(message.bot, pid)
+        await _notify_stock_change(message.bot, pid, added=max(0, stock - previous_stock))
     except Exception:
         logger.exception("Failed to send stock notification after /setstock")
 

@@ -16,10 +16,11 @@ a compatible in-place type change for existing 0/1 data — see
 migrations/migrate_user_decimal.py.
 """
 
+from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import BigInteger, Boolean, Integer, Numeric, String
+from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
@@ -78,6 +79,10 @@ class User(Base):
     )
 
     referred_by: Mapped[Optional[int]] = mapped_column(BigInteger)
+
+    # Set only after this registered Telegram account has authenticated with
+    # fresh Telegram Mini App initData. Used to qualify referral unlocks.
+    miniapp_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     total_referrals: Mapped[int] = mapped_column(
         Integer,
