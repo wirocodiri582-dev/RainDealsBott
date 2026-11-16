@@ -11,6 +11,7 @@ from models.order_workflow import CheckoutAttempt, OrderEvent, OrderWorkNote
 from models.bot_operations import WarrantyRequest, NotificationJob, ProviderHealth
 from models.api_key import ApiKey, ApiOrder, ApiRateLimitBucket
 from models.vendor_offer import VendorOffer, VendorRequest
+from models.bot_menu_setting import BotMenuSetting
 
 
 def _ensure_column(connection, table: str, column: str, definition: str) -> bool:
@@ -86,6 +87,7 @@ def ensure_order_requirements_schema() -> None:
             ClaimMessage.__table__, CancellationRequest.__table__, WalletEntry.__table__,
             VendorOffer.__table__,
             VendorRequest.__table__,
+            BotMenuSetting.__table__,
         ]
     try:
         Base.metadata.create_all(bind=engine, tables=required_tables)

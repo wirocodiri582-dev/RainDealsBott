@@ -46,7 +46,7 @@ from keyboards.menu import get_admin_main_menu
 
 from states.broadcast import BroadcastState
 from services.maintenance_mode import is_maintenance_enabled, set_maintenance_enabled
-from handlers.start import _build_start_welcome, _get_bot_username
+from handlers.start import _load_main_menu_data
 from handlers.products import invalidate_catalog_custom_prices_cache
 
 logger = logging.getLogger(__name__)
@@ -1672,6 +1672,7 @@ async def admin_products(callback: CallbackQuery):
     await callback.answer()
     products = await asyncio.to_thread(_load_admin_product_rows)
     keyboard = [
+        [InlineKeyboardButton(text="⭐ Home menu featured product", callback_data="admin_featured_product")],
         [InlineKeyboardButton(text="➕ New Product", callback_data="create_product")],
         [InlineKeyboardButton(text="🎁 Manage Freebies", callback_data="admin_freebies")],
     ]
@@ -1690,6 +1691,105 @@ async def admin_products(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
     )
+
+
+def _featured_product_keyboard(products: list[dict], page: int, has_more: bool, current: dict | None):
+    rows = []
+    if current:
+        rows.append([InlineKeyboardButton(
+            text=f"✅ Current: {current['icon']} {current['name']}"[:64],
+            callback_data=f"featured_set_{current['id']}",
+        )])
+    for product in products:
+        badge = "🎁" if product["free"] else "📦"
+        rows.append([InlineKeyboardButton(
+            text=f"{badge} {product['icon']} {product['name']} · #{product['id']}"[:64],
+            callback_data=f"featured_set_{product['id']}",
+        )])
+    pager = []
+    if page > 0:
+        pager.append(InlineKeyboardButton(text="‹ Previous", callback_data=f"admin_featured_page_{page - 1}"))
+    if has_more:
+        pager.append(InlineKeyboardButton(text="Next ›", callback_data=f"admin_featured_page_{page + 1}"))
+    if pager:
+        rows.append(pager)
+    rows.append([InlineKeyboardButton(text="🧹 Clear featured product", callback_data="featured_clear")])
+    rows.append([InlineKeyboardButton(text="⬅ Product Manager", callback_data="admin_products")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_featured_product_picker(callback: CallbackQuery, page: int = 0):
+    from services.featured_product import candidates, featured_product
+
+    page = max(0, int(page))
+    products, has_more = await asyncio.to_thread(candidates, page)
+    current = await asyncio.to_thread(featured_product)
+    text = (
+        "⭐ <b>Home menu featured product</b>\n\n"
+        "Choose one active paid product or freebie. It will appear as the second tile under Products.\n\n"
+        + (f"Current selection: <b>{html_escape(current['name'])}</b>" if current else "No product selected yet.")
+    )
+    if not products and not current:
+        text += "\n\nCreate or enable a product first."
+    await _safe_edit_text(
+        callback.message,
+        text,
+        parse_mode="HTML",
+        reply_markup=_featured_product_keyboard(products, page, has_more, current),
+    )
+
+
+@router.callback_query(F.data == "admin_featured_product")
+async def admin_featured_product(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    await callback.answer()
+    await _show_featured_product_picker(callback)
+
+
+@router.callback_query(F.data.startswith("admin_featured_page_"))
+async def admin_featured_product_page(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    try:
+        page = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Invalid page.", show_alert=True)
+        return
+    await callback.answer()
+    await _show_featured_product_picker(callback, page)
+
+
+@router.callback_query(F.data.startswith("featured_set_"))
+async def admin_set_featured_product(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    try:
+        product_id = int(callback.data.removeprefix("featured_set_"))
+    except (TypeError, ValueError):
+        await callback.answer("Invalid product.", show_alert=True)
+        return
+    from services.featured_product import set_featured_product
+    error = await asyncio.to_thread(set_featured_product, product_id, callback.from_user.id)
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+    await callback.answer("Featured product updated.")
+    await _show_featured_product_picker(callback)
+
+
+@router.callback_query(F.data == "featured_clear")
+async def admin_clear_featured_product(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    from services.featured_product import set_featured_product
+    await asyncio.to_thread(set_featured_product, None, callback.from_user.id)
+    await callback.answer("Featured product cleared.")
+    await _show_featured_product_picker(callback)
 
 
 @router.callback_query(F.data == "admin_freebies")
@@ -1981,29 +2081,42 @@ async def admin_back(callback: CallbackQuery, state: FSMContext):
         return
 
     await state.clear()
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter(User.telegram_id == callback.from_user.id).first()
-        if user:
-            bot_username = await _get_bot_username(callback.bot)
-            text = _build_start_welcome(
-                user,
-                callback.from_user.full_name,
-                callback.from_user.id,
-                callback.from_user.username,
-                bot_username,
-            )
-        else:
-            text = "<blockquote>🛍 <b>Welcome to Rain Store Bot!</b></blockquote>"
-        await _safe_edit_text(
-            callback.message,
-            text,
-            reply_markup=get_admin_main_menu(),
-            parse_mode="HTML",
-        )
-    finally:
-        db.close()
     await callback.answer()
+    menu_data = await asyncio.to_thread(
+        _load_main_menu_data,
+        callback.from_user.id,
+        callback.from_user.full_name,
+        callback.from_user.username,
+        "",
+    )
+    if not menu_data:
+        text = "👋 <b>Welcome to RainDeals</b>\n\nChoose where you would like to go."
+        markup = get_admin_main_menu()
+    else:
+        text = menu_data["text"]
+        markup = get_admin_main_menu(
+            menu_data.get("unread_notifications", 0),
+            menu_data.get("featured_product"),
+        )
+        deposit_action = menu_data.get("deposit_action")
+        if deposit_action:
+            label = (
+                f"⏳ Payment checking · #{deposit_action['id']}"
+                if deposit_action["kind"] == "status"
+                else f"💳 Resume payment · {deposit_action['code']}"
+            )
+            markup.inline_keyboard.insert(0, [InlineKeyboardButton(
+                text=label,
+                callback_data=f"resume_deposit_{deposit_action['id']}",
+                style="success",
+            )])
+    await _safe_edit_text(
+        callback.message,
+        text,
+        reply_markup=markup,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 # =====================================================

@@ -18,10 +18,15 @@ from sqlalchemy import or_
 from database import SessionLocal, transaction, retry_on_write_conflict
 from models.user import User
 from models.deposit import Deposit
+from models.order import Order
 from services.session_resume import save_resume
-from config import ADMIN_IDS, CHANNEL_LINK, GROUP_LINK, MINI_APP_URL, TOS_LINK
+from config import (
+    ADMIN_IDS, TOS_LINK,
+    LOYALTY_POINTS_PER_USD,
+)
 
-from keyboards.menu import get_main_menu, get_admin_main_menu, get_start_choice_menu
+from keyboards.menu import get_main_menu, get_admin_main_menu, get_profile_menu
+from services.featured_product import featured_product as load_featured_product
 from utils.ui import show, answer_card, update_card, get_card_location
 
 # Membership check
@@ -156,35 +161,26 @@ def _build_audit_profile(user, telegram_id: int) -> str:
     total_orders = int(getattr(user, 'total_orders', 0) or 0)
     rewards_str = _format_balance(getattr(user, 'referral_earnings_display', 0) or 0)
     full_name = str(getattr(user, 'full_name', '') or 'there')
-    first_name = safe(full_name.split()[0])
+    first_name = safe((full_name.strip().split() or ['there'])[0])
+    username = str(getattr(user, 'username', '') or '').strip().lstrip('@')
+    points = max(
+        0,
+        int(Decimal(str(getattr(user, 'total_spent', 0) or 0)) * Decimal(str(LOYALTY_POINTS_PER_USD))),
+    )
+    username_line = f"\n🔗 @{safe(username)}" if username else ""
 
     return (
-        "🛍 <b>Rain Store</b>\n"
-        "Premium Digital Marketplace\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👋 Welcome back, <b>{first_name}</b>\n\n"
-        "💎 Standard Plan\n\n"
-        f"💰 Wallet: ${balance_str}\n"
-        f"📦 Orders: {total_orders}\n"
-        f"🎁 Rewards: ${rewards_str}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<blockquote>"
-        "✓ Verified Premium Products\n"
-        "✓ Instant Delivery\n"
-        "✓ Secure Payments\n"
-        "✓ Dedicated Customer Support"
-        "</blockquote>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<blockquote>"
-        "🛒 Shop — Browse premium digital products\n"
-        "💰 Deposit — Top up your wallet instantly\n"
-        "👤 Profile — Manage your account &amp; wallet\n"
-        "📦 Orders — View purchases &amp; product keys\n"
-        "📞 Support — Get help from our support team"
-        "</blockquote>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📢 Stay Updated: @Raindrop7707\n\n"
-        "👇 Tap a button below to get started."
+        "👤 <b>Account Overview</b>\n\n"
+        f"🌟 <b>{first_name}</b>{username_line}\n"
+        f"🆔 <code>{int(telegram_id)}</code>\n\n"
+        f"💳 Available Balance: <b>${balance_str}</b>\n"
+        f"📦 Orders Placed: <b>{total_orders}</b>\n"
+        f"💸 Total Spent: <b>${_format_balance(getattr(user, 'total_spent', 0))}</b>\n"
+        f"💰 Total Deposited: <b>${_format_balance(getattr(user, 'total_deposited', 0))}</b>\n"
+        f"🌟 Loyalty Points: <b>{points:,}</b>\n"
+        f"🎁 Referral Earnings: <b>${rewards_str}</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🟢 Account Status: <b>Active</b>"
     )
 
 
@@ -196,7 +192,9 @@ def _build_start_welcome(
     user, full_name: str, telegram_id: int, username: str | None,
     bot_username: str,
 ) -> str:
-    first_name = safe((full_name or "there").split()[0])
+    fallback_name = (str(full_name or "").strip().split() or ["there"])[0]
+    greeting_name = str(username or "").strip().lstrip("@") or fallback_name
+    first_name = safe(greeting_name)
     return (
         f"👋 <b>Hey Dear, {first_name}</b> 🌸\n\n"
         "<b>Welcome to Raindeals</b> 🛍\n\n"
@@ -256,7 +254,6 @@ def _load_main_menu_data(
         user = db.query(User).filter(User.telegram_id == telegram_id).first()
         if not user:
             return None
-        from services.notification_inbox import unread_count
         now = datetime.utcnow()
         deposit = (
             db.query(Deposit)
@@ -279,8 +276,9 @@ def _load_main_menu_data(
             "text": _build_start_welcome(user, full_name, telegram_id, username, bot_username),
             "chat_id": user.home_menu_chat_id,
             "message_id": user.home_menu_message_id,
-            "unread_notifications": unread_count(db,telegram_id),
+            "unread_notifications": 0,
             "deposit_action": deposit_action,
+            "featured_product": load_featured_product(db),
         }
     finally:
         db.close()
@@ -338,12 +336,15 @@ def _load_start_deposit_action(telegram_id: int) -> dict | None:
         db.close()
 
 
-def _load_profile_text(telegram_id: int) -> str | None:
+def _load_profile_data(telegram_id: int) -> tuple[str, int] | None:
     """Load profile data in a worker thread, keeping remote DB waits off-loop."""
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.telegram_id == telegram_id).first()
-        return _build_audit_profile(user, telegram_id) if user else None
+        if not user:
+            return None
+        from services.notification_inbox import unread_count
+        return _build_audit_profile(user, telegram_id), int(unread_count(db, telegram_id) or 0)
     finally:
         db.close()
 
@@ -400,7 +401,12 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
         return
 
     unread = menu_data.get("unread_notifications",0)
-    keyboard = get_admin_main_menu(unread) if callback.from_user.id in ADMIN_IDS else get_main_menu(unread)
+    featured = menu_data.get("featured_product")
+    keyboard = (
+        get_admin_main_menu(unread, featured)
+        if callback.from_user.id in ADMIN_IDS
+        else get_main_menu(unread, featured)
+    )
     deposit_action = menu_data.get("deposit_action")
     if deposit_action:
         label = (f"⏳ Payment checking · #{deposit_action['id']}"
@@ -443,9 +449,24 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "shop_unavailable")
 async def shop_unavailable(callback: CallbackQuery):
     await callback.answer(
-        "The RainDeals Mini App is not configured right now. Choose Continue in bot to shop here.",
+        "The RainDeals Store is not configured yet. Use Products to shop in Telegram.",
         show_alert=True,
     )
+
+
+@router.callback_query(F.data == "featured_product")
+async def open_featured_product(callback: CallbackQuery):
+    """Open the admin-selected home-menu product, including a freebie."""
+    featured = await asyncio.to_thread(load_featured_product)
+    if not featured:
+        await callback.answer(
+            "The featured product has not been selected by an admin yet.",
+            show_alert=True,
+        )
+        return
+    await callback.answer()
+    from handlers.products import product_info
+    await product_info(callback, linked_product_id=featured["id"], acknowledge_callback=False)
 
 
 @router.callback_query(F.data == "language_menu")
@@ -466,21 +487,124 @@ async def my_profile(callback: CallbackQuery):
     """Profile → sends NEW audit-style message with Back button. Main menu stays."""
     await callback.answer()
 
-    text = await asyncio.to_thread(_load_profile_text, callback.from_user.id)
-    if not text:
+    profile = await asyncio.to_thread(_load_profile_data, callback.from_user.id)
+    if not profile:
         await answer_card(callback, "User record not found. Send /start to register again.")
         return
+    text, unread = profile
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Back", callback_data="profile_back")],
-        ]
-    )
     await answer_card(callback,
         text,
-        reply_markup=keyboard,
+        reply_markup=get_profile_menu(unread),
         parse_mode="HTML",
         disable_web_page_preview=True
+    )
+
+
+def _load_loyalty_summary(telegram_id: int) -> tuple[int, str] | None:
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+        if not user:
+            return None
+        spent = Decimal(str(user.total_spent or 0))
+        points = max(0, int(spent * Decimal(str(LOYALTY_POINTS_PER_USD))))
+        return points, _format_balance(spent)
+    finally:
+        db.close()
+
+
+@router.callback_query(F.data == "loyalty_points")
+async def loyalty_points(callback: CallbackQuery):
+    await callback.answer()
+    summary = await asyncio.to_thread(_load_loyalty_summary, callback.from_user.id)
+    if not summary:
+        await answer_card(callback, "Your account could not be loaded. Please send /start.")
+        return
+    points, spent = summary
+    await show(
+        callback,
+        "🌟 <b>LOYALTY POINTS</b>\n\n"
+        f"✨ Points earned: <b>{points:,}</b>\n"
+        f"🛍 Eligible purchases: <b>${spent}</b>\n\n"
+        "Points are calculated from completed purchase spend. Contact support for help with your rewards.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆘 Support", callback_data="support_ticket")],
+            [InlineKeyboardButton(text="⬅ Profile", callback_data="my_profile")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "shop_policies")
+async def shop_policies(callback: CallbackQuery):
+    await callback.answer()
+    policies_url = str(TOS_LINK or "").strip()
+    configured = policies_url.startswith("https://") and "your-site.com" not in policies_url.lower()
+    rows = []
+    if configured:
+        rows.append([InlineKeyboardButton(text="📜 Read shop policies", url=policies_url)])
+        text = "📜 <b>SHOP POLICIES</b>\n\nOpen the link below to read the current shop terms and policies."
+    else:
+        text = "📜 <b>SHOP POLICIES</b>\n\nThe policy page is not configured yet. Contact support if you need help before ordering."
+    rows.extend([
+        [InlineKeyboardButton(text="🆘 Contact support", callback_data="support_ticket")],
+        [InlineKeyboardButton(text="⬅ Profile", callback_data="my_profile")],
+    ])
+    await show(callback, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+def _load_mail_reader_orders(telegram_id: int) -> list[tuple[int, str]]:
+    db = SessionLocal()
+    try:
+        orders = (
+            db.query(Order.id, Order.product_name)
+            .filter(
+                Order.telegram_id == int(telegram_id),
+                Order.status == "completed",
+                Order.delivered_account.isnot(None),
+                Order.delivered_account != "",
+            )
+            .order_by(Order.id.desc())
+            .limit(10)
+            .all()
+        )
+        return [(int(order_id), str(name or "Product")) for order_id, name in orders]
+    finally:
+        db.close()
+
+
+@router.callback_query(F.data == "profile_mail_reader")
+async def profile_mail_reader(callback: CallbackQuery):
+    await callback.answer()
+    orders = await asyncio.to_thread(_load_mail_reader_orders, callback.from_user.id)
+    rows = [
+        [InlineKeyboardButton(
+            text=f"📨 Order #{order_id} · {name[:36]}",
+            callback_data=f"order_detail_{order_id}",
+        )]
+        for order_id, name in orders
+    ]
+    if not rows:
+        text = (
+            "📨 <b>LIVE OTP / MAIL READER</b>\n\n"
+            "No completed orders with delivered account details were found. "
+            "When an order includes a mail reader link, open that order here."
+        )
+    else:
+        text = (
+            "📨 <b>LIVE OTP / MAIL READER</b>\n\n"
+            "Choose a delivered order to view its saved account details and mail reader link."
+        )
+    rows.extend([
+        [InlineKeyboardButton(text="📦 All My Orders", callback_data="orders_menu")],
+        [InlineKeyboardButton(text="⬅ Profile", callback_data="my_profile")],
+    ])
+    await show(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
 
@@ -523,7 +647,13 @@ async def retry_membership_check(callback: CallbackQuery):
 # ╚══════════════════════════════════════════════════════════════╝
 
 @retry_on_write_conflict(max_attempts=3)
-def _get_or_create_user(telegram_id: int, username: str, full_name: str, ref_payload: str) -> dict:
+def _get_or_create_user(
+    telegram_id: int,
+    username: str,
+    full_name: str,
+    ref_payload: str,
+    load_home_menu: bool = True,
+) -> dict:
     with transaction() as db:
         user = db.query(User).filter(User.telegram_id == telegram_id).first()
         is_new = False
@@ -570,11 +700,35 @@ def _get_or_create_user(telegram_id: int, username: str, full_name: str, ref_pay
             if user.full_name != full_name:
                 user.full_name = full_name
 
+        deposit_action = None
+        featured = None
+        if load_home_menu:
+            now = datetime.utcnow()
+            deposit = (
+                db.query(Deposit)
+                .filter(
+                    Deposit.telegram_id == telegram_id,
+                    Deposit.status.in_(["waiting_hash", "pending"]),
+                    or_(Deposit.tx_hash.isnot(None), Deposit.invoice_expires_at > now),
+                )
+                .order_by(Deposit.tx_hash.is_(None), Deposit.id.desc())
+                .first()
+            )
+            if deposit:
+                deposit_action = {
+                    "kind": "status" if deposit.tx_hash is not None else "resume",
+                    "id": int(deposit.id),
+                    "code": deposit.invoice_code or deposit.order_id,
+                }
+            featured = load_featured_product(db)
+
         return {
             "is_new": is_new,
             "referral_bonus": referral_bonus,
             "referral_code": user.referral_code,
             "referred_by": getattr(user, "referred_by", None),
+            "featured_product": featured,
+            "deposit_action": deposit_action,
             # Return the dashboard values from the same transaction. This
             # removes the second remote database query from every /start.
             "profile": {
@@ -697,8 +851,18 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
 
     try:
         db_started_at = time.perf_counter()
+        load_home_menu = (
+            deep_link_product_id is None
+            and vendor_request_id is None
+            and not is_admin
+        )
         user_task = asyncio.to_thread(
-            _get_or_create_user, telegram_id, username, full_name, ref_payload
+            _get_or_create_user,
+            telegram_id,
+            username,
+            full_name,
+            ref_payload,
+            load_home_menu,
         )
         admin_dashboard = None
         if deep_link_product_id is None and is_admin:
@@ -717,11 +881,11 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
                 admin_dashboard = None
             unread, deposit_action = 0, None
         elif deep_link_product_id is None:
-            # The landing screen is static. Avoid separate notification,
-            # invoice, and getMe reads here; load the personalized menu only
-            # after the user chooses Continue in bot.
+            # The home menu uses values collected in the user transaction so
+            # /start stays to one database session while still restoring an
+            # active payment and the current featured item.
             result = await user_task
-            unread, deposit_action = 0, None
+            unread, deposit_action = 0, result.get("deposit_action")
         else:
             result = await user_task
             unread, deposit_action = 0, None
@@ -822,7 +986,22 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
     user.username = username
     user.full_name = full_name
     text = _build_start_welcome(user, full_name, telegram_id, username, "")
-    keyboard = get_start_choice_menu()
+    keyboard = (
+        get_admin_main_menu(featured_product=result.get("featured_product"))
+        if is_admin
+        else get_main_menu(featured_product=result.get("featured_product"))
+    )
+    if deposit_action:
+        label = (
+            f"⏳ Payment checking · #{deposit_action['id']}"
+            if deposit_action["kind"] == "status"
+            else f"💳 Resume payment · {deposit_action['code']}"
+        )
+        keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(
+            text=label,
+            callback_data=f"resume_deposit_{deposit_action['id']}",
+            style="success",
+        )])
     card_started_at = time.perf_counter()
     menu_card = await update_card(
         message,
