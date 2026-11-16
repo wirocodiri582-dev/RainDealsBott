@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from html import escape
 
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
@@ -55,7 +55,7 @@ def verified_referral_count(db: Session, telegram_id: int) -> int:
     )
     unique_network_count = not_approved.filter(
         User.miniapp_ip_hash.isnot(None),
-        User.miniapp_ip_hash.in_(singleton_networks.c.network_hash),
+        User.miniapp_ip_hash.in_(select(singleton_networks.c.network_hash)),
     ).with_entities(
         func.count(func.distinct(User.miniapp_ip_hash))
     ).scalar() or 0
