@@ -13,7 +13,6 @@ import asyncio
 import time
 from html import escape
 from datetime import datetime, timedelta
-from pathlib import Path
 from decimal import Decimal, ROUND_HALF_UP
 
 from aiogram import Router, F
@@ -22,7 +21,6 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    FSInputFile,
 )
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -153,6 +151,14 @@ def _format_usdt(value) -> str:
 
 def _format_inr(value) -> str:
     return f"₹{_format_value(value, '0.01')} INR"
+
+
+def _load_wallet_balance(telegram_id: int):
+    db = SessionLocal()
+    try:
+        return db.query(User.balance).filter(User.telegram_id == int(telegram_id)).scalar()
+    finally:
+        db.close()
 
 
 def _format_amount(amount, network: str) -> str:
@@ -624,22 +630,11 @@ async def deposit_menu(callback: CallbackQuery, state: FSMContext):
         else:
             await state.clear()
 
+        balance = await asyncio.to_thread(_load_wallet_balance, callback.from_user.id)
         text = (
-            f"💰 <b>DEPOSIT FUNDS</b>\n\n"
-            f"<b>Choose a payment method.</b> One invoice lasts 1 hour. Switching methods reuses it without resetting its expiry.\n\n"
-            f"{_divider('─', 28)}\n\n"
-            f"🟡 <b>USDT (BEP20)</b>\n"
-            f"   └ Fast & low fees · Binance Smart Chain\n\n"
-            f"🟣 <b>USDT (Polygon)</b>\n"
-            f"   └ Cheap transactions · Polygon Network\n\n"
-            f"🔴 <b>Binance Pay</b>\n"
-            f"   └ Pay with any crypto · Instant\n\n"
-            f"🟢 <b>UPI (₹ INR)</b>\n"
-            f"   └ Indian Rupee · Bank transfer\n\n"
-            f"🏷️ <b>Redeem Promocode</b>\n"
-            f"   └ Use a promo code to get bonus credits\n\n"
-            f"{_divider('─', 28)}\n\n"
-            f"💡 <i>After paying, submit the transaction reference to verify it automatically.</i>"
+            "💎 <b>DEPOSIT MONEY</b>\n\n"
+            f"💳 Your balance: <b>{_format_usdt(balance)}</b>\n"
+            "Choose a payment method 👇"
         )
 
         await show(
@@ -1277,70 +1272,52 @@ def _invoice_keyboard() -> InlineKeyboardMarkup:
     return _cancel_kb()
 
 
-def _invoice_payload(network: str, data: dict) -> tuple[str, str | None]:
-    """Build the original deposit-card copy for the combined QR/photo card."""
+def _invoice_payload(network: str, data: dict) -> str:
+    """Build a compact text-only invoice. QR images are intentionally omitted."""
     code = escape(str(data.get("invoice_code", "")))
     deposit_id = escape(str(data.get("deposit_id", "")))
     expiry = datetime.fromisoformat(data["invoice_expires_at"])
     remaining = max(0, int((expiry - datetime.utcnow()).total_seconds()))
     mins, secs = divmod(remaining, 60)
     network_config = _get_network_info(network)
-    divider = _divider("─", 28)
-    qr = None
 
     if network == "UPI":
         upi_id = escape(str(getattr(config, "UPI_ID", "") or "Not configured"))
-        qr = getattr(config, "UPI_QR_FILE", "")
         payment_info = (
-            f"🟢 <b>UPI Payment Details</b>\n\n"
-            f"<blockquote><code>{upi_id}</code></blockquote>\n\n"
-            "📱 Scan the QR above or use the UPI ID.\n"
-            "💳 Pay any amount; the verified amount is credited.\n\n"
-            "<b>📋 After payment, send:</b> UTR / Transaction ID"
+            f"🟢 <b>UPI ID</b>\n<code>{upi_id}</code>\n\n"
+            "Pay any amount; the verified amount is credited."
         )
         reference = "UTR / Transaction reference"
     elif network in CRYPTO_NETWORKS:
         address = escape(str(NETWORK_ADDRESSES.get(network, "") or "Not configured"))
-        qr = getattr(config, f"{network}_QR_FILE", "")
         payment_info = (
-            f"{network_config['icon']} <b>{network_config['label']} Deposit Address</b>\n\n"
-            f"<blockquote><code>{address}</code></blockquote>\n\n"
-            "⚠️ <b>Important:</b> Send only USDT on the network shown above.\n"
-            "💰 Send the amount you choose; the verified amount is credited.\n\n"
-            "<b>📋 After sending, paste:</b> Transaction Hash (TXID)"
+            f"{network_config['icon']} <b>USDT address · {network_config['label']}</b>\n"
+            f"<code>{address}</code>\n\n"
+            f"Send USDT on {network_config['label']} only. The verified amount is credited."
         )
         reference = "Transaction Hash (TXID)"
     else:
         pay_id = escape(str(BINANCE_PAY_ID or "Not configured"))
         payment_info = (
-            "🔴 <b>Binance Pay Details</b>\n\n"
-            f"<b>Pay ID:</b> <blockquote><code>{pay_id}</code></blockquote>\n\n"
-            "📱 Open Binance Pay and send any amount.\n"
-            "💰 The verified transfer amount is credited.\n\n"
-            "<b>📋 After payment, send:</b> Binance Pay Order ID"
+            f"🔴 <b>Binance Pay ID</b>\n<code>{pay_id}</code>\n\n"
+            "Pay any amount through Binance Pay; the verified amount is credited."
         )
         reference = "Binance Pay Order ID"
 
     body = (
-        f"{network_config['icon']} <b>DEPOSIT CREATED</b>\n\n"
-        f"<b>📋 Deposit Details</b>\n"
-        f"{divider}\n\n"
-        f"🆔 <b>Deposit ID:</b> <code>#{deposit_id}</code>\n"
-        f"🧾 <b>Invoice:</b> <code>{code}</code>\n"
-        f"📡 <b>Network:</b> {network_config['icon']} {network_config['label']}\n"
-        f"⏳ <b>Expires in:</b> {mins}:{secs:02d}\n"
-        f"📊 <b>Status:</b> ⏳ Awaiting Payment\n\n"
-        f"{_divider('═', 28)}\n\n"
+        f"💳 <b>DEPOSIT · #{deposit_id}</b>\n"
+        f"🧾 Invoice: <code>{code}</code>\n"
+        f"📡 Method: {network_config['icon']} {network_config['label']}\n"
+        f"⏳ Expires in: <b>{mins}:{secs:02d}</b>\n\n"
         f"{payment_info}\n\n"
-        f"{_divider('═', 28)}\n\n"
-        f"💡 After payment, send your <b>{reference}</b> here for verification."
+        f"📩 Submit: <b>{reference}</b>"
     )
-    return body, qr
+    return body
 
 
 @managed_screen
 async def _show_invoice(target, state: FSMContext, deposit_id: int, network: str, data: dict):
-    body, qr = _invoice_payload(network, data)
+    body = _invoice_payload(network, data)
     bot = target.bot
     chat_id = target.message.chat.id if isinstance(target, CallbackQuery) else target.chat.id
     previous_photo = data.get("invoice_photo_message_id")
@@ -1360,39 +1337,20 @@ async def _show_invoice(target, state: FSMContext, deposit_id: int, network: str
         except Exception:
             pass
 
-    invoice_message = None
-    if qr:
-        try:
-            path = Path(qr)
-            photo = FSInputFile(path) if path.is_file() else qr
-            invoice_message = await bot.send_photo(
-                chat_id=chat_id,
-                photo=photo,
-                caption=body,
-                parse_mode="HTML",
-                reply_markup=_invoice_keyboard(),
-            )
-        except Exception:
-            logger.exception("Could not send configured %s QR image", network)
-
-    # A configured QR image and its invoice details are a single Telegram
-    # photo message (image with caption), matching the previous payment card.
-    # Methods without a QR (for example Binance Pay) use one text card.
-    if invoice_message is None:
-        if isinstance(target, CallbackQuery):
-            invoice_message = await target.message.answer(
-                body, parse_mode="HTML", reply_markup=_invoice_keyboard()
-            )
-        else:
-            invoice_message = await target.answer(
-                body, parse_mode="HTML", reply_markup=_invoice_keyboard()
-            )
+    if isinstance(target, CallbackQuery):
+        invoice_message = await target.message.answer(
+            body, parse_mode="HTML", reply_markup=_invoice_keyboard()
+        )
+    else:
+        invoice_message = await target.answer(
+            body, parse_mode="HTML", reply_markup=_invoice_keyboard()
+        )
     track_card(target.from_user.id, invoice_message.chat.id, invoice_message.message_id)
     await state.update_data(
         _card_chat_id=invoice_message.chat.id,
         _card_message_id=invoice_message.message_id,
         invoice_card_message_id=invoice_message.message_id,
-        invoice_photo_message_id=invoice_message.message_id if qr and invoice_message.photo else None,
+        invoice_photo_message_id=None,
     )
     await asyncio.to_thread(
         _save_deposit_card,

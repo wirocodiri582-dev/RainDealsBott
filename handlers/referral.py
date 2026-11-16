@@ -1,5 +1,6 @@
 from datetime import datetime
 from html import escape
+from urllib.parse import quote
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardButton, WebAppInfo
@@ -8,10 +9,74 @@ from sqlalchemy import func
 
 from database import SessionLocal
 from models.user import User
+from models.product import Product
 from config import ADMIN_IDS, MINI_APP_URL
 from utils.ui import show, answer_card
 
 router = Router()
+
+
+@router.callback_query(F.data.regexp(r"^freebie_invite_\d{1,10}$"))
+async def freebie_referral_invite(callback: CallbackQuery):
+    """Show the referral progress and share link for the selected freebie."""
+    try:
+        product_id = int(str(callback.data).removeprefix("freebie_invite_"))
+    except (TypeError, ValueError):
+        await callback.answer("This freebie link is invalid.", show_alert=True)
+        return
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == callback.from_user.id).first()
+        product = db.query(Product).filter(
+            Product.id == product_id,
+            Product.is_active.is_(True),
+            Product.price == 0,
+        ).first()
+        if not user or not product or int(getattr(product, "freebie_referrals_required", 0) or 0) <= 0:
+            await callback.answer("This referral offer is no longer available.", show_alert=True)
+            return
+
+        from services.freebie_referrals import verified_referral_count
+        progress = verified_referral_count(db, callback.from_user.id)
+        required = int(product.freebie_referrals_required or 0)
+        needed = max(0, required - progress)
+        invited = int(db.query(func.count(User.id)).filter(
+            User.referred_by == int(user.telegram_id),
+        ).scalar() or 0)
+        awaiting_store = int(db.query(func.count(User.id)).filter(
+            User.referred_by == int(user.telegram_id),
+            User.miniapp_verified_at.is_(None),
+            User.is_banned.is_(False),
+        ).scalar() or 0)
+        bot = await callback.bot.get_me()
+        link = f"https://t.me/{bot.username}?start=ref_{user.referral_code}"
+        name = escape(str(product.name or "Freebie"))
+        user_verified = bool(user.miniapp_verified_at)
+        progress_bar = get_progress_bar(min(100, progress * 100 / required), length=10)
+        text = (
+            f"🎁 <b>INVITE FRIENDS — UNLOCK {name}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Share your personal link with friends. They must join RainDeals and open the Mini Store to verify their Telegram account.\n\n"
+            f"🎁 <b>Unlock progress:</b> {progress}/{required}\n"
+            f"{progress_bar}\n"
+            f"👥 <b>Invited:</b> {invited} · ⏳ <b>Awaiting Store:</b> {awaiting_store}\n"
+            f"🎁 <b>Reward:</b> {name}\n"
+            f"{'✅ Offer unlocked.' if needed == 0 else f'📣 Invite {needed} more eligible friend(s).'}\n"
+            f"{'✅ Your Store verification is complete.' if user_verified else '🛍 Open the Mini Store once to verify your account before claiming.'}\n\n"
+            "🔗 <b>Your invite link</b>\n"
+            f"<code>{escape(link)}</code>\n\n"
+            "ℹ️ Only new bot accounts can be attributed to a referral link. Existing users opening it again do not count. Self-referrals and matching network checks are excluded or sent for review."
+        )
+        share_url = "https://t.me/share/url?" + f"url={quote(link, safe='')}&text={quote('Join RainDeals and verify in the Mini Store to unlock this freebie!', safe='')}"
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Share invite link", url=share_url)],
+            [InlineKeyboardButton(text="🎁 Back to this freebie", callback_data=f"product_{product_id}")],
+        ])
+        await show(callback, text, parse_mode="HTML", reply_markup=markup)
+    finally:
+        db.close()
+    await callback.answer()
 
 
 @router.callback_query(F.data.regexp(r"^admin_referral_approve_\d{1,15}$"))

@@ -1911,8 +1911,8 @@ async def edit_freebie_referrals_start(callback: CallbackQuery, state: FSMContex
     await answer_card(
         callback,
         "🎁 <b>Freebie referral unlock</b>\n\n"
-        "Enter how many referred accounts must open the RainDeals Mini App to unlock this freebie.\n"
-        "Each referred account is counted once after its Telegram Mini App identity is verified.\n\n"
+        "Choose how many invited friends must complete RainDeals Mini Store verification before this freebie can be claimed.\n"
+        "Only new bot accounts count. Repeated opens by existing users do not count; self-referrals and matching network checks are excluded or reviewed.\n\n"
         f"Current requirement: <b>{current}</b>\n"
         "Send <code>0</code> to remove the requirement, or a number from 1 to 10,000.",
         parse_mode="HTML",

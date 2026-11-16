@@ -377,16 +377,17 @@ def _load_admin_product_rows() -> list[tuple[int, bool, str, str, int]]:
         db.close()
 
 
-def _load_admin_freebie_rows() -> list[tuple[int, bool, str, str, int]]:
-    """Fetch only zero-price items for the separate Freebies manager."""
+def _load_admin_freebie_rows() -> list[tuple[int, bool, str, str, int, int]]:
+    """Fetch zero-price items and their referral unlock setting."""
     db = SessionLocal()
     try:
         rows = db.query(
-            Product.id, Product.is_active, Product.icon, Product.name, Product.stock
+            Product.id, Product.is_active, Product.icon, Product.name, Product.stock,
+            Product.freebie_referrals_required,
         ).filter(Product.price == 0).order_by(Product.id.desc()).all()
         return [
-            (int(product_id), bool(active), icon or "🎁", name, int(stock or 0))
-            for product_id, active, icon, name, stock in rows
+            (int(product_id), bool(active), icon or "🎁", name, int(stock or 0), int(required or 0))
+            for product_id, active, icon, name, stock, required in rows
         ]
     finally:
         db.close()
@@ -1792,10 +1793,11 @@ async def admin_freebies(callback: CallbackQuery):
     await callback.answer()
     freebies = await asyncio.to_thread(_load_admin_freebie_rows)
     keyboard = [[InlineKeyboardButton(text="➕ Create Freebie", callback_data="create_freebie")]]
-    for product_id, active, icon, name, stock in freebies:
+    for product_id, active, icon, name, stock, required in freebies:
         status = "🟢" if active else "🔴"
+        unlock = f"🔒{required} " if required else "🔓 "
         keyboard.append([InlineKeyboardButton(
-            text=f"#{product_id} {status} {icon} {name} ({stock})",
+            text=f"#{product_id} {status} {unlock}{icon} {name} · {stock} stock"[:64],
             callback_data=f"manage_{product_id}",
         )])
     keyboard.extend([
@@ -1805,7 +1807,8 @@ async def admin_freebies(callback: CallbackQuery):
     await _safe_edit_text(
         callback.message,
         "🎁 <b>Freebies</b>\n\n"
-        "Freebies are zero-price products and can have their own catalog, inventory, and delivery settings.",
+        "Freebies have separate catalogs, stock, and delivery settings. Open an item to edit its referral unlock; set 0 for open access or a friend count to gate claiming.\n\n"
+        "The list shows each item’s current unlock rule.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
     )

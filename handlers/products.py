@@ -661,10 +661,12 @@ def _get_bulk_price(bulk_pricing, quantity: int):
 
     try:
         tiers = json.loads(bulk_pricing) if isinstance(bulk_pricing, str) else bulk_pricing
+        if isinstance(tiers, str):
+            tiers = json.loads(tiers)
     except (json.JSONDecodeError, TypeError, ValueError, InvalidOperation, OverflowError):
         return None
 
-    if not tiers:
+    if not isinstance(tiers, dict) or not tiers or _purchase_configuration_errors(None, tiers):
         return None
 
     best_price = None
@@ -697,11 +699,19 @@ def _format_bulk_pricing_text(bulk_pricing) -> str:
 
     try:
         tiers = json.loads(bulk_pricing) if isinstance(bulk_pricing, str) else bulk_pricing
+        if isinstance(tiers, str):
+            tiers = json.loads(tiers)
     except (json.JSONDecodeError, TypeError, ValueError, InvalidOperation, OverflowError):
-        return "  ❌ <i>Not Available</i>"
+        return "  ⚠️ <i>Bulk discount unavailable; the listed base price applies.</i>"
+
+    if not isinstance(tiers, dict):
+        return "  ⚠️ <i>Bulk discount unavailable; the listed base price applies.</i>"
 
     if not tiers:
         return "  ❌ <i>Not Available</i>"
+
+    if _purchase_configuration_errors(None, tiers):
+        return "  ⚠️ <i>Bulk discount unavailable; the listed base price applies.</i>"
 
     lines = []
     sorted_tiers = sorted(tiers.values(), key=lambda x: int(x.get("min", 1)))
@@ -1017,11 +1027,12 @@ def _purchase_configuration_errors(required_info, bulk_pricing) -> list[str]:
 
 
 def _product_purchase_configuration_errors(product) -> list[str]:
-    """Fail closed for both invalid source JSON and malformed persisted rules."""
+    """Block invalid required fields/prices; optional discount errors use base price."""
     marked = set(getattr(product, "_invalid_purchase_configuration", ()) or ())
+    marked.discard("bulk_pricing")
     errors = marked | set(_purchase_configuration_errors(
         getattr(product, "required_info", None),
-        getattr(product, "bulk_pricing", None),
+        None,
     ))
     try:
         price = Decimal(str(getattr(product, "price", "")))
@@ -1150,14 +1161,30 @@ def _load_product_models_safely(query) -> list[Product]:
                     invalid_purchase_fields.append(field)
                     continue
             values[field] = parsed
-        # Run the exact checkout validator after safe decoding as well. This
-        # catches cross-tier overlap and protects both display and purchase.
-        invalid_purchase_fields.extend(
-            _purchase_configuration_errors(
-                values.get("required_info"),
-                values.get("bulk_pricing"),
-            )
+        # Required buyer fields must remain valid for checkout. Bulk pricing
+        # is optional, so malformed tiers are removed from this in-memory row
+        # and checkout safely falls back to the configured base price.
+        final_purchase_errors = _purchase_configuration_errors(
+            values.get("required_info"),
+            values.get("bulk_pricing"),
         )
+        invalid_bulk_pricing = (
+            "bulk_pricing" in invalid_purchase_fields
+            or "bulk_pricing" in final_purchase_errors
+        )
+        if invalid_bulk_pricing:
+            values["bulk_pricing"] = None
+            invalid_purchase_fields = [
+                field for field in invalid_purchase_fields if field != "bulk_pricing"
+            ]
+        invalid_purchase_fields.extend(
+            field for field in final_purchase_errors if field != "bulk_pricing"
+        )
+        if invalid_bulk_pricing:
+            logger.warning(
+                "Ignoring invalid optional bulk pricing; base price applies product_id=%s",
+                values.get("id"),
+            )
         if invalid_purchase_fields:
             logger.warning(
                 "Product remains visible with purchases disabled for invalid configuration product_id=%s fields=%s",
@@ -2703,6 +2730,11 @@ async def product_info(
         )
         if needed:
             text += f"Invite <b>{needed}</b> more verified friend(s) to unlock this freebie.\n"
+        invite_label = (
+            "🛍 Verify Store to claim"
+            if needed == 0 and not freebie_gate["claimant_verified"]
+            else f"👥 Invite friends · {needed} needed"
+        )
 
     text += (
         f"  📦 <b>Stock:</b> {_stock_indicator(stock_count)}\n"
@@ -2770,7 +2802,11 @@ async def product_info(
         elif not freebie_gate["claimant_verified"]:
             buttons.append([InlineKeyboardButton(text="🏠 Open the shop from Main Menu", callback_data="main_menu", style="primary")])
         buttons.append([
-            InlineKeyboardButton(text="👥 Refer & Earn", callback_data="referrals_menu", style="primary"),
+            InlineKeyboardButton(
+                text=invite_label[:64],
+                callback_data=f"freebie_invite_{product_id}",
+                style="primary",
+            ),
             InlineKeyboardButton(text="🔄 Check unlock", callback_data=f"product_{product_id}", style="success"),
         ])
     elif max_qty <= 0:

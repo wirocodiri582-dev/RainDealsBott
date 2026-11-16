@@ -9,15 +9,12 @@ import hashlib
 import hmac
 import json
 import logging
-import mimetypes
 import time
 from datetime import datetime
 from decimal import Decimal
-from pathlib import Path
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import desc, func
 
@@ -322,29 +319,20 @@ def _deposit_view(row: Deposit) -> dict:
     else:
         remaining = 0
     can_pay = bool(row.status == "waiting_hash" and not row.tx_hash and remaining > 0)
-    payment = {"address": "", "qr_url": None, "instructions": ""}
+    payment = {"address": "", "instructions": ""}
     if can_pay:
-        qr_setting = ""
         if network == "BEP20":
             payment["address"] = str(getattr(config, "BEP20_ADDRESS", "") or "")
-            qr_setting = str(getattr(config, "BEP20_QR_FILE", "") or "")
             payment["instructions"] = "Send USDT on BNB Smart Chain (BEP20), then submit the transaction hash."
         elif network == "POLYGON":
             payment["address"] = str(getattr(config, "POLYGON_ADDRESS", "") or "")
-            qr_setting = str(getattr(config, "POLYGON_QR_FILE", "") or "")
             payment["instructions"] = "Send USDT on Polygon, then submit the transaction hash."
         elif network == "BINANCE":
             payment["address"] = str(getattr(config, "BINANCE_PAY_ID", "") or "")
             payment["instructions"] = "Pay using Binance Pay, then submit the Order ID from the receipt."
         elif network == "UPI":
             payment["address"] = str(getattr(config, "UPI_ID", "") or "")
-            qr_setting = str(getattr(config, "UPI_QR_FILE", "") or "")
             payment["instructions"] = "Pay using UPI, then submit the UTR or transaction reference."
-        if qr_setting:
-            if qr_setting.startswith("https://"):
-                payment["qr_url"] = qr_setting
-            elif Path(qr_setting).expanduser().is_file():
-                payment["qr_url"] = f"/miniapp/api/deposits/{int(row.id)}/qr"
     return {
         "id": int(row.id), "invoice": str(row.invoice_code or row.order_id or ""),
         "network": network, "network_label": label[1], "icon": label[0],
@@ -365,15 +353,6 @@ def _owned_deposit(user_id: int, deposit_id: int) -> Deposit | None:
         # Detach scalar fields needed by the API serializer before closing DB.
         db.expunge(row)
         return row
-
-
-def _qr_file(network: str):
-    name = {"BEP20": "BEP20_QR_FILE", "POLYGON": "POLYGON_QR_FILE", "UPI": "UPI_QR_FILE"}.get(network)
-    value = str(getattr(config, name, "") or "").strip() if name else ""
-    if not value or value.startswith(("https://", "http://")):
-        return None
-    path = Path(value).expanduser()
-    return path if path.is_file() else None
 
 
 @router.get("/bootstrap")
@@ -484,19 +463,6 @@ def deposit_detail(deposit_id: int, auth=Depends(current_user)):
     if not row:
         raise HTTPException(status_code=404, detail="Deposit not found.")
     return {"deposit": _deposit_view(row)}
-
-
-@router.get("/deposits/{deposit_id}/qr")
-def deposit_qr(deposit_id: int, auth=Depends(current_user)):
-    row = _owned_deposit(auth["id"], deposit_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Deposit not found.")
-    if row.status != "waiting_hash" or row.tx_hash:
-        raise HTTPException(status_code=404, detail="Payment QR is no longer active.")
-    path = _qr_file(str(row.network or "").upper())
-    if not path:
-        raise HTTPException(status_code=404, detail="No QR image is configured for this payment method.")
-    return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream", filename=path.name)
 
 
 @router.post("/deposits/{deposit_id}/reference")

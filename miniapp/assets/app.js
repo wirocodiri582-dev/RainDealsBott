@@ -6,7 +6,7 @@
     unread: 0, botUsername: "", depositMethods: [], currentProductId: null, buyerInfoDraft: {},
     currentView: "store", cartPending: new Map(), productDetails: new Map(),
     productsRequest: 0, productRequest: 0, catalogLoadedAt: 0, productsRequests: new Map(), cartReady: false, modal: null,
-    notificationPage: 0, depositTimer: null, qrObjectUrl: null, currentDepositId: null,
+    notificationPage: 0, depositTimer: null,
     cartLoadPromise: null,
   };
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -232,7 +232,6 @@
     $("#modal").classList.add("hidden");
     state.productRequest += 1;
     stopDepositTimer();
-    state.currentDepositId = null;
     state.currentProductId = null;
     state.modal = null;
     if (tg?.BackButton) state.currentView === "store" ? tg.BackButton.hide() : tg.BackButton.show();
@@ -433,7 +432,7 @@
   function openDepositMethods(methods) {
     const rows = methods || [];
     openModal(`<p class="eyebrow">ADD FUNDS</p><h2 class="page-title" id="modal-title">Choose a payment method</h2>
-      <p class="muted-count">Use one of the payment methods enabled for RainDeals. Your verified payment amount is credited to your wallet.</p>
+      <p class="muted-count">Choose how you want to pay. Your verified payment amount is credited to your wallet.</p>
       <div class="payment-method-list">${rows.map(row => `<button class="payment-method-card ${row.configured ? "" : "disabled"}" data-deposit-network="${esc(row.network)}" ${row.configured ? "" : "disabled"}><span>${esc(row.icon)}</span><span><strong>${esc(row.label)}</strong><small>${row.configured ? `Submit ${esc(row.reference_label)} after paying` : "Temporarily unavailable"}</small></span><b>${row.configured ? "›" : "—"}</b></button>`).join("")}</div>
       <button class="secondary-button wide-button" data-action="load-deposits">View deposit history</button>`, "deposit-methods");
   }
@@ -448,26 +447,10 @@
   function stopDepositTimer() {
     if (state.depositTimer) clearInterval(state.depositTimer);
     state.depositTimer = null;
-    if (state.qrObjectUrl) URL.revokeObjectURL(state.qrObjectUrl);
-    state.qrObjectUrl = null;
-  }
-
-  async function loadDepositQr(id) {
-    try {
-      const response = await fetch(`/miniapp/api/deposits/${Number(id)}/qr`, { cache: "no-store", headers: { "X-Telegram-Init-Data": state.initData } });
-      if (!response.ok) return;
-      const blob = await response.blob();
-      if (state.modal !== "deposit" || state.currentDepositId !== Number(id)) return;
-      if (state.qrObjectUrl) URL.revokeObjectURL(state.qrObjectUrl);
-      state.qrObjectUrl = URL.createObjectURL(blob);
-      const image = $("#deposit-qr");
-      if (image && state.modal === "deposit") { image.src = state.qrObjectUrl; image.classList.remove("hidden"); }
-    } catch { /* QR is optional; the payment address remains available. */ }
   }
 
   function renderDeposit(deposit) {
     stopDepositTimer();
-    state.currentDepositId = Number(deposit.id);
     const payment = deposit.payment;
     const waiting = deposit.status === "waiting_hash" && Number(deposit.remaining_seconds) > 0 && !deposit.reference_submitted;
     const expired = deposit.status === "waiting_hash" && !deposit.reference_submitted && !Number(deposit.remaining_seconds);
@@ -476,17 +459,10 @@
     openModal(`<p class="eyebrow">${esc(deposit.icon || "💳")} DEPOSIT · #${Number(deposit.id)}</p><h2 class="page-title" id="modal-title">${esc(deposit.invoice || `Deposit #${deposit.id}`)}</h2>
       <div class="panel-card deposit-invoice-card">
         <div class="deposit-summary"><span>${esc(methodLabel)}</span><span class="status-pill ${esc(deposit.status)}">${expired ? "expired" : esc(String(deposit.status).replaceAll("_", " "))}</span></div>
-        ${waiting && payment?.qr_url ? `<img id="deposit-qr" class="deposit-qr hidden" alt="Payment QR code">` : ""}
         ${waiting && payment?.address ? `<div class="deposit-address"><small>${deposit.network === "BINANCE" ? "Binance Pay ID" : deposit.network === "UPI" ? "UPI ID" : "Deposit address"}</small><code>${esc(payment.address)}</code><button class="text-button" data-copy="${esc(payment.address)}">Copy</button></div>` : ""}
         <p class="soft-note">${esc(payment?.instructions || (completed ? `Payment verified${deposit.received_amount && Number(deposit.received_amount) ? ` · ${money(deposit.received_amount)} USDT credited` : ""}.` : deposit.reference_submitted ? "Your payment reference has been saved for verification. Check back here for the result." : expired ? "This invoice expired. Create a new deposit to continue." : "This deposit is being processed."))}</p>
-        ${waiting ? `<p class="invoice-timer">⏳ Invoice expires in <strong id="deposit-timer">—</strong></p><label class="field-label">${esc(deposit.reference_label)}<input id="deposit-reference" class="field-input" maxlength="255" autocomplete="off" placeholder="Enter your payment reference"></label><button class="primary-button wide-button" style="margin-top:12px" data-action="submit-deposit-reference" data-deposit-id="${Number(deposit.id)}">Submit for verification</button><button class="secondary-button wide-button" style="margin-top:8px" data-action="change-payment-method">Change payment method</button>` : `<p class="invoice-timer">${completed ? "This deposit is complete." : deposit.reference_submitted ? "Your reference is saved. Revisit this deposit to check its status." : expired ? "The invoice is no longer accepting payment references." : `Status: ${esc(String(deposit.status).replaceAll("_", " "))}`}</p>${completed ? `<button class="primary-button wide-button" data-close-modal>Done</button>` : deposit.reference_submitted ? `<button class="primary-button wide-button" data-action="load-deposits">My deposits</button>` : `<button class="primary-button wide-button" data-action="open-deposit-methods">${expired ? "Create a new deposit" : "Choose another method"}</button>`}`}
+        ${waiting ? `<p class="invoice-timer">⏳ Invoice expires in <strong id="deposit-timer">—</strong></p><label class="field-label">${esc(deposit.reference_label)}<input id="deposit-reference" class="field-input" maxlength="255" autocomplete="off" placeholder="Enter your payment reference"></label><button class="primary-button wide-button" style="margin-top:12px" data-action="submit-deposit-reference" data-deposit-id="${Number(deposit.id)}">Submit for verification</button><button class="secondary-button wide-button" style="margin-top:8px" data-action="change-payment-method">🔄 Switch payment method</button>` : `<p class="invoice-timer">${completed ? "This deposit is complete." : deposit.reference_submitted ? "Your reference is saved. Revisit this deposit to check its status." : expired ? "The invoice is no longer accepting payment references." : `Status: ${esc(String(deposit.status).replaceAll("_", " "))}`}</p>${completed ? `<button class="primary-button wide-button" data-close-modal>Done</button>` : deposit.reference_submitted ? `<button class="primary-button wide-button" data-action="load-deposits">My deposits</button>` : `<button class="primary-button wide-button" data-action="open-deposit-methods">${expired ? "Create a new deposit" : "Switch payment method"}</button>`}`}
       </div><button class="secondary-button wide-button" data-action="load-deposits">My deposit history</button>`, "deposit");
-    if (waiting && payment?.qr_url) {
-      if (payment.qr_url.startsWith("https://")) {
-        const image = $("#deposit-qr");
-        if (image) { image.src = payment.qr_url; image.classList.remove("hidden"); }
-      } else loadDepositQr(deposit.id);
-    }
     if (waiting) {
       const expiresAt = Date.now() + Number(deposit.remaining_seconds) * 1000;
       const update = () => {

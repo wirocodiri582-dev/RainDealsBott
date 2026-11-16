@@ -2259,6 +2259,8 @@ async def _finish_own_product(message, state):
          else f"💰 <b>Base Price:</b> ${float(product.price):.2f}"),
         f"📊 <b>Stock:</b> {product.stock}",
         f"🚚 <b>Delivery:</b> {product.delivery_type}",
+        ("🎁 <b>Referral unlock:</b> Open access by default. Use <b>Manage This Product → Referral unlock</b> to require verified invites."
+         if is_freebie else ""),
         f"Manual fallback: {'Yes' if product.manual_fallback else 'No'}",
         f"🧾 <b>Buyer details required:</b> {len(product.required_info or [])}",
         f"📦 <b>Preorder:</b> {'🟢 Yes' if product.preorder else '🔴 No'}",
@@ -2299,7 +2301,7 @@ async def _finish_own_product(message, state):
         if is_freebie else "\n✅ <b>Product is now live!</b>"
     )
 
-    text = "\n".join(text_parts)
+    text = "\n".join(part for part in text_parts if part)
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
