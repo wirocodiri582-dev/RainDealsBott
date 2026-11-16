@@ -40,7 +40,9 @@ class CallbackSessionTimeoutMiddleware(BaseMiddleware):
         before_state = await state.get_state() if state else None
         command = (message.text or '').split(maxsplit=1)[0].split('@')[0].lower() if isinstance(event,Message) and message.text else ''
         callback = event.data or '' if isinstance(event,CallbackQuery) else ''
-        bypass = command in {'/start','/restart'} or callback in {'session_resume','session_home','main_menu'}
+        bypass = command in {'/start','/restart'} or callback in {
+            'session_resume', 'session_home', 'main_menu', 'admin_back', 'admin_panel'
+        }
         now, previous = time.time(), self._sessions.get(key)
         snapshot = None
         if previous is None and not before_state and not bypass:

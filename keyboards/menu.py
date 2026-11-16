@@ -48,24 +48,26 @@ def _customer_rows(featured_product: dict | None = None) -> list[list[InlineKeyb
     rows = [
         [InlineKeyboardButton(text="🛍 Products", callback_data="products_menu", style="success")],
         [InlineKeyboardButton(text=featured_text, callback_data=featured_callback, style="primary")],
-        [InlineKeyboardButton(text="📦 My Orders", callback_data="orders_menu", style="primary")],
-        [InlineKeyboardButton(text="🎁 Freebies", callback_data="freebies_menu", style="success")],
+        [
+            InlineKeyboardButton(text="📦 My Orders", callback_data="orders_menu", style="primary"),
+            InlineKeyboardButton(text="🎁 Freebies", callback_data="freebies_menu", style="success"),
+        ],
         [
             InlineKeyboardButton(text="👤 Profile", callback_data="my_profile", style="primary"),
             InlineKeyboardButton(text="💰 Deposit", callback_data="deposit_start", style="success"),
         ],
         [
             InlineKeyboardButton(text="🔑 Bot API", callback_data="api_key_menu", style="primary"),
-            InlineKeyboardButton(text="🌐 Language · English", callback_data="language_menu", style="primary"),
+            _shop_button(),
         ],
         [
+            InlineKeyboardButton(text="🌐 Language · English", callback_data="language_menu", style="primary"),
             InlineKeyboardButton(text="🎯 Refer & Earn", callback_data="referrals_menu", style="primary"),
-            InlineKeyboardButton(text="🤝 Become a Supplier", callback_data="vendor_apply", style="primary"),
         ],
+        [InlineKeyboardButton(text="🤝 Become a Supplier", callback_data="vendor_apply", style="primary")],
     ]
     channel = str(ADDITIONAL_CHANNEL_LINK or "https://t.me/rainworlddd").strip()
     rows.append([InlineKeyboardButton(text="📢 Join our channel", url=channel)])
-    rows.append([_shop_button()])
     return rows
 
 
@@ -78,12 +80,8 @@ def get_admin_main_menu(
     unread_count: int = 0,
     featured_product: dict | None = None,
 ) -> InlineKeyboardMarkup:
-    """Same customer layout with the admin switch placed above the Store row."""
-    rows = _customer_rows(featured_product)
-    rows.insert(-2, [InlineKeyboardButton(
-        text="👑 Admin View", callback_data="admin_panel", style="danger"
-    )])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    """Admin's user-facing menu mirrors the customer grid without admin toggles."""
+    return InlineKeyboardMarkup(inline_keyboard=_customer_rows(featured_product))
 
 
 def get_profile_menu(unread_count: int = 0) -> InlineKeyboardMarkup:

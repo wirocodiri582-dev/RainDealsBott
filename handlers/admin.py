@@ -191,28 +191,23 @@ async def _safe_edit_text(message: Message, text: str, reply_markup=None, parse_
 # ╚══════════════════════════════════════════════════════════════╝
 
 def _get_admin_panel_with_providers() -> InlineKeyboardMarkup:
-    """Dynamically appends the 🏪 Providers button to the admin panel keyboard."""
+    """Build the admin panel with one direct Mini Store button and admin tools."""
     base_markup = get_admin_panel()
     rows = [list(row) for row in base_markup.inline_keyboard]
 
-    shop_buttons = []
     if MINI_APP_URL:
-        shop_buttons.append(InlineKeyboardButton(
-            text="🛍 Buy via site",
+        mini_store_button = InlineKeyboardButton(
+            text="🛍 Open Mini Store",
             web_app=WebAppInfo(url=MINI_APP_URL),
             style="success",
-        ))
-    shop_buttons.append(InlineKeyboardButton(
-        text="🤖 Buy via bot",
-        callback_data="products_menu",
-        style="primary",
-    ))
-    rows.insert(0, shop_buttons)
-    rows.insert(-1, [InlineKeyboardButton(
-        text="👤 User View",
-        callback_data="user_view",
-        style="primary",
-    )])
+        )
+    else:
+        mini_store_button = InlineKeyboardButton(
+            text="🛍 Open Mini Store",
+            callback_data="shop_unavailable",
+            style="success",
+        )
+    rows.insert(0, [mini_store_button])
     rows.insert(-1, [InlineKeyboardButton(
         text="📣 Ask vendors for a product",
         callback_data="vendor_request_new",
@@ -2082,15 +2077,25 @@ async def admin_back(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
     await callback.answer()
-    menu_data = await asyncio.to_thread(
-        _load_main_menu_data,
-        callback.from_user.id,
-        callback.from_user.full_name,
-        callback.from_user.username,
-        "",
-    )
+    try:
+        menu_data = await asyncio.to_thread(
+            _load_main_menu_data,
+            callback.from_user.id,
+            callback.from_user.full_name,
+            callback.from_user.username,
+            "",
+        )
+    except Exception:
+        logger.exception("Could not load the admin's customer home menu")
+        menu_data = None
     if not menu_data:
-        text = "👋 <b>Welcome to RainDeals</b>\n\nChoose where you would like to go."
+        text = _build_start_welcome(
+            None,
+            callback.from_user.full_name,
+            callback.from_user.id,
+            callback.from_user.username,
+            "",
+        )
         markup = get_admin_main_menu()
     else:
         text = menu_data["text"]
@@ -2115,7 +2120,6 @@ async def admin_back(callback: CallbackQuery, state: FSMContext):
         text,
         reply_markup=markup,
         parse_mode="HTML",
-        disable_web_page_preview=True,
     )
 
 
