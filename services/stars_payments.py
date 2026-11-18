@@ -16,7 +16,7 @@ from models.user import User
 
 logger = logging.getLogger(__name__)
 
-MIN_STARS_AMOUNT = 5
+MIN_STARS_AMOUNT = 1
 MAX_STARS_AMOUNT = 100_000
 _USDT_QUANTUM = Decimal("0.00000001")
 

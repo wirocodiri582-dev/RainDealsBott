@@ -696,7 +696,7 @@ async def start_stars_deposit(callback: CallbackQuery, state: FSMContext):
         f"Wallet credit rate: <b>{_format_usdt(rate)} per Star</b>\n"
         "Enter the number of Stars to pay as a whole number. Telegram will "
         "confirm the payment automatically; do not send a transaction hash.\n\n"
-        f"Minimum: <b>5 Stars</b> · Maximum: <b>100,000 Stars</b>\n"
+        f"Minimum: <b>1 Star</b> · Maximum: <b>100,000 Stars</b>\n"
         "Type <code>CANCEL</code> to go back.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -716,10 +716,10 @@ async def process_stars_amount(message: Message, state: FSMContext):
         )
         await state.clear()
         return
-    if not re.fullmatch(r"\d{1,6}", raw) or not 5 <= int(raw) <= 100_000:
+    if not re.fullmatch(r"\d{1,6}", raw) or not 1 <= int(raw) <= 100_000:
         await update_card(
             message, state,
-            "⚠️ Enter a whole number from <b>5 to 100,000 Stars</b>, for example <code>100</code>. "
+            "⚠️ Enter a whole number from <b>1 to 100,000 Stars</b>, for example <code>1</code> or <code>2</code>. "
             "Type <code>CANCEL</code> to go back.",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="↩️ Back to payment methods", callback_data="deposit_start")

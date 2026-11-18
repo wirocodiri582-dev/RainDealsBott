@@ -339,7 +339,7 @@ class CheckoutPayload(BaseModel):
 class DepositCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     network: str = Field(pattern=r"^(BEP20|POLYGON|BINANCE|UPI|STARS)$")
-    stars_amount: int | None = Field(default=None, ge=5, le=100_000)
+    stars_amount: int | None = Field(default=None, ge=1, le=100_000)
 
 
 class DepositReference(BaseModel):

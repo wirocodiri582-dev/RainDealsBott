@@ -489,8 +489,8 @@
     if (!method?.configured) { toast("Telegram Stars is temporarily unavailable."); return; }
     openModal(`<p class="eyebrow">⭐ TELEGRAM STARS</p><h2 class="page-title" id="modal-title">Choose your Stars amount</h2>
       <p class="muted-count">Your wallet credit is calculated at <strong>${esc(method.usdt_per_star)} USDT per Star</strong>. Telegram confirms payment automatically.</p>
-      <label class="field-label">Stars to pay<input id="stars-amount" class="field-input" inputmode="numeric" type="number" min="5" max="100000" step="1" placeholder="For example, 100"></label>
-      <p class="soft-note">Use a whole number from 5 to 100,000. Your wallet is credited only after Telegram reports successful payment.</p>
+      <label class="field-label">Stars to pay<input id="stars-amount" class="field-input" inputmode="numeric" type="number" min="1" max="100000" step="1" placeholder="For example, 1 or 2"></label>
+      <p class="soft-note">Use a whole number from 1 to 100,000. Your wallet is credited only after Telegram reports successful payment.</p>
       <button class="primary-button wide-button" data-action="create-stars-deposit">Continue to Telegram checkout</button>
       <button class="secondary-button wide-button" style="margin-top:8px" data-action="change-payment-method">Back to payment methods</button>`, "stars-amount");
     $("#stars-amount")?.focus();
@@ -839,7 +839,7 @@
     if (target.dataset.action === "create-stars-deposit") {
       const input = $("#stars-amount");
       const amount = Number(input?.value);
-      if (!Number.isSafeInteger(amount) || amount < 5 || amount > 100_000) { toast("Enter a whole Stars amount from 5 to 100,000."); input?.focus(); return; }
+      if (!Number.isSafeInteger(amount) || amount < 1 || amount > 100_000) { toast("Enter a whole Stars amount from 1 to 100,000."); input?.focus(); return; }
       beginDeposit("STARS", amount);
       return;
     }
