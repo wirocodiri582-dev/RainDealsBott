@@ -18,6 +18,7 @@ _writers = {}
 MAX_AGE_SECONDS = 86400
 _capture_prompt = ContextVar('capture_resume_prompt', default=True)
 SAFE_STATES = {'DepositState:waiting_network', 'DepositState:waiting_amount',
+               'DepositState:waiting_stars_amount',
                'DepositState:waiting_txid', 'DepositState:waiting_promo_code',
                'DepositState:waiting_optional_promo', 'PurchaseStates:waiting_qty',
                'SearchStates:waiting_query', 'OrderRequirementStates:waiting_input',

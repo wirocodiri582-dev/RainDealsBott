@@ -137,7 +137,7 @@ async def recover_interrupted_deposit_cards(bot) -> None:
     recovered = await asyncio.to_thread(_recover_interrupted_deposits)
     for item in recovered:
         network = str(item.get("network") or "").upper()
-        network_label = {"BEP20": "🟡 BEP20 (BSC)", "POLYGON": "🟣 Polygon", "BINANCE": "🔴 Binance Pay", "UPI": "🟢 UPI"}.get(network, network)
+        network_label = {"BEP20": "🟡 BEP20 (BSC)", "POLYGON": "🟣 Polygon", "BINANCE": "🔴 Binance Pay", "UPI": "🟢 UPI", "STARS": "⭐ Telegram Stars"}.get(network, network)
         reference = str(item.get("tx_hash") or "")
         if len(reference) > 28:
             reference = reference[:24] + "..."

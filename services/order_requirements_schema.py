@@ -1,4 +1,4 @@
-"""Idempotent schema setup for buyer order information and shared invoices."""
+"""Idempotent schema setup for buyer information, shared invoices, and Stars."""
 
 from sqlalchemy import text
 
@@ -219,6 +219,15 @@ def ensure_order_requirements_schema() -> None:
         _ensure_column(connection, "deposits", "verification_started_at", "DATETIME NULL")
         _ensure_column(connection, "deposits", "verification_lease_token", "VARCHAR(64) NULL")
         _ensure_column(connection, "deposits", "verification_lease_until", "DATETIME NULL")
+        _ensure_column(connection, "deposits", "stars_amount_requested", "INT NULL")
+        _ensure_column(connection, "deposits", "stars_amount_paid", "INT NULL")
+        _ensure_column(connection, "deposits", "stars_usdt_per_star", "DECIMAL(20,8) NULL")
+        _ensure_column(connection, "deposits", "stars_invoice_payload", "VARCHAR(128) NULL")
+        _ensure_column(connection, "deposits", "telegram_payment_charge_id", "VARCHAR(255) NULL")
+        _ensure_column(connection, "deposits", "stars_invoice_url", "VARCHAR(2048) NULL")
+        _ensure_column(connection, "deposits", "stars_precheckout_at", "DATETIME NULL")
+        _ensure_unique_columns(connection, "deposits", ["stars_invoice_payload"], "uq_deposits_stars_payload")
+        _ensure_unique_columns(connection, "deposits", ["telegram_payment_charge_id"], "uq_deposits_telegram_charge")
         _ensure_index(connection, "deposits", ["verification_lease_until"], "ix_deposits_verification_lease_until")
         index_exists = connection.execute(text(
             "SELECT 1 FROM information_schema.STATISTICS "

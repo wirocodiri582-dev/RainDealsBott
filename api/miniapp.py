@@ -338,7 +338,8 @@ class CheckoutPayload(BaseModel):
 
 class DepositCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    network: str = Field(pattern=r"^(BEP20|POLYGON|BINANCE|UPI)$")
+    network: str = Field(pattern=r"^(BEP20|POLYGON|BINANCE|UPI|STARS)$")
+    stars_amount: int | None = Field(default=None, ge=5, le=100_000)
 
 
 class DepositReference(BaseModel):
@@ -356,18 +357,24 @@ _DEPOSIT_LABELS = {
     "POLYGON": ("🟣", "USDT · Polygon", "Transaction Hash (TXID)"),
     "BINANCE": ("🔴", "Binance Pay", "Binance Pay Order ID"),
     "UPI": ("🟢", "UPI · INR", "UTR / Transaction ID"),
+    "STARS": ("⭐", "Telegram Stars", "Automatic Telegram confirmation"),
 }
 
 
 def _deposit_method_rows() -> list[dict]:
+    from services.stars_payments import stars_rate
+
+    stars_exchange_rate = stars_rate()
     configured = {
         "BEP20": bool(str(getattr(config, "BEP20_ADDRESS", "") or "").strip()),
         "POLYGON": bool(str(getattr(config, "POLYGON_ADDRESS", "") or "").strip()),
         "BINANCE": bool(str(getattr(config, "BINANCE_PAY_ID", "") or "").strip()),
         "UPI": bool(str(getattr(config, "UPI_ID", "") or "").strip()),
+        "STARS": bool(BOT_TOKEN and stars_exchange_rate is not None),
     }
     return [{"network": key, "icon": value[0], "label": value[1], "reference_label": value[2],
-             "configured": configured[key]}
+             "configured": configured[key],
+             "usdt_per_star": str(stars_exchange_rate) if key == "STARS" and stars_exchange_rate else None}
             for key, value in _DEPOSIT_LABELS.items()]
 
 
@@ -385,7 +392,12 @@ def _deposit_view(row: Deposit) -> dict:
     can_pay = bool(row.status == "waiting_hash" and not row.tx_hash and remaining > 0)
     payment = {"address": "", "instructions": ""}
     if can_pay:
-        if network == "BEP20":
+        if network == "STARS":
+            payment = {
+                "invoice_url": str(row.stars_invoice_url or ""),
+                "instructions": "Open Telegram's secure Stars checkout. Your wallet is credited after Telegram confirms payment.",
+            }
+        elif network == "BEP20":
             payment["address"] = str(getattr(config, "BEP20_ADDRESS", "") or "")
             payment["instructions"] = "Send USDT on BNB Smart Chain (BEP20), then submit the transaction hash."
         elif network == "POLYGON":
@@ -402,6 +414,9 @@ def _deposit_view(row: Deposit) -> dict:
         "network": network, "network_label": label[1], "icon": label[0],
         "reference_label": label[2], "status": str(row.status or "unknown"),
         "amount": _money(row.amount), "received_amount": _money(row.received_amount),
+        "stars_amount": int(row.stars_amount_requested or 0) if network == "STARS" else None,
+        "stars_amount_paid": int(row.stars_amount_paid or 0) if network == "STARS" else None,
+        "stars_wallet_credit": _money(row.received_amount or row.invoice_usdt_amount or 0) if network == "STARS" else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "expires_at": expiry.isoformat() if expiry else None, "remaining_seconds": remaining,
         "payment": payment if can_pay else None,
@@ -496,7 +511,7 @@ def deposit_methods(auth=Depends(current_user)):
 
 
 @router.post("/deposits")
-async def create_deposit(payload: DepositCreate, auth=Depends(current_user)):
+async def create_deposit(payload: DepositCreate, request: Request, auth=Depends(current_user)):
     import asyncio
     from handlers.deposit import (
         _active_invoice, _create_invoice, _load_invoice_for_resume,
@@ -507,6 +522,32 @@ async def create_deposit(payload: DepositCreate, auth=Depends(current_user)):
     method = next((row for row in _deposit_method_rows() if row["network"] == payload.network), None)
     if not method or not method["configured"]:
         raise HTTPException(status_code=503, detail="This payment method is not configured. Choose another method or contact support.")
+    if payload.network == "STARS":
+        if payload.stars_amount is None:
+            raise HTTPException(status_code=422, detail="Enter a whole number of Telegram Stars.")
+        bot = getattr(request.app.state, "main_bot", None)
+        if bot is None:
+            raise HTTPException(status_code=503, detail="Telegram Stars checkout is temporarily unavailable.")
+        try:
+            from services.stars_payments import (
+                StarsPaymentError, create_stars_invoice, create_stars_invoice_link,
+            )
+            invoice = await asyncio.to_thread(
+                create_stars_invoice, auth["id"], int(payload.stars_amount)
+            )
+            invoice["telegram_id"] = int(auth["id"])
+            await create_stars_invoice_link(bot, invoice)
+            owned = await asyncio.to_thread(_owned_deposit, auth["id"], int(invoice["id"]))
+            if not owned:
+                raise HTTPException(status_code=409, detail="The Stars invoice is no longer available. Refresh and try again.")
+            return {"deposit": _deposit_view(owned)}
+        except StarsPaymentError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Mini App Stars invoice creation failed for telegram_id=%s", auth["id"])
+            raise HTTPException(status_code=503, detail="Could not prepare the Stars checkout. Please try again.")
     submitted = await asyncio.to_thread(_submitted_invoice, auth["id"])
     if submitted:
         raise HTTPException(status_code=409, detail="A payment reference is already being verified. Check your deposit history before starting another.")
@@ -567,6 +608,8 @@ async def submit_deposit_reference(deposit_id: int, payload: DepositReference, a
     if not row:
         raise HTTPException(status_code=404, detail="Deposit not found.")
     network = str(row.network or "").upper()
+    if network == "STARS":
+        raise HTTPException(status_code=409, detail="Telegram Stars payments are confirmed automatically. No payment reference is needed.")
     reference = payload.reference.strip()
     valid = (_valid_upi_reference(reference) if network == "UPI" else
              _valid_order_id(reference) if network == "BINANCE" else

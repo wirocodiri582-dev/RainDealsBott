@@ -161,6 +161,7 @@ async def _restore_snapshot(message, state, snapshot):
                    'DepositState:waiting_promo_code': 'Continue. Send your promo code.',
                    'DepositState:waiting_optional_promo': 'Continue. Send your promo code.',
                    'DepositState:waiting_amount': 'Continue. Send the deposit amount.',
+                   'DepositState:waiting_stars_amount': 'Continue. Enter a whole number of Telegram Stars.',
                    'SupportState:waiting_message': 'Continue your ticket. Send your message.',
                    'SupportState:tracking_ticket': 'Continue tracking. Send your ticket ID.',
                    'OrderFilterStates:waiting_filter': 'Continue searching. Send your order ID.'}

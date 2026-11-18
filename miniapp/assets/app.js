@@ -480,8 +480,20 @@
     const rows = methods || [];
     openModal(`<p class="eyebrow">ADD FUNDS</p><h2 class="page-title" id="modal-title">Choose a payment method</h2>
       <p class="muted-count">Choose how you want to pay. Your verified payment amount is credited to your wallet.</p>
-      <div class="payment-method-list">${rows.map(row => `<button class="payment-method-card ${row.configured && !state.depositPending ? "" : "disabled"}" data-deposit-network="${esc(row.network)}" ${row.configured && !state.depositPending ? "" : "disabled"}><span>${esc(row.icon)}</span><span><strong>${esc(row.label)}</strong><small>${state.depositPending ? "Creating your invoice…" : row.configured ? `Submit ${esc(row.reference_label)} after paying` : "Temporarily unavailable"}</small></span><b>${row.configured ? "›" : "—"}</b></button>`).join("")}</div>
+      <div class="payment-method-list">${rows.map(row => `<button class="payment-method-card ${row.configured && !state.depositPending ? "" : "disabled"}" data-deposit-network="${esc(row.network)}" ${row.configured && !state.depositPending ? "" : "disabled"}><span>${esc(row.icon)}</span><span><strong>${esc(row.label)}</strong><small>${state.depositPending ? "Creating your invoice…" : row.configured ? row.network === "STARS" ? `Choose a Stars amount · ${esc(row.usdt_per_star)} USDT per Star` : `Submit ${esc(row.reference_label)} after paying` : row.network === "STARS" ? "Temporarily unavailable · ask admin to configure the rate" : "Temporarily unavailable"}</small></span><b>${row.configured ? "›" : "—"}</b></button>`).join("")}</div>
       <button class="secondary-button wide-button" data-action="load-deposits">View deposit history</button>`, "deposit-methods");
+  }
+
+  function openStarsAmountForm() {
+    const method = state.depositMethods.find(row => row.network === "STARS");
+    if (!method?.configured) { toast("Telegram Stars is temporarily unavailable."); return; }
+    openModal(`<p class="eyebrow">⭐ TELEGRAM STARS</p><h2 class="page-title" id="modal-title">Choose your Stars amount</h2>
+      <p class="muted-count">Your wallet credit is calculated at <strong>${esc(method.usdt_per_star)} USDT per Star</strong>. Telegram confirms payment automatically.</p>
+      <label class="field-label">Stars to pay<input id="stars-amount" class="field-input" inputmode="numeric" type="number" min="5" max="100000" step="1" placeholder="For example, 100"></label>
+      <p class="soft-note">Use a whole number from 5 to 100,000. Your wallet is credited only after Telegram reports successful payment.</p>
+      <button class="primary-button wide-button" data-action="create-stars-deposit">Continue to Telegram checkout</button>
+      <button class="secondary-button wide-button" style="margin-top:8px" data-action="change-payment-method">Back to payment methods</button>`, "stars-amount");
+    $("#stars-amount")?.focus();
   }
 
   async function showDepositMethods() {
@@ -500,15 +512,31 @@
     stopDepositTimer();
     const payment = deposit.payment;
     const waiting = deposit.status === "waiting_hash" && Number(deposit.remaining_seconds) > 0 && !deposit.reference_submitted;
-    const expired = deposit.status === "waiting_hash" && !deposit.reference_submitted && !Number(deposit.remaining_seconds);
+    const expired = !deposit.reference_submitted && (deposit.status === "expired" || (deposit.status === "waiting_hash" && !Number(deposit.remaining_seconds)));
     const completed = deposit.status === "completed";
+    const isStars = deposit.network === "STARS";
+    const starsPending = isStars && deposit.status === "pending";
     const methodLabel = deposit.network_label || deposit.network;
+    const starsSummary = isStars ? `<div class="deposit-address"><small>Telegram Stars payment</small><code>${Number(deposit.stars_amount_paid || deposit.stars_amount || 0)} Stars · ${money(deposit.stars_wallet_credit || deposit.received_amount || deposit.amount)} wallet credit</code></div>` : "";
+    const paymentStatusText = isStars
+      ? completed ? `Telegram confirmed payment${deposit.received_amount && Number(deposit.received_amount) ? ` · ${money(deposit.received_amount)} USDT credited` : ""}.`
+        : starsPending ? "Telegram confirmed your payment. Wallet credit is processing; do not pay again."
+          : expired ? "This Stars invoice expired. Create a new deposit to continue."
+            : "Open Telegram checkout to finish this Stars payment."
+      : completed ? `Payment verified${deposit.received_amount && Number(deposit.received_amount) ? ` · ${money(deposit.received_amount)} USDT credited` : ""}.`
+        : deposit.reference_submitted ? "Your payment reference has been saved for verification. Check back here for the result."
+          : expired ? "This invoice expired. Create a new deposit to continue."
+            : "This deposit is being processed.";
+    const starsControls = waiting && isStars
+      ? `${payment?.invoice_url ? `<button class="primary-button wide-button" data-action="pay-stars" data-deposit-id="${Number(deposit.id)}" data-invoice-url="${esc(payment.invoice_url)}">⭐ Pay ${Number(deposit.stars_amount || 0)} Stars</button>` : `<p class="soft-note">Telegram checkout link is being prepared. Reopen this deposit in a moment.</p>`}<button class="secondary-button wide-button" style="margin-top:8px" data-action="change-payment-method">🔄 Switch payment method</button>`
+      : "";
     openModal(`<p class="eyebrow">${esc(deposit.icon || "💳")} DEPOSIT · #${Number(deposit.id)}</p><h2 class="page-title" id="modal-title">${esc(deposit.invoice || `Deposit #${deposit.id}`)}</h2>
       <div class="panel-card deposit-invoice-card">
         <div class="deposit-summary"><span>${esc(methodLabel)}</span><span class="status-pill ${esc(deposit.status)}">${expired ? "expired" : esc(String(deposit.status).replaceAll("_", " "))}</span></div>
+        ${starsSummary}
         ${waiting && payment?.address ? `<div class="deposit-address"><small>${deposit.network === "BINANCE" ? "Binance Pay ID" : deposit.network === "UPI" ? "UPI ID" : "Deposit address"}</small><code>${esc(payment.address)}</code><button class="text-button" data-copy="${esc(payment.address)}">Copy</button></div>` : ""}
-        <p class="soft-note">${esc(payment?.instructions || (completed ? `Payment verified${deposit.received_amount && Number(deposit.received_amount) ? ` · ${money(deposit.received_amount)} USDT credited` : ""}.` : deposit.reference_submitted ? "Your payment reference has been saved for verification. Check back here for the result." : expired ? "This invoice expired. Create a new deposit to continue." : "This deposit is being processed."))}</p>
-        ${waiting ? `<p class="invoice-timer">⏳ Invoice expires in <strong id="deposit-timer">—</strong></p><label class="field-label">${esc(deposit.reference_label)}<input id="deposit-reference" class="field-input" maxlength="255" autocomplete="off" placeholder="Enter your payment reference"></label><button class="primary-button wide-button" style="margin-top:12px" data-action="submit-deposit-reference" data-deposit-id="${Number(deposit.id)}">Submit for verification</button><button class="secondary-button wide-button" style="margin-top:8px" data-action="change-payment-method">🔄 Switch payment method</button>` : `<p class="invoice-timer">${completed ? "This deposit is complete." : deposit.reference_submitted ? "Your reference is saved. Revisit this deposit to check its status." : expired ? "The invoice is no longer accepting payment references." : `Status: ${esc(String(deposit.status).replaceAll("_", " "))}`}</p>${completed ? `<button class="primary-button wide-button" data-close-modal>Done</button>` : deposit.reference_submitted ? `<button class="primary-button wide-button" data-action="load-deposits">My deposits</button>` : `<button class="primary-button wide-button" data-action="open-deposit-methods">${expired ? "Create a new deposit" : "Switch payment method"}</button>`}`}
+        <p class="soft-note">${esc(payment?.instructions || paymentStatusText)}</p>
+        ${waiting ? `<p class="invoice-timer">⏳ Invoice expires in <strong id="deposit-timer">—</strong></p>${isStars ? starsControls : `<label class="field-label">${esc(deposit.reference_label)}<input id="deposit-reference" class="field-input" maxlength="255" autocomplete="off" placeholder="Enter your payment reference"></label><button class="primary-button wide-button" style="margin-top:12px" data-action="submit-deposit-reference" data-deposit-id="${Number(deposit.id)}">Submit for verification</button><button class="secondary-button wide-button" style="margin-top:8px" data-action="change-payment-method">🔄 Switch payment method</button>`}` : `<p class="invoice-timer">${completed ? "This deposit is complete." : deposit.reference_submitted ? "Your reference is saved. Revisit this deposit to check its status." : expired ? "The invoice is no longer accepting payment references." : `Status: ${esc(String(deposit.status).replaceAll("_", " "))}`}</p>${completed ? `<button class="primary-button wide-button" data-close-modal>Done</button>` : deposit.reference_submitted ? `<button class="primary-button wide-button" data-action="load-deposits">My deposits</button>` : `<button class="primary-button wide-button" data-action="open-deposit-methods">${expired ? "Create a new deposit" : "Switch payment method"}</button>`}`}
       </div><button class="secondary-button wide-button" data-action="load-deposits">My deposit history</button>`, "deposit");
     if (waiting) {
       const expiresAt = Date.now() + Number(deposit.remaining_seconds) * 1000;
@@ -532,15 +560,20 @@
     }
   }
 
-  async function beginDeposit(network) {
+  async function beginDeposit(network, starsAmount = null) {
     if (state.depositPending) return;
     state.depositPending = network;
     openDepositMethods(state.depositMethods);
     const request = state.modalGeneration;
     try {
-      const data = await api("/deposits", { method: "POST", body: JSON.stringify({ network }) });
+      const payload = { network };
+      if (network === "STARS") payload.stars_amount = starsAmount;
+      const data = await api("/deposits", { method: "POST", body: JSON.stringify(payload) });
       if (!data.deposit) throw new Error("Could not load the deposit invoice.");
-      if (state.modalGeneration === request) renderDeposit(data.deposit);
+      if (state.modalGeneration === request) {
+        renderDeposit(data.deposit);
+        if (network === "STARS" && data.deposit.payment?.invoice_url) openStarsCheckout(data.deposit);
+      }
       else toast("Deposit created. Find it in your deposit history.");
     } catch (error) {
       if (state.modalGeneration === request) toast(error.message);
@@ -548,6 +581,33 @@
       state.depositPending = null;
       if (state.modal === "deposit-methods") openDepositMethods(state.depositMethods);
     }
+  }
+
+  function openStarsCheckout(deposit) {
+    const url = deposit?.payment?.invoice_url;
+    if (!url) { toast("Telegram checkout is not available for this invoice."); return; }
+    if (!tg?.openInvoice) { toast("Open this Mini App in Telegram to pay with Stars."); return; }
+    tg.openInvoice(url, status => {
+      if (status === "paid") refreshStarsDeposit(Number(deposit.id));
+      else if (status === "pending") refreshStarsDeposit(Number(deposit.id));
+      else if (status === "failed") toast("Telegram could not complete this Stars payment.");
+    });
+  }
+
+  async function refreshStarsDeposit(id) {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      if (attempt) await new Promise(resolve => setTimeout(resolve, 1000));
+      try {
+        const data = await api(`/deposits/${id}`);
+        if (data.deposit?.status === "completed") {
+          if (state.modal === "deposit") renderDeposit(data.deposit);
+          toast("Telegram Stars payment confirmed. Wallet updated.");
+          return;
+        }
+        if (data.deposit && state.modal === "deposit") renderDeposit(data.deposit);
+      } catch {}
+    }
+    toast("Payment status is still updating. Check this deposit again shortly.");
   }
 
   async function showDeposit(id) {
@@ -771,7 +831,22 @@
     if (target.dataset.action === "confirm-checkout") { confirmCheckout(); return; }
     if (target.dataset.action === "check-orders") { closeModal(); setView("orders"); return; }
     if (target.dataset.action === "clear-cart") { clearCart(); return; }
-    if (target.dataset.depositNetwork) { beginDeposit(target.dataset.depositNetwork); return; }
+    if (target.dataset.depositNetwork) {
+      if (target.dataset.depositNetwork === "STARS") openStarsAmountForm();
+      else beginDeposit(target.dataset.depositNetwork);
+      return;
+    }
+    if (target.dataset.action === "create-stars-deposit") {
+      const input = $("#stars-amount");
+      const amount = Number(input?.value);
+      if (!Number.isSafeInteger(amount) || amount < 5 || amount > 100_000) { toast("Enter a whole Stars amount from 5 to 100,000."); input?.focus(); return; }
+      beginDeposit("STARS", amount);
+      return;
+    }
+    if (target.dataset.action === "pay-stars") {
+      openStarsCheckout({ id: Number(target.dataset.depositId), payment: { invoice_url: target.dataset.invoiceUrl } });
+      return;
+    }
     if (target.dataset.action === "full-product-details") { showFullProductDetails(target.dataset.productId); return; }
     if (target.dataset.depositDetail) { showDeposit(target.dataset.depositDetail); return; }
     if (target.dataset.depositPage !== undefined) { loadDepositsHistory(Number(target.dataset.depositPage)); return; }

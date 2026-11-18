@@ -115,6 +115,7 @@ async def _register_bot_commands(bot: Bot):
                 BotCommand(command="wallet", description="View your wallet and balance"),
                 BotCommand(command="orders", description="View your orders"),
                 BotCommand(command="profile", description="View your profile"),
+                BotCommand(command="paysupport", description="Get help with a payment"),
             ],
             scope=BotCommandScopeDefault(),
         )

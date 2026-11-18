@@ -42,6 +42,13 @@ def get_deposit_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="⭐ Telegram Stars",
+                    callback_data="deposit_stars",
+                    style="primary"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="🏷️ Redeem Promocode",
                     callback_data="deposit_promo",
                     style="success"

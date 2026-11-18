@@ -64,6 +64,17 @@ class Deposit(Base):
         nullable=True,
     )
 
+    # Telegram Stars top-ups are settled only from Telegram's
+    # successful_payment update. Keep the Stars quote and charge metadata
+    # alongside the existing wallet ledger entry for audit/reconciliation.
+    stars_amount_requested = Column(Integer, nullable=True)
+    stars_amount_paid = Column(Integer, nullable=True)
+    stars_usdt_per_star = Column(DECIMAL(20, 8), nullable=True)
+    stars_invoice_payload = Column(String(128), unique=True, nullable=True)
+    telegram_payment_charge_id = Column(String(255), unique=True, nullable=True)
+    stars_invoice_url = Column(String(2048), nullable=True)
+    stars_precheckout_at = Column(DateTime, nullable=True)
+
     network = Column(
         String(50)
     )

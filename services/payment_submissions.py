@@ -124,7 +124,8 @@ def credit_verified(db, original, amount, inr_amount=None, conversion_rate=None)
         return False
     db.refresh(wallet)
     from services.wallet_ledger import record_wallet
-    record_wallet(db,wallet,f'Deposit #{deposit.id} · {deposit.network}',before_balance)
+    ledger_method = 'Telegram Stars' if str(deposit.network or '').upper() == 'STARS' else deposit.network
+    record_wallet(db,wallet,f'Deposit #{deposit.id} · {ledger_method}',before_balance)
     deposit.amount = deposit.received_amount = amount
     deposit.status = 'completed'
     for name, value in extras.items():
@@ -145,16 +146,28 @@ def credit_verified(db, original, amount, inr_amount=None, conversion_rate=None)
         "POLYGON": "USDT Polygon",
         "BINANCE": "Binance Pay",
         "UPI": "UPI",
+        "STARS": "Telegram Stars",
     }.get(str(deposit.network or "").upper(), escape(str(deposit.network or "Unknown")))
     amount_text = f"${amount.quantize(Decimal('0.01')):.2f} USDT"
+    stars_paid_line = (
+        f"\n⭐ <b>Stars paid:</b> {int(deposit.stars_amount_paid)}"
+        if str(deposit.network or "").upper() == "STARS" and deposit.stars_amount_paid
+        else ""
+    )
+    payment_reference = (
+        "Telegram confirmed"
+        if str(deposit.network or "").upper() == "STARS"
+        else escape(str(deposit.tx_hash or '')[:18]) + "…"
+    )
     admin_body = (
         "💎 <b>New Deposit!</b>\n\n"
         f"🎉 <b>By:</b> {admin_name}\n"
         f"🆔 <b>Telegram ID:</b> <code>{wallet.telegram_id}</code>\n"
         f"💰 <b>Amount:</b> {amount_text}\n"
+        f"{stars_paid_line}"
         f"💳 <b>Method:</b> {network_label}\n"
         f"🧾 <b>Deposit:</b> <code>#{deposit.id}</code>\n"
-        f"🔑 <b>Reference:</b> <code>{escape(str(deposit.tx_hash or '')[:18])}…</code>"
+        f"🔑 <b>Reference:</b> <code>{payment_reference}</code>"
     )
     enqueue_admin(db, f"deposit-completed:{deposit.id}", admin_body)
 
@@ -163,6 +176,7 @@ def credit_verified(db, original, amount, inr_amount=None, conversion_rate=None)
             "💎 <b>New Deposit!</b>\n\n"
             f"🎉 <b>By:</b> {public_name}\n"
             f"💰 <b>Amount:</b> {amount_text}\n"
+            f"{stars_paid_line}"
             f"💳 <b>Method:</b> {network_label}"
         )
         enqueue(

@@ -24,6 +24,11 @@ MAINTENANCE_PASSWORD_HASH = os.getenv("MAINTENANCE_PASSWORD_HASH", "").strip() o
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
+# Wallet credit for Telegram Stars is operator-configured because the Stars
+# payout value and the shop's USDT balance are not a universal 1:1 conversion.
+# Leave blank to keep Stars visible as unavailable until a rate is configured.
+TELEGRAM_STARS_USDT_PER_STAR = os.getenv("TELEGRAM_STARS_USDT_PER_STAR", "").strip()
+
 # Manual reseller deliveries are sent by the Cloudflare delivery-bot webhook.
 # The delivery bot token is configured only as a Cloudflare Worker secret.
 DELIVERY_BRIDGE_URL = os.getenv("DELIVERY_BRIDGE_URL", "").strip().rstrip("/")

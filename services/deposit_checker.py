@@ -3044,7 +3044,9 @@ async def check_pending_deposits(bot=None):
 
     try:
 
-        query = db.query(Deposit.id, Deposit.network).filter(Deposit.status == "pending")
+        query = db.query(Deposit.id, Deposit.network).filter(
+            Deposit.status == "pending", Deposit.network != "STARS"
+        )
         if _pending_deposit_scan_ceiling is None:
             _pending_deposit_scan_ceiling = int(
                 query.with_entities(func.max(Deposit.id)).scalar() or 0
@@ -3200,6 +3202,15 @@ async def deposit_checker_loop(bot=None):
     while True:
 
         try:
+
+            # Telegram Stars are settled by successful_payment, not by a
+            # chain lookup. Retry only wallet credits already bound to a
+            # verified Telegram charge.
+            from services.stars_payments import reconcile_pending_stars
+            try:
+                await asyncio.to_thread(reconcile_pending_stars)
+            except Exception:
+                logger.exception("Telegram Stars reconciliation pass failed")
 
             await check_pending_deposits(bot)
 

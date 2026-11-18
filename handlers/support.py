@@ -3,6 +3,7 @@ from datetime import datetime
 from html import escape
 
 from aiogram import Router, F
+from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
     Message,
@@ -24,6 +25,24 @@ router = Router()
 
 # Store only the Telegram username, without @ or a t.me URL.
 CONTACT_USERNAME = "Raindrop7707"
+
+
+@router.message(Command("paysupport"))
+async def payment_support_command(message: Message):
+    """Telegram's required payment-support entry point for Stars receipts."""
+    await answer_card(
+        message,
+        "💳 <b>Payment support</b>\n\n"
+        "If a Telegram Stars payment is missing, duplicated, or needs review, "
+        "open a support ticket and include the deposit number from My Deposits. "
+        "Never send your Telegram password or login code.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎫 Contact RainDeals support", callback_data="support_ticket")],
+            [InlineKeyboardButton(text="📜 My Deposits", callback_data="my_deposits")],
+            [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")],
+        ]),
+    )
 
 
 # =====================================================

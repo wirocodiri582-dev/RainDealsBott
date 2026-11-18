@@ -27,6 +27,10 @@ def _format_value(value, places: str) -> str:
 
 
 def _admin_deposit_amount(deposit) -> str:
+    if (deposit.network or "").upper() == "STARS":
+        paid = f"⭐ {int(deposit.stars_amount_paid or deposit.stars_amount_requested or 0)} Stars"
+        credited = _format_value(deposit.received_amount or deposit.invoice_usdt_amount or deposit.amount, "0.00000001")
+        return f"{paid} → ${credited} USDT"
     if (deposit.network or "").upper() == "UPI" and deposit.status == "completed":
         credited = _format_value(deposit.received_amount or deposit.amount, "0.001")
         if deposit.inr_amount is not None:
@@ -230,10 +234,10 @@ async def deposit_info(
 {_admin_deposit_amount(deposit)}
 
 🌐 Network:
-{deposit.network}
+{"Telegram Stars" if (deposit.network or "").upper() == "STARS" else deposit.network}
 
 🔗 TXID:
-<code>{deposit.tx_hash or "Not Submitted"}</code>
+<code>{"Telegram confirmed" if (deposit.network or "").upper() == "STARS" and deposit.telegram_payment_charge_id else deposit.tx_hash or "Not Submitted"}</code>
 
 📄 Status:
 {deposit.status}

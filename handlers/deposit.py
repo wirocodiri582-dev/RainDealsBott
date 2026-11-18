@@ -85,6 +85,14 @@ NETWORK_CONFIG = {
         "currency": "INR",
         "symbol": "₹",
     },
+    "STARS": {
+        "icon": "⭐",
+        "label": "Telegram Stars",
+        "description": "Pay securely with Telegram Stars",
+        "style": "primary",
+        "currency": "XTR",
+        "symbol": "⭐",
+    },
     "PROMO": {
         "icon": "🏷️",
         "label": "Promocode",
@@ -408,7 +416,9 @@ def _build_deposit_card(deposit, index: int) -> str:
     created_str = _format_dt(deposit.created_at if hasattr(deposit, 'created_at') else None)
 
     tx_display = "N/A"
-    if deposit.tx_hash:
+    if (deposit.network or "").upper() == "STARS" and deposit.telegram_payment_charge_id:
+        tx_display = "Telegram payment confirmed"
+    elif deposit.tx_hash:
         if deposit.tx_hash.startswith("PROMO_"):
             tx_display = f"🎫 {deposit.tx_hash[6:]}"
         elif len(deposit.tx_hash) > 20:
@@ -417,7 +427,17 @@ def _build_deposit_card(deposit, index: int) -> str:
             tx_display = deposit.tx_hash
 
     amount_lines = []
-    if (deposit.network or "").upper() == "UPI" and deposit.status == "completed":
+    if (deposit.network or "").upper() == "STARS":
+        if deposit.status == "waiting_hash":
+            status_label = "Awaiting Stars payment"
+        elif deposit.status == "pending" and deposit.telegram_payment_charge_id:
+            status_label = "Payment received · wallet credit processing"
+        if deposit.stars_amount_paid:
+            amount_lines.append(f"├─ ⭐ <b>Paid:</b> {int(deposit.stars_amount_paid)} Stars")
+        elif deposit.stars_amount_requested:
+            amount_lines.append(f"├─ ⭐ <b>Invoice:</b> {int(deposit.stars_amount_requested)} Stars")
+        amount_lines.append(f"├─ 💰 <b>Wallet credit:</b> {_format_usdt(deposit.received_amount or deposit.invoice_usdt_amount or deposit.amount)}")
+    elif (deposit.network or "").upper() == "UPI" and deposit.status == "completed":
         # New records retain both values. Older UPI deposits only have the
         # converted USDT amount, so do not incorrectly label it as INR.
         if deposit.inr_amount is not None:
@@ -649,6 +669,198 @@ async def deposit_menu(callback: CallbackQuery, state: FSMContext):
             "button_timing button=deposit user_id=%s total_ms=%.1f",
             callback.from_user.id,
             (time.perf_counter() - started) * 1000,
+        )
+
+
+@router.callback_query(F.data == "deposit_stars")
+async def start_stars_deposit(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    from services.stars_payments import stars_rate
+
+    rate = stars_rate()
+    if rate is None:
+        await show(
+            callback,
+            "⭐ <b>Telegram Stars is not configured yet</b>\n\n"
+            "The administrator must set <code>TELEGRAM_STARS_USDT_PER_STAR</code> "
+            "on the bot host before Stars top-ups can be accepted.",
+            parse_mode="HTML",
+            reply_markup=_back_to_menu_kb(),
+        )
+        return
+
+    await state.set_state(DepositState.waiting_stars_amount)
+    await show(
+        callback,
+        "⭐ <b>PAY WITH TELEGRAM STARS</b>\n\n"
+        f"Wallet credit rate: <b>{_format_usdt(rate)} per Star</b>\n"
+        "Enter the number of Stars to pay as a whole number. Telegram will "
+        "confirm the payment automatically; do not send a transaction hash.\n\n"
+        f"Minimum: <b>5 Stars</b> · Maximum: <b>100,000 Stars</b>\n"
+        "Type <code>CANCEL</code> to go back.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="↩️ Back to payment methods", callback_data="deposit_start")
+        ]]),
+        state=state,
+    )
+
+
+@router.message(DepositState.waiting_stars_amount)
+async def process_stars_amount(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if is_cancel(raw):
+        await update_card(
+            message, state, "❌ <b>Stars top-up cancelled.</b>",
+            parse_mode="HTML", reply_markup=_back_to_menu_kb(),
+        )
+        await state.clear()
+        return
+    if not re.fullmatch(r"\d{1,6}", raw) or not 5 <= int(raw) <= 100_000:
+        await update_card(
+            message, state,
+            "⚠️ Enter a whole number from <b>5 to 100,000 Stars</b>, for example <code>100</code>. "
+            "Type <code>CANCEL</code> to go back.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="↩️ Back to payment methods", callback_data="deposit_start")
+            ]]),
+        )
+        return
+
+    try:
+        from services.stars_payments import (
+            StarsPaymentError, create_stars_invoice, create_stars_invoice_link,
+            save_stars_invoice_message,
+        )
+        stars_amount = int(raw)
+        invoice = await asyncio.to_thread(create_stars_invoice, message.from_user.id, stars_amount)
+        invoice["telegram_id"] = int(message.from_user.id)
+        invoice_url = await create_stars_invoice_link(message.bot, invoice)
+        expires = datetime.fromisoformat(invoice["expires_at"])
+        remaining = max(0, int((expires - datetime.utcnow()).total_seconds()))
+        mins, secs = divmod(remaining, 60)
+        credit = _format_usdt(invoice["usdt_credit"])
+        body = (
+            f"⭐ <b>TELEGRAM STARS · DEPOSIT #{invoice['id']}</b>\n"
+            f"🧾 Invoice: <code>{escape(invoice['invoice'])}</code>\n"
+            f"⭐ Stars to pay: <b>{int(invoice['stars_amount'])}</b>\n"
+            f"💰 Wallet credit: <b>{credit}</b>\n"
+            f"⏳ Expires in: <b>{mins}:{secs:02d}</b>\n\n"
+            "Tap the payment button and complete checkout in Telegram. "
+            "Your wallet is credited only after Telegram confirms the payment."
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⭐ Pay {int(invoice['stars_amount'])} Stars", url=invoice_url)],
+            [InlineKeyboardButton(text="📜 My Deposits", callback_data="my_deposits")],
+            [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")],
+        ])
+        card = await answer_card(message, body, state=state, parse_mode="HTML", reply_markup=markup)
+        if card:
+            await asyncio.to_thread(
+                save_stars_invoice_message,
+                invoice["id"], message.from_user.id, card.chat.id, card.message_id,
+            )
+        await state.clear()
+    except Exception as exc:
+        from services.stars_payments import StarsPaymentError
+        if isinstance(exc, StarsPaymentError):
+            user_message = str(exc)
+        else:
+            logger.exception("Could not create Stars invoice for user %s", message.from_user.id)
+            user_message = "Could not prepare the Stars invoice. Your wallet was not charged. Please try again."
+        await update_card(
+            message, state, f"⚠️ {escape(user_message)}",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="↩️ Payment methods", callback_data="deposit_start")
+            ]]),
+        )
+
+
+@router.pre_checkout_query()
+async def validate_stars_precheckout(query):
+    """Answer Telegram's checkout authorization promptly; never credit here."""
+    try:
+        from services.stars_payments import validate_precheckout
+        ok, reason = await asyncio.wait_for(asyncio.to_thread(
+            validate_precheckout,
+            query.from_user.id,
+            query.invoice_payload,
+            query.currency,
+            query.total_amount,
+        ), timeout=7.0)
+    except Exception:
+        logger.exception("Stars pre-checkout handler failed for user %s", query.from_user.id)
+        ok, reason = False, "Payment verification is temporarily unavailable. Please try again."
+    if ok:
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message=reason[:200])
+
+
+@router.message(F.successful_payment)
+async def complete_stars_payment(message: Message):
+    """Credit only from Telegram's authoritative successful_payment update."""
+    payment = message.successful_payment
+    if not payment:
+        return
+    from services.stars_payments import record_successful_payment
+    result = "retry"
+    for attempt in range(5):
+        result = await asyncio.to_thread(
+            record_successful_payment,
+            message.from_user.id,
+            payment.invoice_payload,
+            payment.currency,
+            payment.total_amount,
+            payment.telegram_payment_charge_id,
+        )
+        if result != "retry":
+            break
+        if attempt < 4:
+            await asyncio.sleep(0.5 * (2 ** attempt))
+    if result == "retry":
+        logger.error(
+            "Could not durably record Telegram Stars payment after retries; "
+            "leaving update retryable user_id=%s",
+            message.from_user.id,
+        )
+        # The Cloudflare Telegram bridge returns a retryable HTTP error when
+        # dispatch raises. Never acknowledge a charge without durable storage.
+        raise RuntimeError("Telegram Stars charge could not be durably recorded")
+    if result == "already_credited":
+        return
+    if result == "credited":
+        await message.answer(
+            "✅ <b>Telegram Stars payment confirmed</b>\n\n"
+            f"⭐ Paid: <b>{int(payment.total_amount)} Stars</b>\n"
+            "💰 Your RainDeals wallet has been credited. Open Profile or Balance to see the updated amount.",
+            parse_mode="HTML",
+        )
+        return
+    if result == "credit_pending":
+        await message.answer(
+            "✅ Telegram confirmed your Stars payment. Wallet credit is being reconciled; "
+            "please do not pay again. Check your deposit history shortly.",
+        )
+        return
+
+    try:
+        refunded = await message.bot.refund_star_payment(
+            user_id=message.from_user.id,
+            telegram_payment_charge_id=payment.telegram_payment_charge_id,
+        )
+    except Exception:
+        refunded = False
+        logger.exception("Could not refund unmatched Telegram Stars charge for user %s", message.from_user.id)
+    if refunded:
+        await message.answer(
+            "⚠️ This Stars payment could not be matched to an active RainDeals invoice, "
+            "so Telegram has been asked to refund it. Check your Stars balance shortly.",
+        )
+    else:
+        await message.answer(
+            "⚠️ Telegram received your Stars payment, but automatic matching needs admin review. "
+            "Please do not pay again; support has been alerted.",
         )
 
 
@@ -1042,6 +1254,7 @@ def _create_invoice(telegram_id: int, amount_usdt: Decimal, network: str) -> dic
 
         active = (db.query(Deposit)
                   .filter(Deposit.telegram_id == telegram_id,
+                          Deposit.network != "STARS",
                           Deposit.status.in_(["waiting_hash", "pending"]),
                           Deposit.tx_hash.is_(None),
                           Deposit.invoice_expires_at > datetime.utcnow())
@@ -1087,6 +1300,7 @@ def _active_invoice(telegram_id: int) -> dict | None:
     try:
         deposit = (db.query(Deposit)
                    .filter(Deposit.telegram_id == telegram_id,
+                           Deposit.network != "STARS",
                            Deposit.status.in_(["waiting_hash", "pending"]),
                            Deposit.tx_hash.is_(None),
                            Deposit.invoice_expires_at > datetime.utcnow())
