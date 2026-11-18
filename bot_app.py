@@ -53,6 +53,7 @@ from handlers.admin_orders import router as admin_orders_router
 from handlers.admin_deposits import router as admin_deposits_router
 from handlers.admin_support import router as admin_support_router
 from handlers.admin_promo import router as admin_promo_router
+from handlers.admin_promotions import router as admin_promotions_router
 
 
 # ============================================================
@@ -238,6 +239,10 @@ logger.info(
 
 dp.include_router(
     admin_router
+)
+
+dp.include_router(
+    admin_promotions_router
 )
 
 dp.include_router(

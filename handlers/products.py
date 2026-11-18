@@ -1214,13 +1214,13 @@ def _catalog_snapshot(products: list[Product]) -> list[Product]:
         accounts = account_lines(product.file_content)
         product._catalog_account_count = len(accounts)
         product._catalog_reusable_content_present = bool(str(product.reusable_delivery or "").strip())
+        product._catalog_description = str(product.description or "")[:1200]
         product.file_content = None
         product.reusable_delivery = None
         # These large or sensitive fields are loaded only for the detail or
         # checkout path, never retained in the shared browse cache.
         product.description = None
         product.delivery_instruction = None
-        product.required_info = None
         product.reseller_cost = None
         product.aftercare_policy = None
         product.warranty_days = 0

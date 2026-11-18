@@ -95,9 +95,50 @@ def _queue_order(order, channel_id, bot_id):
         stored = db.query(Order).filter(Order.id == order['id']).with_for_update().first()
         if not stored or stored.admin_notification_sent_at or stored.admin_notification_queued_at:
             return
-        enqueue(db, f"admin-order:{order['id']}", channel_id, _format_order(order), bot_id,
-                source_order_id=order['id'])
-        stored.admin_notification_queued_at = datetime.utcnow()
+        _enqueue_order_record(db, stored, channel_id, bot_id)
+
+
+def _order_payload(row) -> dict:
+    return {
+        "id": row.id,
+        "telegram_id": row.telegram_id,
+        "product_name": row.product_name,
+        "quantity": row.quantity,
+        "amount": row.amount,
+        "status": row.status,
+        "delivery_type": row.delivery_type,
+        "is_preorder": row.is_preorder,
+        "created_at": row.created_at,
+    }
+
+
+def _enqueue_order_record(db, order, channel_id, bot_id):
+    payload = _order_payload(order)
+    enqueue(db, f"admin-order:{order.id}", channel_id, _format_order(payload), bot_id,
+            source_order_id=order.id)
+    order.admin_notification_queued_at = datetime.utcnow()
+
+
+def queue_order_notification(order_id: int, bot_id: int | None = None) -> bool:
+    """Durably queue one newly created order for Admin Notify.
+
+    Mini App checkout calls this immediately after its cart result is saved.
+    The polling loop remains the recovery path if the request cannot enqueue.
+    The order lock and unique outbox event make both paths idempotent.
+    """
+    channel_id = admin_destination()
+    if not channel_id:
+        logger.warning("Admin order alert skipped: no Admin Notify destination configured")
+        return False
+
+    with transaction() as db:
+        order = db.query(Order).filter(Order.id == int(order_id)).with_for_update().first()
+        if not order:
+            return False
+        if order.admin_notification_sent_at or order.admin_notification_queued_at:
+            return True
+        _enqueue_order_record(db, order, channel_id, bot_id)
+    return True
 
 
 def _format_order(order: dict) -> str:

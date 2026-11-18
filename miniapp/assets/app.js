@@ -4,9 +4,10 @@
     initData: tg?.initData || "", profile: null, products: [], freebies: false,
     category: "All", search: "", stockOnly: false, sort: "featured", cart: { items: [] },
     unread: 0, botUsername: "", depositMethods: [], currentProductId: null, buyerInfoDraft: {},
-    currentView: "store", cartPending: new Map(), productDetails: new Map(),
+    currentView: "store", cartPending: new Map(), pendingAdds: new Set(), productDetails: new Map(),
     productsRequest: 0, productRequest: 0, catalogLoadedAt: 0, productsRequests: new Map(), cartReady: false, modal: null,
-    notificationPage: 0, depositTimer: null,
+    notificationPage: 0, depositTimer: null, checkoutPending: false, checkoutUncertain: false, clearCartPending: false,
+    depositPending: null, profileLoadedAt: 0, profileRequest: null, modalGeneration: 0,
     cartLoadPromise: null,
   };
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -38,7 +39,11 @@
       },
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(detailText(data));
+    if (!response.ok) {
+      const error = new Error(detailText(data));
+      error.status = response.status;
+      throw error;
+    }
     return data;
   }
 
@@ -64,7 +69,7 @@
       if (name === "store" && !state.modal) tg.BackButton.hide(); else tg.BackButton.show();
     }
     if (name === "balance") loadBalance();
-    if (name === "profile") renderProfile();
+    if (name === "profile") { renderProfile(); loadProfile(); }
     if (name === "orders") loadOrders();
     if (name === "notifications") loadNotifications(0);
     if (name === "store" && state.catalogLoadedAt && Date.now() - state.catalogLoadedAt > 90_000) {
@@ -93,6 +98,7 @@
       state.cartReady = true;
       syncHeader();
       if (state.modal === "cart") renderCart(false);
+      flushPendingAdds();
       return data;
     }).finally(() => { state.cartLoadPromise = null; });
     return state.cartLoadPromise;
@@ -214,13 +220,14 @@
         <div class="product-info">
           <div class="product-category">${product.freebie_referrals_required ? `🔒 ${Number(product.verified_referrals || 0)}/${Number(product.freebie_referrals_required)} verified` : esc(product.category)}</div>
           <h3 class="product-name">${esc(product.name)}</h3>
-          <div class="product-foot"><div class="product-price">${money(product.price)} <small>USDT</small></div><button class="add-button" data-add="${product.id}" aria-label="Add ${esc(product.name)} to cart" ${!product.purchasable ? "disabled" : ""}>+</button></div>
+          <div class="product-foot"><div class="product-price">${money(product.price)} <small>USDT</small></div><button class="add-button" data-add="${product.id}" aria-label="Add ${esc(product.name)} to cart" ${!product.purchasable || state.pendingAdds.has(Number(product.id)) || state.cartPending.has(Number(product.id)) ? "disabled" : ""}>${state.pendingAdds.has(Number(product.id)) || state.cartPending.has(Number(product.id)) ? "…" : "+"}</button></div>
         </div>
       </article>`).join("");
     $("#empty-state").classList.toggle("hidden", items.length > 0);
   }
 
   function openModal(content, kind) {
+    state.modalGeneration += 1;
     if (state.modal === "deposit" && kind !== "deposit") stopDepositTimer();
     state.modal = kind;
     $("#modal-content").innerHTML = content;
@@ -229,6 +236,7 @@
   }
 
   function closeModal() {
+    state.modalGeneration += 1;
     $("#modal").classList.add("hidden");
     state.productRequest += 1;
     stopDepositTimer();
@@ -243,6 +251,7 @@
 
   function productSheet(product) {
     const unsupported = productInputWarning(product);
+    const adding = state.pendingAdds.has(Number(product.id));
     const gatedFreebie = Number(product.freebie_referrals_required || 0) > 0;
     const gateLocked = gatedFreebie && !product.freebie_unlocked;
     const gateCopy = gateLocked
@@ -260,7 +269,7 @@
       ${gatedFreebie ? `<div class="soft-note" style="margin:12px 0">🔐 ${esc(gateCopy)}</div>` : ""}
       ${(product.required_info || []).map(field => `<div class="soft-note">Before checkout: ${esc(field.label)} (${esc(field.type)})</div>`).join("")}
       ${product.preorder ? `<div class="soft-note" style="margin:12px 0">This item is currently out of stock. Your order will be queued for manual fulfillment when accepted.</div>` : ""}
-      ${gateLocked ? `<button class="primary-button wide-button" data-action="share-referral" ${state.profile?.referral_link ? "" : "disabled"}>🤝 Invite friends to unlock</button>` : unsupported ? `<div class="soft-note" style="margin:12px 0">This item needs a photo or Telegram contact. Open the bot to complete that secure form.</div><button class="primary-button wide-button" data-action="open-bot">Continue in Telegram</button>` : `<button class="primary-button wide-button" data-action="add-product" data-id="${product.id}" ${!product.purchasable ? "disabled" : ""}>${product.preorder ? "Add preorder to cart" : "Add to cart"}</button>`}
+      ${gateLocked ? `<button class="primary-button wide-button" data-action="share-referral" ${state.profile?.referral_link ? "" : "disabled"}>🤝 Invite friends to unlock</button>` : unsupported ? `<div class="soft-note" style="margin:12px 0">This item needs a photo or Telegram contact. Open the bot to complete that secure form.</div><button class="primary-button wide-button" data-action="open-bot">Continue in Telegram</button>` : `<button class="primary-button wide-button" data-action="add-product" data-id="${product.id}" ${!product.purchasable || adding ? "disabled" : ""}>${adding ? "Adding to cart…" : product.preorder ? "Add preorder to cart" : "Add to cart"}</button>`}
       <button class="secondary-button wide-button" style="margin-top:8px" data-close-modal>Keep browsing</button>
     `, "product");
   }
@@ -336,6 +345,7 @@
           toast(error.message);
         } finally {
           syncHeader();
+          syncProductAddButtons();
           if (["cart", "cart-review"].includes(state.modal)) renderCart(state.modal === "cart-review");
         }
       })();
@@ -344,26 +354,60 @@
     }
     state.cart = applyLocalCartQuantity(state.cart, id, nextQuantity);
     syncHeader();
+    syncProductAddButtons();
     if (["cart", "cart-review"].includes(state.modal)) renderCart(state.modal === "cart-review");
     return task.promise;
   }
 
   function addProduct(productId) {
     if (!state.cartReady) {
-      toast("Loading your cart…");
-      loadCart().then(() => addProduct(productId)).catch(error => toast(error.message));
+      const id = Number(productId);
+      if (state.pendingAdds.has(id)) return;
+      state.pendingAdds.add(id);
+      const product = state.products.find(row => row.id === id);
+      if (product && state.modal === "product") productSheet(product);
+      else renderStore();
+      toast("Adding as soon as your cart is ready…");
+      loadCart().catch(error => {
+        state.pendingAdds.delete(id);
+        const latest = state.products.find(row => row.id === id);
+        if (latest && state.modal === "product") productSheet(latest);
+        else renderStore();
+        toast(error.message);
+      });
       return;
     }
-    const product = state.products.find(row => row.id === Number(productId));
-    const current = state.cart.items.find(row => row.product_id === Number(productId))?.quantity || 0;
+    const id = Number(productId);
+    if (state.cartPending.has(id)) return;
+    const product = state.products.find(row => row.id === id);
+    const current = state.cart.items.find(row => row.product_id === id)?.quantity || 0;
     const desired = current + 1;
     if (product && desired > product.sellable_stock) {
       toast(`Only ${product.sellable_stock} units are currently available.`);
       return;
     }
-    changeCart(productId, desired);
+    changeCart(id, desired);
+    syncProductAddButtons();
     closeModal();
     toast("Added to your RainDeals cart");
+  }
+
+  function flushPendingAdds() {
+    if (!state.cartReady || !state.pendingAdds.size) return;
+    const queued = [...state.pendingAdds];
+    state.pendingAdds.clear();
+    if (state.currentView === "store" && state.modal !== "product") renderStore();
+    for (const id of queued) addProduct(id);
+  }
+
+  function syncProductAddButtons() {
+    $$('[data-add]').forEach(button => {
+      const id = Number(button.dataset.add);
+      const product = state.products.find(row => row.id === id);
+      const pending = state.pendingAdds.has(id) || state.cartPending.has(id);
+      button.disabled = !product?.purchasable || pending;
+      button.textContent = pending ? "…" : "+";
+    });
   }
 
   function renderCart(review = false) {
@@ -392,16 +436,19 @@
       </div>`;
     }).join("") : `<div class="empty-state"><span>🛍️</span><strong>Your cart is empty</strong><p>Browse the RainDeals shop and add a product.</p></div>`;
     const updating = state.cartPending.size > 0;
-    const confirmBlock = review ? `
-      <div class="soft-note">You’re about to spend <b>${money(total)} USDT</b> from your RainDeals balance. Each item is placed as its own order. Check My Orders if a supplier result is unclear.</div>
-      <button class="primary-button wide-button" style="margin-top:12px" data-action="confirm-checkout" ${hasIssue || unsupported || updating ? "disabled" : ""}>Confirm &amp; pay ${money(total)}</button>
+    const confirmBlock = review ? (state.checkoutUncertain ? `
+      <div class="soft-note">We could not confirm the last checkout response. Check My Orders before placing this cart again.</div>
+      <button class="primary-button wide-button" style="margin-top:12px" data-action="check-orders">Check My Orders</button>
       <button class="secondary-button wide-button" style="margin-top:8px" data-action="cart-review-cancel">Back to cart</button>` : `
+      <div class="soft-note">You’re about to spend <b>${money(total)} USDT</b> from your RainDeals balance. Each item is placed as its own order. Check My Orders if a supplier result is unclear.</div>
+      <button class="primary-button wide-button" style="margin-top:12px" data-action="confirm-checkout" ${state.checkoutPending || hasIssue || unsupported || updating ? "disabled" : ""}>${state.checkoutPending ? "Placing your order…" : `Confirm &amp; pay ${money(total)}`}</button>
+      <button class="secondary-button wide-button" style="margin-top:8px" data-action="cart-review-cancel">Back to cart</button>`) : `
       <button class="primary-button wide-button" data-action="review-checkout" ${!lines.length || hasIssue || unsupported || updating ? "disabled" : ""}>${updating ? "Updating cart…" : "Review checkout"}</button>`;
     openModal(`
       <p class="eyebrow">YOUR RAINDEALS BAG</p><h2 class="page-title" id="modal-title">Shopping cart</h2>
       ${lines.length ? `<p class="muted-count">Prices and available stock are rechecked before checkout.</p>` : ""}
       <div class="cart-list">${lineHtml}</div>
-      ${lines.length ? `<div class="cart-total"><span>Total${updating ? " · updating" : ""}</span><strong>${updating ? "Updating…" : `${money(total)} USDT`}</strong></div>${hasIssue ? `<div class="soft-note">Fix unavailable cart items before checkout.</div>` : ""}${unsupported ? `<button class="secondary-button wide-button" data-action="open-bot">Complete photo/contact details in Telegram</button>` : confirmBlock}<button class="secondary-button wide-button" style="margin-top:8px" data-action="clear-cart" ${!lines.length || updating ? "disabled" : ""}>Clear cart</button>` : `<button class="primary-button wide-button" data-action="keep-shopping">Browse products</button>`}
+      ${lines.length ? `<div class="cart-total"><span>Total${updating ? " · updating" : ""}</span><strong>${updating ? "Updating…" : `${money(total)} USDT`}</strong></div>${hasIssue ? `<div class="soft-note">Fix unavailable cart items before checkout.</div>` : ""}${unsupported ? `<button class="secondary-button wide-button" data-action="open-bot">Complete photo/contact details in Telegram</button>` : confirmBlock}<button class="secondary-button wide-button" style="margin-top:8px" data-action="clear-cart" ${!lines.length || updating || state.clearCartPending ? "disabled" : ""}>${state.clearCartPending ? "Clearing cart…" : "Clear cart"}</button>` : `<button class="primary-button wide-button" data-action="keep-shopping">Browse products</button>`}
     `, review ? "cart-review" : "cart");
   }
 
@@ -433,7 +480,7 @@
     const rows = methods || [];
     openModal(`<p class="eyebrow">ADD FUNDS</p><h2 class="page-title" id="modal-title">Choose a payment method</h2>
       <p class="muted-count">Choose how you want to pay. Your verified payment amount is credited to your wallet.</p>
-      <div class="payment-method-list">${rows.map(row => `<button class="payment-method-card ${row.configured ? "" : "disabled"}" data-deposit-network="${esc(row.network)}" ${row.configured ? "" : "disabled"}><span>${esc(row.icon)}</span><span><strong>${esc(row.label)}</strong><small>${row.configured ? `Submit ${esc(row.reference_label)} after paying` : "Temporarily unavailable"}</small></span><b>${row.configured ? "›" : "—"}</b></button>`).join("")}</div>
+      <div class="payment-method-list">${rows.map(row => `<button class="payment-method-card ${row.configured && !state.depositPending ? "" : "disabled"}" data-deposit-network="${esc(row.network)}" ${row.configured && !state.depositPending ? "" : "disabled"}><span>${esc(row.icon)}</span><span><strong>${esc(row.label)}</strong><small>${state.depositPending ? "Creating your invoice…" : row.configured ? `Submit ${esc(row.reference_label)} after paying` : "Temporarily unavailable"}</small></span><b>${row.configured ? "›" : "—"}</b></button>`).join("")}</div>
       <button class="secondary-button wide-button" data-action="load-deposits">View deposit history</button>`, "deposit-methods");
   }
 
@@ -486,16 +533,32 @@
   }
 
   async function beginDeposit(network) {
+    if (state.depositPending) return;
+    state.depositPending = network;
+    openDepositMethods(state.depositMethods);
+    const request = state.modalGeneration;
     try {
       const data = await api("/deposits", { method: "POST", body: JSON.stringify({ network }) });
       if (!data.deposit) throw new Error("Could not load the deposit invoice.");
-      renderDeposit(data.deposit);
-    } catch (error) { toast(error.message); }
+      if (state.modalGeneration === request) renderDeposit(data.deposit);
+      else toast("Deposit created. Find it in your deposit history.");
+    } catch (error) {
+      if (state.modalGeneration === request) toast(error.message);
+    } finally {
+      state.depositPending = null;
+      if (state.modal === "deposit-methods") openDepositMethods(state.depositMethods);
+    }
   }
 
   async function showDeposit(id) {
-    try { const data = await api(`/deposits/${Number(id)}`); renderDeposit(data.deposit); }
-    catch (error) { toast(error.message); }
+    openModal(`<p class="eyebrow">DEPOSIT</p><h2 class="page-title" id="modal-title">Loading deposit…</h2><div class="loading"><span class="spinner"></span><p>Getting the latest payment status…</p></div>`, "deposit");
+    const request = state.modalGeneration;
+    try {
+      const data = await api(`/deposits/${Number(id)}`);
+      if (state.modalGeneration === request) renderDeposit(data.deposit);
+    } catch (error) {
+      if (state.modalGeneration === request) openModal(`<h2 class="page-title" id="modal-title">Deposit unavailable</h2><p class="soft-note">${esc(error.message)}</p>`, "deposit");
+    }
   }
 
   async function submitDepositReference(id) {
@@ -503,18 +566,23 @@
     const button = $('[data-action="submit-deposit-reference"]');
     const reference = input?.value.trim();
     if (!reference) { toast("Enter your payment reference first."); input?.focus(); return; }
+    const request = state.modalGeneration;
     button.disabled = true;
     button.textContent = "Saving reference…";
     try {
       const result = await api(`/deposits/${Number(id)}/reference`, {
         method: "POST", body: JSON.stringify({ reference }),
       });
-      toast(result.message || "Reference saved for verification.");
-      await showDeposit(id);
-      loadBalance();
+      if (state.modalGeneration === request) {
+        toast(result.message || "Reference saved for verification.");
+        await showDeposit(id);
+        loadBalance();
+      }
     } catch (error) {
-      toast(error.message);
-      if (button) { button.disabled = false; button.textContent = "Submit for verification"; }
+      if (state.modalGeneration === request) {
+        toast(error.message);
+        if (button?.isConnected) { button.disabled = false; button.textContent = "Submit for verification"; }
+      }
     }
   }
 
@@ -547,12 +615,13 @@
     const code = $("#promocode-input")?.value.trim();
     if (!code) { toast("Enter a promocode first."); return; }
     button.disabled = true;
+    button.textContent = "Checking code…";
     try {
       const result = await api("/promocodes/redeem", { method: "POST", body: JSON.stringify({ code }) });
       if (state.profile) state.profile.balance = result.balance;
       closeModal(); syncHeader(); toast(`Code redeemed · ${money(result.amount)} USDT added`); loadBalance();
     } catch (error) { toast(error.message); }
-    finally { if (button) button.disabled = false; }
+    finally { if (button?.isConnected) { button.disabled = false; button.textContent = "Redeem code"; } }
   }
 
   function renderProfile() {
@@ -570,20 +639,39 @@
       <button class="secondary-button wide-button" data-action="open-bot">Support &amp; account help in Telegram</button>`;
   }
 
+  function loadProfile(force = false) {
+    if (state.profileRequest) return state.profileRequest;
+    if (!force && state.profileLoadedAt && Date.now() - state.profileLoadedAt < 30_000) return Promise.resolve(state.profile);
+    state.profileRequest = api("/profile").then(profile => {
+      state.profile = { ...state.profile, ...profile };
+      state.profileLoadedAt = Date.now();
+      if (state.currentView === "profile") renderProfile();
+      syncHeader();
+      return state.profile;
+    }).catch(error => {
+      if (state.currentView === "profile") toast(error.message);
+      return state.profile;
+    }).finally(() => { state.profileRequest = null; });
+    return state.profileRequest;
+  }
+
   async function loadOrders() {
     const view = $("#orders-view");
     view.innerHTML = `<p class="eyebrow">YOUR PURCHASES</p><h1 class="page-title">My orders</h1><div class="loading"><span class="spinner"></span><p>Loading orders…</p></div>`;
     try {
       const data = await api("/orders");
+      state.checkoutUncertain = false;
       view.innerHTML = `<p class="eyebrow">YOUR PURCHASES</p><h1 class="page-title">My orders</h1>${data.orders.length ? data.orders.map(order => `<button class="order-card" data-order="${order.id}"><div class="order-top"><strong>Order #${order.id}</strong><span class="status-pill ${esc(order.status)}">${esc(String(order.status).replaceAll("_", " "))}</span></div><p>${esc(order.product_name)} · Qty ${order.quantity} · ${money(order.amount)} USDT</p><p>${esc(when(order.created_at))}${order.refunded ? " · Refunded" : ""}</p></button>`).join("") : `<div class="empty-state"><span>📦</span><strong>No orders yet</strong><p>Your purchases will appear here.</p></div>`}<button class="secondary-button wide-button" data-view="store">Browse products</button>`;
     } catch (error) { view.innerHTML = `<h1 class="page-title">My orders</h1><p class="soft-note">${esc(error.message)}</p>`; }
   }
 
   async function showOrder(orderId) {
+    openModal(`<p class="eyebrow">ORDER DETAILS</p><h2 class="page-title" id="modal-title">Loading order…</h2><div class="loading"><span class="spinner"></span><p>Getting the latest order status…</p></div>`, "order");
+    const request = state.modalGeneration;
     try {
       const order = await api(`/orders/${Number(orderId)}`);
-      openModal(`<p class="eyebrow">ORDER DETAILS</p><h2 class="page-title" id="modal-title">Order #${order.id}</h2><div class="panel-card"><div class="row-line"><strong>Product</strong><span>${esc(order.product_name)}</span></div><div class="row-line"><strong>Status</strong><span class="status-pill ${esc(order.status)}">${esc(String(order.status).replaceAll("_", " "))}</span></div><div class="row-line"><strong>Quantity</strong><span>${order.quantity}</span></div><div class="row-line"><strong>Paid</strong><span>${money(order.amount)} USDT</span></div><div class="row-line"><strong>Placed</strong><span>${esc(when(order.created_at))}</span></div></div><p class="soft-note">For delivered account details or warranty help, open this order in the RainDeals Telegram bot.</p><button class="primary-button wide-button" data-action="open-bot">Open order in Telegram</button>`, "order");
-    } catch (error) { toast(error.message); }
+      if (state.modalGeneration === request) openModal(`<p class="eyebrow">ORDER DETAILS</p><h2 class="page-title" id="modal-title">Order #${order.id}</h2><div class="panel-card"><div class="row-line"><strong>Product</strong><span>${esc(order.product_name)}</span></div><div class="row-line"><strong>Status</strong><span class="status-pill ${esc(order.status)}">${esc(String(order.status).replaceAll("_", " "))}</span></div><div class="row-line"><strong>Quantity</strong><span>${order.quantity}</span></div><div class="row-line"><strong>Paid</strong><span>${money(order.amount)} USDT</span></div><div class="row-line"><strong>Placed</strong><span>${esc(when(order.created_at))}</span></div></div><p class="soft-note">For delivered account details or warranty help, open this order in the RainDeals Telegram bot.</p><button class="primary-button wide-button" data-action="open-bot">Open order in Telegram</button>`, "order");
+    } catch (error) { if (state.modalGeneration === request) openModal(`<h2 class="page-title" id="modal-title">Order unavailable</h2><p class="soft-note">${esc(error.message)}</p>`, "order"); }
   }
 
   async function loadNotifications(page = 0) {
@@ -596,20 +684,21 @@
       syncHeader();
       const rows = data.rows || [];
       view.innerHTML = `<p class="eyebrow">YOUR ACCOUNT UPDATES</p><h1 class="page-title">Notifications <span class="muted-count">${state.unread} unread</span></h1>
-        ${rows.length ? rows.map(row => `<button class="notification-card" data-notification="${row.id}"><div class="notification-top"><strong>${esc(row.title)}</strong><span>${row.unread ? "🔵" : "✓"}</span></div><p>${esc(row.summary)}</p><p>${esc(when(row.created_at))}</p></button>`).join("") : `<div class="empty-state"><span>✨</span><strong>You’re all caught up</strong><p>New RainDeals updates will appear here.</p></div>`}
+        ${rows.length ? rows.map(row => `<button class="notification-card" data-notification="${row.id}" data-notification-unread="${row.unread ? "1" : "0"}"><div class="notification-top"><strong>${esc(row.title)}</strong><span>${row.unread ? "🔵" : "✓"}</span></div><p>${esc(row.summary)}</p><p>${esc(when(row.created_at))}</p></button>`).join("") : `<div class="empty-state"><span>✨</span><strong>You’re all caught up</strong><p>New RainDeals updates will appear here.</p></div>`}
         <div class="search-row" style="grid-template-columns:1fr 1fr"><button class="secondary-button" data-notice-page="${Math.max(0,page-1)}" ${page <= 0 ? "disabled" : ""}>‹ Previous</button><button class="secondary-button" data-notice-page="${page+1}" ${!data.has_more ? "disabled" : ""}>Next ›</button></div>
         <button class="secondary-button wide-button" style="margin-top:12px" data-action="open-bot">Open updates in Telegram</button>`;
     } catch (error) { view.innerHTML = `<h1 class="page-title">Notifications</h1><p class="soft-note">${esc(error.message)}</p>`; }
   }
 
-  async function showNotification(id) {
+  async function showNotification(id, wasUnread = false) {
+    openModal(`<p class="eyebrow">RAINDEALS UPDATE</p><h2 class="page-title" id="modal-title">Opening update…</h2><div class="loading"><span class="spinner"></span><p>Loading this message…</p></div>`, "notification");
+    const request = state.modalGeneration;
     try {
       const row = await api(`/notifications/${Number(id)}/read`, { method: "POST" });
-      const latest = await api("/notifications?page=0");
-      state.unread = Number(latest.unread || 0);
+      if (wasUnread) state.unread = Math.max(0, Number(state.unread || 0) - 1);
       syncHeader();
-      openModal(`<p class="eyebrow">RAINDEALS UPDATE</p><h2 class="page-title" id="modal-title">${esc(row.title)}</h2><div class="panel-card"><p>${esc(row.content || row.summary)}</p><small class="muted-count">${esc(when(row.created_at))}</small></div><button class="primary-button wide-button" data-action="open-bot">Open in Telegram</button>`, "notification");
-    } catch (error) { toast(error.message); }
+      if (state.modalGeneration === request) openModal(`<p class="eyebrow">RAINDEALS UPDATE</p><h2 class="page-title" id="modal-title">${esc(row.title)}</h2><div class="panel-card"><p>${esc(row.content || row.summary)}</p><small class="muted-count">${esc(when(row.created_at))}</small></div><button class="primary-button wide-button" data-action="open-bot">Open in Telegram</button>`, "notification");
+    } catch (error) { if (state.modalGeneration === request) openModal(`<h2 class="page-title" id="modal-title">Update unavailable</h2><p class="soft-note">${esc(error.message)}</p>`, "notification"); }
   }
 
   function buildBuyerInfo() {
@@ -623,12 +712,16 @@
   }
 
   async function confirmCheckout() {
+    if (state.checkoutPending) return;
     const buyerInfo = buildBuyerInfo();
+    state.checkoutPending = true;
+    renderCart(true);
     try {
       const result = await api("/checkout", { method: "POST", body: JSON.stringify({ buyer_info: buyerInfo }) });
       invalidateCatalogCache();
       const checkout = result.checkout || {};
       state.buyerInfoDraft = {};
+      state.checkoutPending = false;
       closeModal();
       await loadCart(true);
       if (checkout.status === "completed") toast("Purchase complete. Open My Orders for details.");
@@ -637,8 +730,27 @@
       else toast("Checkout finished. Review the result in My Orders.");
       setView("orders");
     } catch (error) {
-      toast(error.message);
+      state.checkoutPending = false;
+      if (!error.status || error.status >= 500) state.checkoutUncertain = true;
+      if (state.modal === "cart-review") renderCart(true);
+      toast(state.checkoutUncertain ? "Checkout response is unclear. Check My Orders before retrying." : error.message);
       if (/photo|contact/i.test(error.message)) toast("Open the Telegram bot to submit this product’s photo/contact field.");
+    }
+  }
+
+  async function clearCart() {
+    if (state.clearCartPending) return;
+    state.clearCartPending = true;
+    renderCart(false);
+    try {
+      state.cart = await api("/cart", { method: "DELETE" });
+      syncHeader();
+      toast("Cart cleared");
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      state.clearCartPending = false;
+      if (state.modal === "cart") renderCart(false);
     }
   }
 
@@ -657,7 +769,8 @@
     if (target.dataset.action === "review-checkout") { renderCart(true); return; }
     if (target.dataset.action === "cart-review-cancel") { renderCart(false); return; }
     if (target.dataset.action === "confirm-checkout") { confirmCheckout(); return; }
-    if (target.dataset.action === "clear-cart") { api("/cart", { method: "DELETE" }).then(data => { state.cart = data; syncHeader(); renderCart(false); toast("Cart cleared"); }).catch(error => toast(error.message)); return; }
+    if (target.dataset.action === "check-orders") { closeModal(); setView("orders"); return; }
+    if (target.dataset.action === "clear-cart") { clearCart(); return; }
     if (target.dataset.depositNetwork) { beginDeposit(target.dataset.depositNetwork); return; }
     if (target.dataset.action === "full-product-details") { showFullProductDetails(target.dataset.productId); return; }
     if (target.dataset.depositDetail) { showDeposit(target.dataset.depositDetail); return; }
@@ -683,7 +796,15 @@
     }
     if (target.dataset.cartRemove) { changeCart(target.dataset.cartRemove, 0); return; }
     if (target.dataset.order) { showOrder(target.dataset.order); return; }
-    if (target.dataset.notification) { showNotification(target.dataset.notification); return; }
+    if (target.dataset.notification) {
+      const unread = target.dataset.notificationUnread === "1";
+      if (unread) {
+        target.dataset.notificationUnread = "0";
+        const marker = $(".notification-top span", target);
+        if (marker) marker.textContent = "✓";
+      }
+      showNotification(target.dataset.notification, unread); return;
+    }
     if (target.dataset.noticePage) { loadNotifications(Number(target.dataset.noticePage)); return; }
     if (target.id === "cart-open") { renderCart(false); return; }
     if (target.id === "notify-open") { setView("notifications"); return; }
@@ -748,10 +869,10 @@
       syncHeader();
       $("#main").classList.remove("hidden"); $("#bottom-nav").classList.remove("hidden");
       renderProfile();
+      loadCart().catch(error => { state.cartReady = false; toast(error.message); });
       loadProducts(false).catch(error => {
         $("#product-grid").innerHTML = `<div class="soft-note">${esc(error.message)} <button class="text-button" data-action="refresh-catalog">Try again</button></div>`;
       });
-      loadCart().catch(error => { state.cartReady = false; toast(error.message); });
     } catch (error) {
       $("#loading").classList.add("hidden");
       $("#auth-error").classList.remove("hidden");

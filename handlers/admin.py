@@ -208,6 +208,11 @@ def _get_admin_panel_with_providers() -> InlineKeyboardMarkup:
             style="success",
         )
     rows.insert(0, [mini_store_button])
+    rows.insert(1, [InlineKeyboardButton(
+        text="📣 Promote a product",
+        callback_data="admin_promote",
+        style="primary",
+    )])
     rows.insert(-1, [InlineKeyboardButton(
         text="📣 Ask vendors for a product",
         callback_data="vendor_request_new",

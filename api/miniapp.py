@@ -10,6 +10,7 @@ import hmac
 import json
 import logging
 import time
+import asyncio
 from datetime import datetime
 from decimal import Decimal
 from urllib.parse import parse_qsl
@@ -71,14 +72,24 @@ def current_user(
 ) -> dict:
     auth = _verify_init_data(init_data or "")
     with SessionLocal() as db:
-        user = db.query(User).filter(User.telegram_id == auth["id"]).with_for_update().first()
+        # Most Mini App requests only need a read. Avoid taking a database row
+        # lock for every asset/API request; acquire it only for the one-time
+        # verification write so concurrent first opens remain serialized.
+        user = db.query(User).filter(User.telegram_id == auth["id"]).first()
         if not user or user.is_banned:
             raise HTTPException(status_code=403, detail={"error": "account_unavailable", "message": "Send /start to the RainDeals bot to activate your account."})
-        newly_verified = user.miniapp_verified_at is None
+        newly_verified = False
         # Telegram signed initData proves the account identity. Record it only
         # once, along with a keyed network fingerprint for referral abuse
         # checks. No raw IP or forwarded header is persisted.
         if user.miniapp_verified_at is None:
+            user = db.query(User).filter(
+                User.telegram_id == auth["id"]
+            ).with_for_update().first()
+            if not user or user.is_banned:
+                raise HTTPException(status_code=403, detail={"error": "account_unavailable", "message": "Send /start to the RainDeals bot to activate your account."})
+            newly_verified = user.miniapp_verified_at is None
+        if newly_verified:
             # Serialize first-time referrals from the same inviter while their
             # fingerprints are recorded. Without this parent-row lock, two
             # concurrent Mini App opens can miss each other's network hash.
@@ -125,11 +136,22 @@ def current_user(
                         notification_db.commit()
             except Exception:
                 logger.exception("Could not record Mini App referral verification for user_id=%s", auth["id"])
+        bootstrap_profile = None
+        if request.url.path.rstrip("/").endswith("/bootstrap"):
+            bootstrap_profile = {
+                "telegram_id": int(user.telegram_id), "name": user.full_name or "RainDeals customer",
+                "username": user.username, "balance": user.balance,
+                "spent": user.total_spent, "deposited": user.total_deposited,
+                "orders": int(user.total_orders or 0),
+                "referral_earnings": user.referral_earnings,
+                "referral_code": str(user.referral_code or "").strip(),
+            }
         return {
             "id": int(user.telegram_id),
             "telegram_user": auth["telegram_user"],
             "newly_verified": newly_verified,
             "referred": bool(user.referred_by),
+            "bootstrap_profile": bootstrap_profile,
         }
 
 
@@ -154,13 +176,74 @@ def _requirements(product: Product) -> list[dict[str, str]]:
     return result
 
 
-def _product_rows(user_id: int, freebies: bool = False, *, product_id: int | None = None, include_details: bool = False) -> list[dict]:
+def _serialize_product_rows(
+    user_id: int,
+    products: list[Product],
+    *,
+    claimant_verified: bool,
+    verified_referrals: int = 0,
+    include_details: bool = False,
+) -> list[dict]:
     from handlers.products import (
         _get_bulk_price, _get_max_qty, _get_catalog_custom_prices, _money as shop_money,
         _real_stock,
         _product_purchase_configuration_errors,
     )
     from services.fulfillment_policy import manual_allowed as _manual_allowed
+    custom_prices = _get_catalog_custom_prices(user_id, [int(p.id) for p in products])
+    output = []
+    for product in products:
+        try:
+            if _product_purchase_configuration_errors(product):
+                continue
+            # Keep real/current capacity separate from an allowed preorder.
+            available = max(0, int(_real_stock(product)))
+            sellable = max(0, int(_get_max_qty(product)))
+            is_preorder = bool(
+                product.preorder
+                and product.source != "reseller"
+                and available <= 0
+                and _manual_allowed(product)
+            )
+            custom_price = custom_prices.get(int(product.id))
+            price = custom_price if custom_price is not None else shop_money(product.price)
+            bulk = _get_bulk_price(product.bulk_pricing, 1) if custom_price is None and product.bulk_pricing else None
+            if bulk is not None:
+                price = shop_money(bulk)
+            referral_requirement = (
+                max(0, int(getattr(product, "freebie_referrals_required", 0) or 0))
+                if Decimal(str(product.price or 0)) == 0 else 0
+            )
+            freebie_unlocked = (
+                referral_requirement == 0
+                or (claimant_verified and verified_referrals >= referral_requirement)
+            )
+            description = getattr(product, "_catalog_description", None)
+            if description is None:
+                description = str(product.description or "")
+            output.append({
+                "id": int(product.id), "name": str(product.name or "Product")[:255],
+                "icon": str(product.icon or "📦")[:50],
+                "description": description[:1200 if include_details else 350],
+                "description_truncated": bool(not include_details and len(description) > 350),
+                "category": (str(product.category or "General").strip() or "General")[:100],
+                "price": _money(price), "currency": "USDT", "stock": available,
+                "sellable_stock": sellable, "in_stock": available > 0,
+                "purchasable": sellable > 0 and freebie_unlocked,
+                "preorder": is_preorder,
+                "delivery_type": str(product.delivery_type or "manual"),
+                "required_info": _requirements(product),
+                "freebie_referrals_required": referral_requirement,
+                "verified_referrals": verified_referrals if referral_requirement else 0,
+                "claimant_miniapp_verified": claimant_verified if referral_requirement else True,
+                "freebie_unlocked": freebie_unlocked,
+            })
+        except Exception:
+            logger.exception("Mini App product omitted due to invalid catalog configuration product_id=%s", product.id)
+    return output
+
+
+def _product_rows(user_id: int, freebies: bool = False, *, product_id: int | None = None, include_details: bool = False) -> list[dict]:
     with SessionLocal() as db:
         query = db.query(Product).filter(Product.is_active.is_(True))
         if product_id is not None:
@@ -168,10 +251,6 @@ def _product_rows(user_id: int, freebies: bool = False, *, product_id: int | Non
         else:
             query = query.filter(Product.price == 0) if freebies else query.filter(Product.price > 0)
         products = query.order_by(Product.id.desc()).limit(1 if product_id is not None else 1000).all()
-        # Resolve custom rates as a catalog batch instead of querying them
-        # separately for every product. Newly added products are still read
-        # from the database on each catalog request.
-        custom_prices = _get_catalog_custom_prices(user_id, [int(p.id) for p in products])
         claimant = db.query(User).filter(User.telegram_id == int(user_id)).first()
         claimant_verified = bool(claimant and claimant.miniapp_verified_at)
         has_gated_freebies = any(
@@ -183,57 +262,42 @@ def _product_rows(user_id: int, freebies: bool = False, *, product_id: int | Non
         if has_gated_freebies:
             from services.freebie_referrals import verified_referral_count
             verified_referrals = verified_referral_count(db, user_id)
-        output = []
-        for product in products:
-            try:
-                if _product_purchase_configuration_errors(product):
-                    continue
-                # Keep real/current capacity separate from an allowed
-                # preorder. _get_max_qty intentionally returns a large
-                # preorder ceiling, which must never be presented as stock.
-                available = max(0, int(_real_stock(product)))
-                sellable = max(0, int(_get_max_qty(product)))
-                is_preorder = bool(
-                    product.preorder
-                    and product.source != "reseller"
-                    and available <= 0
-                    and _manual_allowed(product)
-                )
-                custom_price = custom_prices.get(int(product.id))
-                price = custom_price if custom_price is not None else shop_money(product.price)
-                bulk = _get_bulk_price(product.bulk_pricing, 1) if custom_price is None and product.bulk_pricing else None
-                if bulk is not None:
-                    price = shop_money(bulk)
-                referral_requirement = (
-                    max(0, int(getattr(product, "freebie_referrals_required", 0) or 0))
-                    if Decimal(str(product.price or 0)) == 0 else 0
-                )
-                freebie_unlocked = (
-                    referral_requirement == 0
-                    or (claimant_verified and verified_referrals >= referral_requirement)
-                )
-                output.append({
-                    "id": int(product.id), "name": str(product.name or "Product")[:255],
-                    "icon": str(product.icon or "📦")[:50],
-                    # Keep the catalog response light, but include enough buyer
-                    # requirements for product cards and checkout prompts.
-                    "description": str(product.description or "")[:1200 if include_details else 350],
-                    "description_truncated": bool(not include_details and len(str(product.description or "")) > 350),
-                    "category": (str(product.category or "General").strip() or "General")[:100],
-                    "price": _money(price), "currency": "USDT", "stock": available,
-                    "sellable_stock": sellable, "in_stock": available > 0,
-                    "purchasable": sellable > 0 and freebie_unlocked,
-                    "preorder": is_preorder,
-                    "delivery_type": str(product.delivery_type or "manual"),
-                    "required_info": _requirements(product),
-                    "freebie_referrals_required": referral_requirement,
-                    "verified_referrals": verified_referrals if referral_requirement else 0,
-                    "claimant_miniapp_verified": claimant_verified if referral_requirement else True,
-                    "freebie_unlocked": freebie_unlocked,
-                })
-            except Exception:
-                logger.exception("Mini App product omitted due to invalid catalog configuration product_id=%s", product.id)
-        return output
+        return _serialize_product_rows(
+            user_id, products, claimant_verified=claimant_verified,
+            verified_referrals=verified_referrals, include_details=include_details,
+        )
+
+
+async def _cached_product_rows(user_id: int, freebies: bool) -> list[dict]:
+    """Build the Mini App catalog from the bot's credential-free warm cache."""
+    from handlers.products import _fetch_catalog_snapshot, _money as shop_money
+    products = await _fetch_catalog_snapshot()
+    return await asyncio.to_thread(_serialize_cached_product_rows, user_id, freebies, products, shop_money)
+
+
+def _serialize_cached_product_rows(user_id: int, freebies: bool, snapshot: list[Product], shop_money) -> list[dict]:
+    """Run SQL/custom-rate lookups and catalog serialization off the event loop."""
+    wanted_free = bool(freebies)
+    products = [
+        product for product in reversed(snapshot)
+        if (shop_money(product.price) == 0) == wanted_free
+    ][:1000]
+    with SessionLocal() as db:
+        claimant = db.query(User).filter(User.telegram_id == int(user_id)).first()
+        claimant_verified = bool(claimant and claimant.miniapp_verified_at)
+        has_gated_freebies = any(
+            Decimal(str(p.price or 0)) == 0
+            and int(getattr(p, "freebie_referrals_required", 0) or 0) > 0
+            for p in products
+        )
+        verified_referrals = 0
+        if has_gated_freebies:
+            from services.freebie_referrals import verified_referral_count
+            verified_referrals = verified_referral_count(db, user_id)
+        return _serialize_product_rows(
+            user_id, products, claimant_verified=claimant_verified,
+            verified_referrals=verified_referrals,
+        )
 
 
 def _cart_snapshot(user_id: int) -> dict:
@@ -358,35 +422,63 @@ def _owned_deposit(user_id: int, deposit_id: int) -> Deposit | None:
 @router.get("/bootstrap")
 def bootstrap(request: Request, auth=Depends(current_user)):
     from services import notification_inbox
+    user = auth.get("bootstrap_profile")
+    if not user:
+        raise HTTPException(status_code=403, detail="Could not load the RainDeals profile.")
+    username = getattr(request.app.state, "main_bot_username", MAIN_BOT_USERNAME)
+    referral_code = user["referral_code"]
+    referral_link = f"https://t.me/{username}?start=ref_{referral_code}" if username and referral_code else ""
+    return {
+        "profile": {"telegram_id": user["telegram_id"], "name": user["name"],
+                    "username": user["username"], "balance": _money(user["balance"]),
+                    "spent": _money(user["spent"]), "deposited": _money(user["deposited"]),
+                    "orders": user["orders"],
+                    # Referral aggregates are loaded only if the customer
+                    # opens Profile; they are not needed to paint the shop.
+                    "referrals": 0, "verified_referrals": 0,
+                    "referral_earnings": _money(user["referral_earnings"]), "referral_link": referral_link},
+        "unread_notifications": int(notification_inbox.count(auth["id"])),
+        "main_bot_username": username,
+        "deposit_methods": _deposit_method_rows(),
+        "verification": {
+            "just_completed": bool(auth.get("newly_verified")),
+            "referred": bool(auth.get("referred")),
+        },
+    }
+
+
+@router.get("/profile")
+def profile(request: Request, auth=Depends(current_user)):
+    from services.freebie_referrals import verified_referral_count
     with SessionLocal() as db:
         user = db.query(User).filter(User.telegram_id == auth["id"]).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="RainDeals account not found.")
         username = getattr(request.app.state, "main_bot_username", MAIN_BOT_USERNAME)
-        referral_code = str(user.referral_code or "").strip()
-        referral_link = f"https://t.me/{username}?start=ref_{referral_code}" if username and referral_code else ""
-        from services.freebie_referrals import verified_referral_count
         return {
-            "profile": {"telegram_id": int(user.telegram_id), "name": user.full_name or "RainDeals customer",
-                        "username": user.username, "balance": _money(user.balance),
-                        "spent": _money(user.total_spent), "deposited": _money(user.total_deposited),
-                        "orders": int(user.total_orders or 0),
-                        "referrals": int(db.query(func.count(User.id)).filter(
-                            User.referred_by == int(user.telegram_id)
-                        ).scalar() or 0),
-                        "verified_referrals": verified_referral_count(db, auth["id"]),
-                        "referral_earnings": _money(user.referral_earnings), "referral_link": referral_link},
-            "unread_notifications": int(notification_inbox.count(auth["id"])),
-            "main_bot_username": username,
-            "deposit_methods": _deposit_method_rows(),
-            "verification": {
-                "just_completed": bool(auth.get("newly_verified")),
-                "referred": bool(auth.get("referred")),
-            },
+            "telegram_id": int(user.telegram_id), "name": user.full_name or "RainDeals customer",
+            "username": user.username, "balance": _money(user.balance),
+            "spent": _money(user.total_spent), "deposited": _money(user.total_deposited),
+            "orders": int(user.total_orders or 0),
+            "referrals": int(db.query(func.count(User.id)).filter(
+                User.referred_by == int(user.telegram_id)
+            ).scalar() or 0),
+            "verified_referrals": verified_referral_count(db, auth["id"]),
+            "referral_earnings": _money(user.referral_earnings),
+            "referral_link": (
+                f"https://t.me/{username}?start=ref_{str(user.referral_code or '').strip()}"
+                if username and user.referral_code else ""
+            ),
         }
 
 
 @router.get("/products")
-def products(freebies: bool = False, auth=Depends(current_user)):
-    rows = _product_rows(auth["id"], freebies)
+async def products(freebies: bool = False, auth=Depends(current_user)):
+    try:
+        rows = await _cached_product_rows(auth["id"], freebies)
+    except Exception:
+        logger.exception("Mini App cached catalog build failed; using direct catalog query")
+        rows = await asyncio.to_thread(_product_rows, auth["id"], freebies)
     return {"products": rows, "categories": sorted({row["category"] for row in rows}, key=str.casefold)}
 
 
@@ -566,6 +658,23 @@ async def checkout(payload: CheckoutPayload, request: Request, auth=Depends(curr
         if bot is None:
             raise HTTPException(status_code=503, detail="Checkout is temporarily unavailable. Try again in a moment.")
         result = await cart.checkout(auth["id"], token, bot.id, payload.buyer_info)
+        # The bot's Telegram checkout handler sends its public order card itself.
+        # Mini App checkout bypasses that handler, so enqueue the same durable
+        # Admin Notify event here. Failure must not undo a completed purchase;
+        # the background order scanner remains the retry/recovery path.
+        checkout_result = result if isinstance(result, dict) else {}
+        order_ids = {
+            int(item["order_id"])
+            for item in checkout_result.get("results", [])
+            if isinstance(item, dict) and item.get("order_id")
+        }
+        if order_ids:
+            from services.order_notifications import queue_order_notification
+            for order_id in order_ids:
+                try:
+                    await asyncio.to_thread(queue_order_notification, order_id, bot.id)
+                except Exception:
+                    logger.exception("Mini App Admin Notify enqueue failed order_id=%s", order_id)
         return {"checkout": result, "total": _money(total), "items_reviewed": len(lines)}
     except HTTPException:
         raise
