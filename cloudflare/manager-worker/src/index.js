@@ -22,7 +22,7 @@ const responseFields={
   custom_rates:'id,telegram_id,product_id,price,is_active,created_at,stopped_at',
  users:'id,telegram_id,username,full_name,balance,total_spent,membership,is_banned,created_at',
  orders:'id,telegram_id,user_id,product_id,product_name,service,quantity,amount,status,delivery_type,automatic_quantity,manual_pending_quantity,reusable_delivery_quantity,created_at,updated_at,delivered_at,aftercare_policy,warranty_days,subscription_days,term_days,subscription_expires_at,received_at,coverage_started_at,warranty_expires_at',
- deposits:'id,telegram_id,user_id,amount,currency,network,status,txid,payment_method,created_at,updated_at,verified_at',
+ deposits:'id,telegram_id,order_id,invoice_code,invoice_expires_at,invoice_usdt_amount,verification_started_at,tx_hash,amount,received_amount,inr_amount,conversion_rate,stars_amount_requested,stars_amount_paid,stars_usdt_per_star,network,status,created_at',
  tickets:'id,telegram_id,user_id,subject,status,priority,admin_response,created_at,updated_at',
  api_keys:'id,telegram_id,name,key_prefix,is_active,created_at,last_used_at',
   api_orders:'id,telegram_id,user_id,product_id,product_name,quantity,amount,status,created_at,updated_at',
@@ -46,7 +46,7 @@ const rows=async(env,sql,args=[])=>((await db(env,sql,args)).rows||[]);
 async function tx(env,fn){const t=await env.TIDB.begin();try{const r=await fn(t);await t.commit();return r;}catch(e){await t.rollback();throw e;}}
 let schemaInitPromise;
 let forceKillSchemaPromise;
-const managerSchemaTables=['raindeals_web_manager_sessions','raindeals_web_manager_settings','raindeals_web_manager_attempts','raindeals_web_manager_audit','raindeals_web_manager_login_preferences','raindeals_web_manager_login_lockouts','raindeals_web_manager_force_kill','raindeals_web_manager_admins'];
+const managerSchemaTables=['raindeals_web_manager_sessions','raindeals_web_manager_settings','raindeals_web_manager_attempts','raindeals_web_manager_audit','raindeals_web_manager_login_preferences','raindeals_web_manager_login_lockouts','raindeals_web_manager_force_kill','raindeals_web_manager_admins','raindeals_runtime_settings','raindeals_deposit_reviews'];
 const tableColumnCache=new Map();
 let aftercareSchemaReady=false;
 async function requireAftercareSchema(env){if(!aftercareSchemaReady){await ensureAftercareSchema(env);for(const table of ['orders','products','bot_warranty_requests'])tableColumnCache.delete(table);aftercareSchemaReady=true}}
@@ -68,6 +68,8 @@ async function init(env){
   await db(env,"CREATE TABLE IF NOT EXISTS raindeals_web_manager_sessions (token_hash CHAR(64) PRIMARY KEY,csrf CHAR(64) NOT NULL,admin_id BIGINT NOT NULL,expires_at DATETIME NOT NULL,created_at DATETIME NOT NULL)");
   await db(env,"DELETE FROM raindeals_web_manager_sessions WHERE expires_at>DATE_ADD(created_at,INTERVAL 120 MINUTE)");
   await db(env,"CREATE TABLE IF NOT EXISTS raindeals_web_manager_settings (setting_key VARCHAR(64) PRIMARY KEY,setting_value TEXT NOT NULL,updated_by BIGINT NOT NULL,updated_at DATETIME(6) NOT NULL)");
+  await db(env,"CREATE TABLE IF NOT EXISTS raindeals_runtime_settings (setting_key VARCHAR(64) NOT NULL PRIMARY KEY,setting_value MEDIUMTEXT NOT NULL,updated_by BIGINT NOT NULL DEFAULT 0,updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6))");
+  await db(env,"CREATE TABLE IF NOT EXISTS raindeals_deposit_reviews (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,deposit_id BIGINT NOT NULL,admin_id BIGINT NOT NULL,action VARCHAR(24) NOT NULL,note TEXT NOT NULL,external_reference VARCHAR(255) NULL,created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),KEY ix_deposit_review_id(deposit_id,id),KEY ix_deposit_review_created(created_at))");
   await db(env,"CREATE TABLE IF NOT EXISTS raindeals_web_manager_attempts (bucket CHAR(64) PRIMARY KEY,attempts INT NOT NULL,expires_at DATETIME NOT NULL)");
   await db(env,"CREATE TABLE IF NOT EXISTS raindeals_web_manager_audit (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,admin_id BIGINT NOT NULL,action VARCHAR(32) NOT NULL,target_type VARCHAR(64) NOT NULL,target_id VARCHAR(64) NULL,details TEXT NOT NULL,created_at DATETIME(6) NOT NULL,KEY ix_manager_audit_created(created_at),KEY ix_manager_audit_admin(admin_id))");
   await db(env,"CREATE TABLE IF NOT EXISTS raindeals_web_manager_login_preferences (token_hash CHAR(64) PRIMARY KEY,session_minutes SMALLINT NOT NULL,expires_at DATETIME NOT NULL)");
@@ -112,6 +114,71 @@ async function decryptVendorCiphertext(env,token){
   try{return new TextDecoder('utf-8',{fatal:true}).decode(await crypto.subtle.decrypt({name:'AES-CBC',iv:raw.slice(9,25)},encryptionKey,raw.slice(25,-32)))}catch{error('Vendor private data could not be decrypted. Check the shared encryption key.',503)}
 }
 const htmlEscape=value=>String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+const runtimeSettingKeys=new Set([
+  'usdt_price_source_url','payment_upi_id','payment_bep20_address','payment_polygon_address','payment_binance_pay_id',
+  'payment_stars_usdt_per_star','payment_order','payment_enabled_upi','payment_enabled_bep20','payment_enabled_polygon','payment_enabled_binance','payment_enabled_stars',
+  'payment_min_upi','payment_max_upi','payment_min_bep20','payment_max_bep20','payment_min_polygon','payment_max_polygon','payment_min_binance','payment_max_binance','payment_min_stars','payment_max_stars',
+  'payment_expiry_upi','payment_expiry_bep20','payment_expiry_polygon','payment_expiry_binance','payment_expiry_stars',
+  'payment_reference_prefix_upi','payment_reference_prefix_bep20','payment_reference_prefix_polygon','payment_reference_prefix_binance',
+  'payment_reference_min_upi','payment_reference_max_upi','payment_reference_min_binance','payment_reference_max_binance',
+  'shop_enabled','miniapp_enabled','feature_cart','feature_freebies','feature_referrals','feature_vendor_offers','feature_deposits',
+  'shop_pause_message','miniapp_disabled_message','maintenance_schedule_start','maintenance_schedule_end'
+]);
+function publicHttpsUrl(value){
+  const raw=String(value||'').trim();if(!raw)return '';
+  let u;try{u=new URL(raw)}catch{error('Enter a valid HTTPS URL for the USDT price source.')}
+  const host=u.hostname.toLowerCase().replace(/^\[|\]$/g,'');
+  if(u.protocol!=='https:'||u.username||u.password||!host||host==='localhost'||host.endsWith('.localhost')||host.endsWith('.local')||host.endsWith('.internal')||host==='metadata.google.internal')error('Price source must be a public HTTPS URL without embedded credentials.');
+  if(/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)||host.includes(':'))error('Use a public DNS hostname rather than an IP address.');
+  return u.toString();
+}
+function normalizeRuntimeSettings(input){
+  if(!input||typeof input!=='object'||Array.isArray(input))error('Settings must be a JSON object.');
+  const out={};
+  for(const [key,raw] of Object.entries(input)){
+    if(!runtimeSettingKeys.has(key))error('Unknown Manager setting: '+key);
+    const value=String(raw??'').trim();if(value.length>800000)error('A setting value is too large.');
+    if(key==='usdt_price_source_url'){out[key]=publicHttpsUrl(value);continue}
+    if(key==='payment_order'){
+      let order;try{order=JSON.parse(value)}catch{error('Payment order must be a JSON array.')}
+      const allowed=['BEP20','POLYGON','BINANCE','UPI','STARS'];if(!Array.isArray(order)||order.length!==allowed.length||new Set(order).size!==allowed.length||order.some(x=>!allowed.includes(String(x).toUpperCase())))error('Payment order must contain BEP20, POLYGON, BINANCE, UPI, and STARS once each.');
+      out[key]=JSON.stringify(order.map(x=>String(x).toUpperCase()));continue;
+    }
+    if(key.startsWith('payment_enabled_')||['shop_enabled','miniapp_enabled','feature_cart','feature_freebies','feature_referrals','feature_vendor_offers','feature_deposits'].includes(key)){
+      if(!['0','1'].includes(value))error(key+' must be on (1) or off (0).');out[key]=value;continue;
+    }
+    if(key.startsWith('payment_min_')||key.startsWith('payment_max_')||key==='payment_stars_usdt_per_star'){
+      if(value===''&&key==='payment_stars_usdt_per_star'){out[key]='';continue}
+      if(/^payment_(?:min|max)_stars$/.test(key)&&!/^\d+$/.test(value))error(key+' must be a whole Stars count.');
+      if(!/^\d{1,7}(?:\.\d{1,8})?$/.test(value)||Number(value)<=0||Number(value)>1000000)error('Enter a positive amount for '+key+'.');out[key]=value;continue;
+    }
+    if(key.startsWith('payment_expiry_')){if(!/^\d+$/.test(value)||Number(value)<300||Number(value)>86400)error('Invoice expiry must be 300–86,400 seconds.');out[key]=value;continue}
+    if(key.startsWith('payment_reference_min_')||key.startsWith('payment_reference_max_')){if(!/^\d+$/.test(value)||Number(value)<1||Number(value)>255)error('Reference length must be between 1 and 255.');out[key]=value;continue}
+    if(key.startsWith('payment_reference_prefix_')){if(value.length>40||/[\r\n]/.test(value))error('Reference prefix must be 40 characters or shorter.');out[key]=value;continue}
+    if(key.endsWith('_address')&&value&&!/^0x[a-fA-F0-9]{40}$/.test(value))error(key+' must be a 0x address with 40 hex characters.');
+    if(key==='payment_upi_id'&&value&&!/^[A-Za-z0-9._-]{2,128}@[A-Za-z0-9.-]{2,64}$/.test(value))error('Enter a valid UPI ID.');
+    if(key==='payment_binance_pay_id'&&value&&!/^[A-Za-z0-9_-]{3,64}$/.test(value))error('Enter a valid Binance Pay ID.');
+    if(key==='payment_stars_usdt_per_star'&&value&&!/^\d+(?:\.\d{1,8})?$/.test(value))error('Stars credit rate must be a positive decimal or blank to disable Stars.');
+    if(['shop_pause_message','miniapp_disabled_message'].includes(key)&&value.length>1000)error(key+' must be 1,000 characters or shorter.');
+    if(['maintenance_schedule_start','maintenance_schedule_end'].includes(key)&&value){const d=new Date(value);if(Number.isNaN(d.getTime()))error('Scheduled maintenance must use a valid UTC date and time.');out[key]=d.toISOString();continue}
+    out[key]=value;
+  }
+  for(const method of ['upi','bep20','polygon','binance','stars']){
+    const min=out['payment_min_'+method],max=out['payment_max_'+method];if(min!==undefined&&max!==undefined&&Number(min)>Number(max))error('Minimum amount cannot exceed maximum for '+method.toUpperCase()+'.');
+    const minLen=out['payment_reference_min_'+method],maxLen=out['payment_reference_max_'+method];if(minLen!==undefined&&maxLen!==undefined&&Number(minLen)>Number(maxLen))error('Minimum reference length cannot exceed maximum for '+method.toUpperCase()+'.');
+  }
+  if(('maintenance_schedule_start'in out)!==('maintenance_schedule_end'in out))error('Enter both scheduled maintenance start and end, or clear both.');
+  if(out.maintenance_schedule_start&&new Date(out.maintenance_schedule_start)>=new Date(out.maintenance_schedule_end))error('Scheduled maintenance end must be after its start.');
+  return out;
+}
+function csvCell(value){let s=String(value??'');if(/^[=+\-@\t\r]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"'}
+async function readLimitedText(response,maxBytes=500000){
+  const reader=response.body?.getReader();if(!reader)error('Price source returned no readable body.',502);
+  const chunks=[];let total=0;
+  while(true){const {done,value}=await reader.read();if(done)break;total+=value.byteLength;if(total>maxBytes){await reader.cancel();error('Price source response exceeds 500 KB.',422)}chunks.push(value)}
+  const body=new Uint8Array(total);let offset=0;for(const chunk of chunks){body.set(chunk,offset);offset+=chunk.byteLength}
+  return new TextDecoder('utf-8',{fatal:false}).decode(body)
+}
 function decimalUnits(value){const raw=String(value??'0').trim();if(!/^\d+(?:\.\d{1,8})?$/.test(raw))error('Enter a valid payout amount with up to eight decimals.');const [whole,fraction='']=raw.split('.');return BigInt(whole)*100000000n+BigInt((fraction+'00000000').slice(0,8))}
 function unitsDecimal(units){const whole=units/100000000n,fraction=String(units%100000000n).padStart(8,'0');return `${whole}.${fraction}`}
 function signedUnitsDecimal(units){return units<0n?`-${unitsDecimal(-units)}`:unitsDecimal(units)}
@@ -123,8 +190,8 @@ async function assertLoginUnlocked(env){const row=(await rows(env,'SELECT locked
 async function assertLoginUnlockedTx(t){const row=(await t.execute('SELECT lock_id FROM raindeals_web_manager_login_lockouts WHERE lock_id=1 AND locked_until>UTC_TIMESTAMP() FOR UPDATE')).rows?.[0];if(row)error('Manager login is locked by /kill. Try again after the five-minute lock expires.',423)}
 const ownerIds=env=>new Set(String(env.MANAGER_ADMIN_IDS||'').split(',').map(x=>x.trim()).filter(x=>/^\d{1,20}$/.test(x)));
 const managerSections=['dashboard','products','orders','deposits','users','tickets','promocodes','custom_rates','api_keys','api_orders','referrals','vendor_offers','product_rate_controls','rate_control_assignments','manager_audit','settings'];
-const writableSections=['products','orders','tickets','promocodes','custom_rates','api_keys','vendor_offers','product_rate_controls','rate_control_assignments','settings'];
-const managerCapabilities=[...writableSections.map(x=>x+'_write'),'orders_export','orders_alerts','delivery_ids','delivery_secrets','vendor_offer_secrets'];
+const writableSections=['products','orders','deposits','tickets','promocodes','custom_rates','api_keys','vendor_offers','product_rate_controls','rate_control_assignments','settings'];
+const managerCapabilities=[...writableSections.map(x=>x+'_write'),'orders_export','orders_alerts','deposits_export','delivery_ids','delivery_secrets','vendor_offer_secrets'];
 function jsonValue(value,fallback){if(typeof value==='string'){try{return JSON.parse(value)}catch{return fallback}}return value??fallback}
 async function optionalRows(env,sql,args=[]){try{return await rows(env,sql,args)}catch(e){if(/1146|doesn't exist/i.test(String(e?.message||e)))return[];throw e}}
 async function managerAdmin(env,id){
@@ -141,6 +208,7 @@ function requiredPermission(path){
   if(path==='/manage/me')return null;
   if(path==='/manage/admins'||path.startsWith('/manage/admins/'))return'admins';
   if(path.startsWith('/manage/orders/export'))return'orders_export';
+  if(path.startsWith('/manage/deposits/export'))return'deposits_export';
   if(path.startsWith('/manage/orders/alerts'))return'orders_alerts';
   if(path.startsWith('/manage/orders/'))return'orders';
   if(path==='/manage/orders')return'orders';
@@ -428,7 +496,7 @@ async function route(request,env){
     if(!/^[a-z][a-z0-9_-]{1,31}$/.test(role))error('Role name must be 2–32 letters, numbers, _ or -.');
     if(!Array.isArray(b.permissions)||!b.permissions.length)error('Select at least one permission.');
     const permissions=[...new Set(b.permissions.map(String))];for(const p of permissions)if(!managerSections.includes(p)&&!managerCapabilities.includes(p))error('Unknown permission: '+p);
-    for(const p of permissions){if(p.endsWith('_write')&&!permissions.includes(p.slice(0,-6)))error('Grant the section before its edit permission.');if(['orders_export','orders_alerts','delivery_ids','delivery_secrets'].includes(p)&&!permissions.includes('orders'))error('Grant Orders before its special actions.');if(p==='vendor_offer_secrets'&&!permissions.includes('vendor_offers'))error('Grant Vendor offers before private vendor details.');}
+    for(const p of permissions){if(p.endsWith('_write')&&!permissions.includes(p.slice(0,-6)))error('Grant the section before its edit permission.');if(['orders_export','orders_alerts','delivery_ids','delivery_secrets'].includes(p)&&!permissions.includes('orders'))error('Grant Orders before its special actions.');if(p==='deposits_export'&&!permissions.includes('deposits'))error('Grant Deposits before its export action.');if(p==='vendor_offer_secrets'&&!permissions.includes('vendor_offers'))error('Grant Vendor offers before private vendor details.');}
     await db(env,'INSERT INTO raindeals_web_manager_admins (telegram_id,display_name,role_key,permissions_json,is_active,is_owner,added_by,created_at,updated_at) VALUES (?,?,?,?,1,0,?,UTC_TIMESTAMP(6),UTC_TIMESTAMP(6)) ON DUPLICATE KEY UPDATE display_name=VALUES(display_name),role_key=VALUES(role_key),permissions_json=VALUES(permissions_json),is_active=1,updated_at=UTC_TIMESTAMP(6)',[telegramId,displayName,role,JSON.stringify(permissions),auth.admin_id]);
     await audit(env,auth.admin_id,target?'update':'create','manager_admin',telegramId,{role_key:role,permissions});return reply({success:true,message:'Admin role saved. The Telegram ID can now verify sign-ins.'});
   }
@@ -638,6 +706,61 @@ async function route(request,env){
     const order=(await rows(env,'SELECT id,delivered_account FROM orders WHERE id=? LIMIT 1',[orderIds[1]]))[0];if(!order)error('Order not found.',404);
     const identifiers=String(order.delivered_account||'').split(/\r?\n/).map(x=>x.trim()).filter(x=>/^[^:\s]{1,256}:.+$/.test(x)).map(x=>x.slice(0,x.indexOf(':')));
     await audit(env,auth.admin_id,'view','delivered_identifiers',order.id,{count:identifiers.length});return reply({order_id:String(order.id),identifiers,format:'Only text before the first colon is returned; passwords and full delivery strings are never returned.'});
+  }
+  if(path==='/manage/runtime-settings'&&request.method==='GET'){
+    const saved=await rows(env,'SELECT setting_key,setting_value,updated_at FROM raindeals_runtime_settings');
+    return reply({settings:Object.fromEntries(saved.map(row=>[row.setting_key,String(row.setting_value??'')])),updated_at:saved.reduce((latest,row)=>!latest||String(row.updated_at)>latest?String(row.updated_at):latest,'')||null});
+  }
+  if(path==='/manage/runtime-settings'&&request.method==='POST'){
+    const b=await body(request),normalized=normalizeRuntimeSettings(b.settings);
+    if(!Object.keys(normalized).length)error('No runtime settings were supplied.');
+    await tx(env,async t=>{for(const [key,value] of Object.entries(normalized))await t.execute('INSERT INTO raindeals_runtime_settings (setting_key,setting_value,updated_by,updated_at) VALUES (?,?,?,UTC_TIMESTAMP(6)) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value),updated_by=VALUES(updated_by),updated_at=VALUES(updated_at)',[key,value,auth.admin_id]);});
+    await audit(env,auth.admin_id,'update','runtime_settings','global',{keys:Object.keys(normalized)});
+    return reply({success:true,message:'Settings saved to shared TiDB. Bot and Mini App changes apply within a few seconds.',keys:Object.keys(normalized)});
+  }
+  if(path==='/manage/runtime-settings/test-price-source'&&request.method==='POST'){
+    const b=await body(request),priceUrl=publicHttpsUrl(b.url);if(!priceUrl)error('Enter a price source URL to test.');
+    let response;try{response=await fetch(priceUrl,{headers:{accept:'application/json,text/plain,text/html;q=0.8'},redirect:'manual',signal:AbortSignal.timeout(6000)});}catch{error('Could not connect to that price source.',502)}
+    if(response.status>=300&&response.status<400)error('Price source redirects. Save the final HTTPS URL directly.',422);
+    let raw;try{raw=await readLimitedText(response,500000)}catch(e){if(e.status)throw e;error('Price source returned an unreadable response.',502)}
+    let rate=null;try{const parsed=JSON.parse(raw);const find=v=>{if(Array.isArray(v))return v.length===1?find(v[0]):null;if(v&&typeof v==='object'){for(const [k,x] of Object.entries(v)){if(/^(rate|price|usdt[_-]?inr|inr|value|lastprice)$/i.test(k)){const n=typeof x==='object'?find(x):Number(x);if(Number.isFinite(n)&&n>=1&&n<=1000)return n}}for(const k of ['data','result','ticker']){if(v[k]!==undefined){const n=find(v[k]);if(n!==null)return n}}return null}const n=Number(v);return Number.isFinite(n)&&n>=1&&n<=1000?n:null};rate=find(parsed)}catch{}
+    if(rate===null){const match=raw.match(/(?:₹\s*|\b)(\d{1,4}(?:\.\d{1,6})?)\s*(?:INR|₹)/i)||raw.match(/(?:rate|price|usdt\s*inr)\D{0,30}(\d{1,4}(?:\.\d{1,6})?)/i);const value=match?Number(match[1]):NaN;if(Number.isFinite(value)&&value>=1&&value<=1000)rate=value}
+    if(!response.ok||rate===null)error('The source must return an INR-per-USDT value from 1 to 1,000. Expected JSON such as {"rate": 89.5}.',422);
+    await audit(env,auth.admin_id,'test','usdt_price_source','global',{host:new URL(priceUrl).host,rate});
+    return reply({success:true,rate,message:`Price source is reachable. Parsed rate: ₹${rate} per USDT.`});
+  }
+  if(path==='/manage/deposits/export'&&request.method==='GET'){
+    const limit=Math.max(1,Math.min(20000,Number(url.searchParams.get('limit'))||10000));
+    const available=(await rows(env,'SHOW COLUMNS FROM deposits')).map(c=>c.Field),wanted=responseFields.deposits.split(','),visible=wanted.filter(c=>available.includes(c));
+    const found=await rows(env,`SELECT ${visible.map(c=>'`'+c+'`').join(',')} FROM deposits ORDER BY id DESC LIMIT ${limit}`);
+    const csv=[visible.map(csvCell).join(','),...found.map(row=>visible.map(key=>csvCell(row[key])).join(','))].join('\r\n');
+    await audit(env,auth.admin_id,'export','deposits','latest',{rows:found.length,limit});
+    return new Response(csv,{headers:{'content-type':'text/csv; charset=utf-8','content-disposition':'attachment; filename="raindeals-deposits.csv"','cache-control':'no-store'}});
+  }
+  const depositReview=path.match(/^\/manage\/deposits\/(\d+)\/review$/);
+  if(depositReview&&request.method==='POST'){
+    const b=await body(request),depositId=depositReview[1],action=String(b.action||'').trim(),note=String(b.note||'').trim().slice(0,2000),reference=String(b.external_reference||'').trim().slice(0,255);
+    if(!['flag','resolve','approve_credit','record_refund'].includes(action))error('Choose flag, resolve, approve_credit, or record_refund.');
+    if(!note)error('Add a short audit note for this review action.');
+    if(action==='record_refund'&&!reference)error('Enter the external payment or support reference after the manual refund is sent.');
+    const dep=(await rows(env,'SELECT id,status,tx_hash,received_amount FROM deposits WHERE id=? LIMIT 1',[depositId]))[0];if(!dep)error('Deposit not found.',404);
+    if(action==='approve_credit'&&(!dep.tx_hash||Number(dep.received_amount||0)<=0||String(dep.status)!=='review_required'))error('Only a verified payment held for review can be approved for wallet credit.',409);
+    if(action==='record_refund'&&(String(dep.status)!=='review_required'||Number(dep.received_amount||0)<=0))error('Only a verified payment held for review can be recorded as externally refunded.',409);
+    if(action==='flag'&&(!dep.tx_hash||['completed','failed','refunded'].includes(String(dep.status))))error('Only an open submitted payment can be flagged.',409);
+    await tx(env,async t=>{
+      if(action==='flag')await t.execute("UPDATE deposits SET status='review_required' WHERE id=? AND status NOT IN ('completed','failed','refunded')",[depositId]);
+      if(action==='resolve')await t.execute("UPDATE deposits SET status='pending' WHERE id=? AND status='review_required'",[depositId]);
+      if(action==='approve_credit')await t.execute("UPDATE deposits SET status='pending' WHERE id=? AND status='review_required'",[depositId]);
+      if(action==='record_refund')await t.execute("UPDATE deposits SET status='refunded' WHERE id=? AND status='review_required'",[depositId]);
+      await t.execute('INSERT INTO raindeals_deposit_reviews (deposit_id,admin_id,action,note,external_reference,created_at) VALUES (?,?,?,?,?,UTC_TIMESTAMP(6))',[depositId,auth.admin_id,action,note,reference||null]);
+    });
+    await audit(env,auth.admin_id,action,'deposit',depositId,{note,external_reference:reference||null});
+    return reply({success:true,message:action==='approve_credit'?'Approval saved. The bot will re-verify the original payment and credit the confirmed amount if it still matches.':action==='resolve'?'Review cleared. The bot will resume automatic verification.':action==='record_refund'?'External refund recorded for audit. The Manager does not transfer funds.':'Deposit moved to review_required; automatic wallet credit is paused.'});
+  }
+  const depositReviewHistory=path.match(/^\/manage\/deposits\/(\d+)\/reviews$/);
+  if(depositReviewHistory&&request.method==='GET'){
+    const found=await rows(env,'SELECT id,deposit_id,admin_id,action,note,external_reference,created_at FROM raindeals_deposit_reviews WHERE deposit_id=? ORDER BY id DESC LIMIT 50',[depositReviewHistory[1]]);
+    return reply({rows:found});
   }
   if(path==='/manage/settings'&&request.method==='GET'){
     const [saved,maintenance]=await Promise.all([
@@ -923,6 +1046,7 @@ async function route(request,env){
     const pageRows=await rows(env,`SELECT ${visible.map(c=>'`'+c+'`').join(',')}${extra} FROM \`${dbTable}\`${where} ORDER BY id DESC LIMIT 31 OFFSET ${offset}`,params);
     let outputRows=pageRows.slice(0,30);
     if(name==='products'&&outputRows.length){const ids=outputRows.map(row=>row.id),placeholders=ids.map(()=>'?').join(',');const shared=await rows(env,`SELECT id,CASE WHEN COALESCE(reusable_delivery,'')='' THEN 0 ELSE COALESCE(reusable_stock,0) END AS reusable_stock FROM products WHERE id IN (${placeholders})`,ids);const sharedMap=new Map(shared.map(row=>[String(row.id),Number(row.reusable_stock||0)]));for(const row of outputRows)row.reusable_stock=sharedMap.get(String(row.id))||0;}
+    if(name==='deposits'&&outputRows.length){const ids=outputRows.map(row=>row.id),placeholders=ids.map(()=>'?').join(',');const actions=await rows(env,`SELECT r.deposit_id,r.action AS last_review_action,r.note AS last_review_note,r.external_reference AS last_external_reference,r.admin_id AS last_review_admin,r.created_at AS last_review_at FROM raindeals_deposit_reviews r JOIN (SELECT deposit_id,MAX(id) AS id FROM raindeals_deposit_reviews WHERE deposit_id IN (${placeholders}) GROUP BY deposit_id) latest ON latest.id=r.id`,ids);const reviewMap=new Map(actions.map(row=>[String(row.deposit_id),row]));for(const row of outputRows)Object.assign(row,reviewMap.get(String(row.id))||{});}
     if(name==='providers'&&outputRows.length){
       const ids=outputRows.map(row=>row.id),placeholders=ids.map(()=>'?').join(',');
       const [flags,counts]=await Promise.all([

@@ -72,6 +72,9 @@ def _credit_preorder_referral(db, order) -> dict | None:
     order.is_preorder = False
     order.referral_commission_amount = Decimal("0")
     order.referral_commission_to_balance = bool(REFERRAL_CREDIT_TO_BALANCE)
+    from services.runtime_settings import setting_bool
+    if not setting_bool("feature_referrals", True):
+        return None
     buyer = db.query(User).filter(User.telegram_id == order.telegram_id).with_for_update().first()
     if not buyer or not buyer.referred_by:
         return None

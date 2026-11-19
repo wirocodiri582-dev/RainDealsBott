@@ -134,8 +134,11 @@ def submit(telegram_id, bot_id, product_name, description, delivery_instructions
     from models.vendor_offer import VendorOffer, VendorRequest
     from services.input_forms import text_value
     from services.notification_outbox import enqueue_admin
+    from services.runtime_settings import setting_bool
     from html import escape
 
+    if not setting_bool("feature_vendor_offers", True):
+        raise ValueError("Provider offers are temporarily unavailable.")
     product_name = text_value(product_name, 120, 3)
     description = text_value(description, 1400, 10)
     delivery_instructions = text_value(delivery_instructions, 1400, 5)

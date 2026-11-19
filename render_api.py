@@ -38,7 +38,11 @@ from services.supplier_reconciliation import supplier_reconciliation_loop
 from services.notification_outbox import notification_loop
 from services.product_api_access import ensure_product_api_access_schema
 from services.provider_schema import ensure_provider_schema
-from services.maintenance_mode import ensure_maintenance_schema, is_maintenance_enabled
+from services.maintenance_mode import (
+    customer_store_pause_message,
+    ensure_maintenance_schema,
+    is_customer_store_paused,
+)
 from services.order_rating_schema import ensure_order_rating_schema
 from services.order_requirements_schema import ensure_order_requirements_schema
 from services.warranty_revision_schema import ensure_warranty_revision_schema
@@ -367,13 +371,13 @@ async def api_validation_error(request: Request, exc: RequestValidationError):
 async def request_logger(request: Request, call_next):
 
     commerce_api = request.url.path.startswith(("/api/v1/", "/miniapp/api/"))
-    if commerce_api and await asyncio.to_thread(is_maintenance_enabled):
+    if commerce_api and await asyncio.to_thread(is_customer_store_paused):
         return JSONResponse(
             status_code=503,
             content={
                 "success": False,
-                "error": "maintenance_mode",
-                "message": "Rain Store is currently under maintenance. Please check back soon.",
+                "error": "store_paused",
+                "message": customer_store_pause_message("Rain Store is currently under maintenance. Please check back soon."),
             },
         )
 

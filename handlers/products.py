@@ -3395,7 +3395,8 @@ def _do_purchase(
         if not is_preorder_order and user.referred_by:
             order.referral_commission_amount = Decimal("0")
             order.referral_commission_to_balance = bool(REFERRAL_CREDIT_TO_BALANCE)
-            referrer = db.query(User).filter(User.telegram_id == user.referred_by).with_for_update().first()
+            from services.runtime_settings import setting_bool
+            referrer = db.query(User).filter(User.telegram_id == user.referred_by).with_for_update().first() if setting_bool("feature_referrals", True) else None
             if referrer is not None:
                 commission = _money(total_amount * REFERRAL_COMMISSION_RATE)
                 if commission > 0:
@@ -3792,7 +3793,8 @@ async def _do_reseller_purchase_unlocked(
             if u.referred_by:
                 order.referral_commission_amount = Decimal("0")
                 order.referral_commission_to_balance = bool(REFERRAL_CREDIT_TO_BALANCE)
-                referrer = db.query(User).filter(User.telegram_id == u.referred_by).with_for_update().first()
+                from services.runtime_settings import setting_bool
+                referrer = db.query(User).filter(User.telegram_id == u.referred_by).with_for_update().first() if setting_bool("feature_referrals", True) else None
                 if referrer is not None:
                     commission = _money(total_amount * REFERRAL_COMMISSION_RATE)
                     if commission > 0:

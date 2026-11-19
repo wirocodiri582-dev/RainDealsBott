@@ -29,7 +29,11 @@ def stars_rate() -> Decimal | None:
     """Return the configured USDT credit per Star, or None if disabled."""
     import config
 
-    raw = str(getattr(config, "TELEGRAM_STARS_USDT_PER_STAR", "") or "").strip()
+    from services.runtime_settings import payment_value
+    raw = payment_value(
+        "payment_stars_usdt_per_star",
+        str(getattr(config, "TELEGRAM_STARS_USDT_PER_STAR", "") or ""),
+    )
     if not raw:
         return None
     try:
@@ -46,6 +50,16 @@ def stars_rate() -> Decimal | None:
 
 def stars_configured() -> bool:
     return stars_rate() is not None
+
+
+def stars_limits() -> tuple[int, int]:
+    from services.runtime_settings import payment_value
+    try:
+        minimum = max(1, min(100_000, int(payment_value("payment_min_stars", str(MIN_STARS_AMOUNT)) or MIN_STARS_AMOUNT)))
+        maximum = max(minimum, min(100_000, int(payment_value("payment_max_stars", str(MAX_STARS_AMOUNT)) or MAX_STARS_AMOUNT)))
+        return minimum, maximum
+    except (TypeError, ValueError):
+        return MIN_STARS_AMOUNT, MAX_STARS_AMOUNT
 
 
 async def create_stars_invoice_link(bot, invoice: dict) -> str:
@@ -78,9 +92,10 @@ def quote_usdt(stars: int, rate: Decimal | None = None) -> Decimal:
         count = int(stars)
     except (TypeError, ValueError):
         raise StarsPaymentError("Enter a whole number of Telegram Stars.")
-    if count < MIN_STARS_AMOUNT or count > MAX_STARS_AMOUNT:
+    minimum, maximum = stars_limits()
+    if count < minimum or count > maximum:
         raise StarsPaymentError(
-            f"Enter an amount from {MIN_STARS_AMOUNT} to {MAX_STARS_AMOUNT:,} Stars."
+            f"Enter an amount from {minimum:,} to {maximum:,} Stars."
         )
     rate = rate if rate is not None else stars_rate()
     if rate is None:
@@ -157,9 +172,10 @@ def create_stars_invoice(telegram_id: int, stars_amount: int) -> dict:
             row.status = "expired"
 
         from services.session_policy import INVOICE_LIFETIME_SECONDS
+        from services.runtime_settings import invoice_lifetime_seconds
         invoice_code = f"STARS{secrets.token_hex(5).upper()}"
         payload = "rdstars_" + secrets.token_urlsafe(32)
-        expires = now + timedelta(seconds=int(INVOICE_LIFETIME_SECONDS))
+        expires = now + timedelta(seconds=invoice_lifetime_seconds("STARS", INVOICE_LIFETIME_SECONDS))
         row = Deposit(
             telegram_id=int(telegram_id), order_id=invoice_code,
             invoice_code=invoice_code, invoice_expires_at=expires,

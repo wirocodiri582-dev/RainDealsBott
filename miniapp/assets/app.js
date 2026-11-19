@@ -2,6 +2,7 @@
   const tg = window.Telegram?.WebApp;
   const state = {
     initData: tg?.initData || "", profile: null, products: [], freebies: false,
+    features: { cart: true, freebies: true, referrals: true, vendor_offers: true, deposits: true },
     category: "All", search: "", stockOnly: false, sort: "featured", cart: { items: [] },
     unread: 0, botUsername: "", depositMethods: [], currentProductId: null, buyerInfoDraft: {},
     currentView: "store", cartPending: new Map(), pendingAdds: new Set(), productDetails: new Map(),
@@ -82,7 +83,8 @@
     const count = state.cart.items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
     const badge = $("#cart-count");
     badge.textContent = count > 99 ? "99+" : String(count);
-    badge.classList.toggle("hidden", count < 1);
+    badge.classList.toggle("hidden", count < 1 || !state.features.cart);
+    $("#cart-open").classList.toggle("hidden", !state.features.cart);
     $("#notify-dot").classList.toggle("hidden", !state.unread);
     if (state.profile) {
       $("#balance-mini").textContent = money(state.profile.balance);
@@ -202,7 +204,7 @@
       const label = category === "All" ? (state.freebies ? "🎁 Freebies" : "All") : category;
       const count = category === "All" ? state.products.length : counts.get(category);
       return `<button class="category-chip ${state.category === category ? "active" : ""}" data-category="${esc(category)}">${esc(label)} <em>${count}</em></button>`;
-    }).join("") + `<button class="category-chip ${state.freebies ? "" : ""}" data-freebies="toggle">${state.freebies ? "🛍 Paid shop" : "🎁 Freebies"}</button>`;
+    }).join("") + (state.features.freebies ? `<button class="category-chip" data-freebies="toggle">${state.freebies ? "🛍 Paid shop" : "🎁 Freebies"}</button>` : "");
   }
 
   function renderStore() {
@@ -220,7 +222,7 @@
         <div class="product-info">
           <div class="product-category">${product.freebie_referrals_required ? `🔒 ${Number(product.verified_referrals || 0)}/${Number(product.freebie_referrals_required)} verified` : esc(product.category)}</div>
           <h3 class="product-name">${esc(product.name)}</h3>
-          <div class="product-foot"><div class="product-price">${money(product.price)} <small>USDT</small></div><button class="add-button" data-add="${product.id}" aria-label="Add ${esc(product.name)} to cart" ${!product.purchasable || state.pendingAdds.has(Number(product.id)) || state.cartPending.has(Number(product.id)) ? "disabled" : ""}>${state.pendingAdds.has(Number(product.id)) || state.cartPending.has(Number(product.id)) ? "…" : "+"}</button></div>
+          <div class="product-foot"><div class="product-price">${money(product.price)} <small>USDT</small></div><button class="add-button" data-add="${product.id}" aria-label="Add ${esc(product.name)} to cart" ${!state.features.cart || !product.purchasable || state.pendingAdds.has(Number(product.id)) || state.cartPending.has(Number(product.id)) ? "disabled" : ""}>${!state.features.cart ? "—" : state.pendingAdds.has(Number(product.id)) || state.cartPending.has(Number(product.id)) ? "…" : "+"}</button></div>
         </div>
       </article>`).join("");
     $("#empty-state").classList.toggle("hidden", items.length > 0);
@@ -269,7 +271,7 @@
       ${gatedFreebie ? `<div class="soft-note" style="margin:12px 0">🔐 ${esc(gateCopy)}</div>` : ""}
       ${(product.required_info || []).map(field => `<div class="soft-note">Before checkout: ${esc(field.label)} (${esc(field.type)})</div>`).join("")}
       ${product.preorder ? `<div class="soft-note" style="margin:12px 0">This item is currently out of stock. Your order will be queued for manual fulfillment when accepted.</div>` : ""}
-      ${gateLocked ? `<button class="primary-button wide-button" data-action="share-referral" ${state.profile?.referral_link ? "" : "disabled"}>🤝 Invite friends to unlock</button>` : unsupported ? `<div class="soft-note" style="margin:12px 0">This item needs a photo or Telegram contact. Open the bot to complete that secure form.</div><button class="primary-button wide-button" data-action="open-bot">Continue in Telegram</button>` : `<button class="primary-button wide-button" data-action="add-product" data-id="${product.id}" ${!product.purchasable || adding ? "disabled" : ""}>${adding ? "Adding to cart…" : product.preorder ? "Add preorder to cart" : "Add to cart"}</button>`}
+      ${gateLocked ? `<button class="primary-button wide-button" data-action="share-referral" ${state.features.referrals && state.profile?.referral_link ? "" : "disabled"}>🤝 Invite friends to unlock</button>` : unsupported ? `<div class="soft-note" style="margin:12px 0">This item needs a photo or Telegram contact. Open the bot to complete that secure form.</div><button class="primary-button wide-button" data-action="open-bot">Continue in Telegram</button>` : `<button class="primary-button wide-button" data-action="add-product" data-id="${product.id}" ${!state.features.cart || !product.purchasable || adding ? "disabled" : ""}>${!state.features.cart ? "Cart purchases are unavailable" : adding ? "Adding to cart…" : product.preorder ? "Add preorder to cart" : "Add to cart"}</button>`}
       <button class="secondary-button wide-button" style="margin-top:8px" data-close-modal>Keep browsing</button>
     `, "product");
   }
@@ -360,6 +362,7 @@
   }
 
   function addProduct(productId) {
+    if (!state.features.cart) { toast("Cart purchases are temporarily unavailable."); return; }
     if (!state.cartReady) {
       const id = Number(productId);
       if (state.pendingAdds.has(id)) return;
@@ -457,11 +460,11 @@
     const deposits = depositData.deposits || [];
     $("#balance-view").innerHTML = `
       <p class="eyebrow">YOUR RAINDEALS WALLET</p><h1 class="page-title">Balance</h1>
-      <div class="panel-card balance-card"><small>AVAILABLE BALANCE</small><strong>${money(data.balance)} <small>USDT</small></strong><div class="balance-actions"><button data-action="open-deposit-methods">＋ Add funds</button><button data-action="open-promocode">🎟 Redeem code</button></div></div>
+      <div class="panel-card balance-card"><small>AVAILABLE BALANCE</small><strong>${money(data.balance)} <small>USDT</small></strong><div class="balance-actions">${state.features.deposits ? `<button data-action="open-deposit-methods">＋ Add funds</button>` : ""}<button data-action="open-promocode">🎟 Redeem code</button></div></div>
       <div class="panel-card"><h2 class="panel-heading">Recent wallet activity</h2>
         ${entries.length ? entries.map(row => `<div class="row-line"><div><strong>${esc(row.label)}</strong><small>${esc(when(row.created_at))}</small></div><span class="amount ${Number(row.amount) >= 0 ? "positive" : "negative"}">${Number(row.amount) >= 0 ? "+" : "−"}${money(Math.abs(Number(row.amount)))}<small> · ${money(row.balance)} balance</small></span></div>`).join("") : `<p class="muted-count">Your wallet activity will appear here.</p>`}
       </div>
-      <div class="panel-card"><div class="section-heading compact-heading"><h2 class="panel-heading">My deposits</h2><button class="text-button" data-action="open-deposit-methods">＋ Add funds</button></div>
+      <div class="panel-card"><div class="section-heading compact-heading"><h2 class="panel-heading">My deposits</h2>${state.features.deposits ? `<button class="text-button" data-action="open-deposit-methods">＋ Add funds</button>` : ""}</div>
         ${deposits.length ? deposits.slice(0, 5).map(row => `<button class="deposit-history-row" data-deposit-detail="${Number(row.id)}"><span class="deposit-history-icon">${esc(row.icon || "💳")}</span><span><strong>${esc(row.invoice || `Deposit #${row.id}`)}</strong><small>${esc(row.network_label || row.network)} · ${esc(when(row.created_at))}</small></span><span class="status-pill ${esc(row.status)}">${esc(String(row.status).replaceAll("_", " "))}</span></button>`).join("") : `<p class="muted-count">Your deposit history will appear here.</p>`}
         <button class="secondary-button wide-button" data-action="load-deposits">View deposit history</button>
       </div>`;
@@ -477,26 +480,29 @@
   }
 
   function openDepositMethods(methods) {
+    if (!state.features.deposits) { toast("Deposits are temporarily unavailable."); return; }
     const rows = methods || [];
     openModal(`<p class="eyebrow">ADD FUNDS</p><h2 class="page-title" id="modal-title">Choose a payment method</h2>
       <p class="muted-count">Choose how you want to pay. Your verified payment amount is credited to your wallet.</p>
-      <div class="payment-method-list">${rows.map(row => `<button class="payment-method-card ${row.configured && !state.depositPending ? "" : "disabled"}" data-deposit-network="${esc(row.network)}" ${row.configured && !state.depositPending ? "" : "disabled"}><span>${esc(row.icon)}</span><span><strong>${esc(row.label)}</strong><small>${state.depositPending ? "Creating your invoice…" : row.configured ? row.network === "STARS" ? `Choose a Stars amount · ${esc(row.usdt_per_star)} USDT per Star` : `Submit ${esc(row.reference_label)} after paying` : row.network === "STARS" ? "Temporarily unavailable · ask admin to configure the rate" : "Temporarily unavailable"}</small></span><b>${row.configured ? "›" : "—"}</b></button>`).join("")}</div>
+      <div class="payment-method-list">${rows.map(row => `<button class="payment-method-card ${row.configured && !state.depositPending ? "" : "disabled"}" data-deposit-network="${esc(row.network)}" ${row.configured && !state.depositPending ? "" : "disabled"}><span>${esc(row.icon)}</span><span><strong>${esc(row.label)}</strong><small>${state.depositPending ? "Creating your invoice…" : row.configured ? row.network === "STARS" ? `Choose ${row.stars_minimum ?? 1}–${row.stars_maximum ?? 100000} Stars · ${esc(row.usdt_per_star)} USDT per Star` : `Allowed: ${esc(row.minimum)}–${esc(row.maximum)} ${row.network === "UPI" ? "INR" : "USDT"} · Submit ${esc(row.reference_label)} after paying` : row.network === "STARS" ? "Temporarily unavailable · ask admin to configure the rate" : "Temporarily unavailable"}</small></span><b>${row.configured ? "›" : "—"}</b></button>`).join("")}</div>
       <button class="secondary-button wide-button" data-action="load-deposits">View deposit history</button>`, "deposit-methods");
   }
 
   function openStarsAmountForm() {
     const method = state.depositMethods.find(row => row.network === "STARS");
     if (!method?.configured) { toast("Telegram Stars is temporarily unavailable."); return; }
+    const minimum = Number(method.stars_minimum ?? 1), maximum = Number(method.stars_maximum ?? 100000);
     openModal(`<p class="eyebrow">⭐ TELEGRAM STARS</p><h2 class="page-title" id="modal-title">Choose your Stars amount</h2>
       <p class="muted-count">Your wallet credit is calculated at <strong>${esc(method.usdt_per_star)} USDT per Star</strong>. Telegram confirms payment automatically.</p>
-      <label class="field-label">Stars to pay<input id="stars-amount" class="field-input" inputmode="numeric" type="number" min="1" max="100000" step="1" placeholder="For example, 1 or 2"></label>
-      <p class="soft-note">Use a whole number from 1 to 100,000. Your wallet is credited only after Telegram reports successful payment.</p>
+      <label class="field-label">Stars to pay<input id="stars-amount" class="field-input" inputmode="numeric" type="number" min="${minimum}" max="${maximum}" step="1" placeholder="For example, ${minimum}"></label>
+      <p class="soft-note">Use a whole number from ${minimum.toLocaleString()} to ${maximum.toLocaleString()}. Your wallet is credited only after Telegram reports successful payment.</p>
       <button class="primary-button wide-button" data-action="create-stars-deposit">Continue to Telegram checkout</button>
       <button class="secondary-button wide-button" style="margin-top:8px" data-action="change-payment-method">Back to payment methods</button>`, "stars-amount");
     $("#stars-amount")?.focus();
   }
 
   async function showDepositMethods() {
+    if (!state.features.deposits) { toast("Deposits are temporarily unavailable."); return; }
     if (state.depositMethods.length) { openDepositMethods(state.depositMethods); return; }
     openModal(`<p class="eyebrow">ADD FUNDS</p><h2 class="page-title" id="modal-title">Choose a payment method</h2><div class="loading"><span class="spinner"></span><p>Loading available methods…</p></div>`, "deposit-methods");
     try { const data = await api("/deposit-methods"); if (state.modal === "deposit-methods") openDepositMethods(data.methods || []); }
@@ -662,7 +668,7 @@
   async function loadDepositsHistory(page = 0) {
     try {
       const data = await api(`/deposits?page=${page}`);
-      openModal(`<p class="eyebrow">WALLET</p><h2 class="page-title" id="modal-title">Deposit history</h2>${data.deposits.length ? data.deposits.map(row => `<button class="deposit-history-row" data-deposit-detail="${Number(row.id)}"><span class="deposit-history-icon">${esc(row.icon || "💳")}</span><span><strong>${esc(row.invoice || `Deposit #${row.id}`)}</strong><small>${esc(row.network_label || row.network)} · ${esc(when(row.created_at))}</small></span><span class="status-pill ${esc(row.status)}">${esc(String(row.status).replaceAll("_", " "))}</span></button>`).join("") : `<div class="empty-state"><span>💳</span><strong>No deposits yet</strong><p>Your deposits will appear here.</p></div>`}<div class="search-row" style="grid-template-columns:1fr 1fr"><button class="secondary-button" data-deposit-page="${Math.max(0, page - 1)}" ${page <= 0 ? "disabled" : ""}>‹ Previous</button><button class="secondary-button" data-deposit-page="${page + 1}" ${!data.has_more ? "disabled" : ""}>Next ›</button></div><button class="primary-button wide-button" style="margin-top:10px" data-action="open-deposit-methods">＋ Add funds</button>`, "deposit-history");
+      openModal(`<p class="eyebrow">WALLET</p><h2 class="page-title" id="modal-title">Deposit history</h2>${data.deposits.length ? data.deposits.map(row => `<button class="deposit-history-row" data-deposit-detail="${Number(row.id)}"><span class="deposit-history-icon">${esc(row.icon || "💳")}</span><span><strong>${esc(row.invoice || `Deposit #${row.id}`)}</strong><small>${esc(row.network_label || row.network)} · ${esc(when(row.created_at))}</small></span><span class="status-pill ${esc(row.status)}">${esc(String(row.status).replaceAll("_", " "))}</span></button>`).join("") : `<div class="empty-state"><span>💳</span><strong>No deposits yet</strong><p>Your deposits will appear here.</p></div>`}<div class="search-row" style="grid-template-columns:1fr 1fr"><button class="secondary-button" data-deposit-page="${Math.max(0, page - 1)}" ${page <= 0 ? "disabled" : ""}>‹ Previous</button><button class="secondary-button" data-deposit-page="${page + 1}" ${!data.has_more ? "disabled" : ""}>Next ›</button></div>${state.features.deposits ? `<button class="primary-button wide-button" style="margin-top:10px" data-action="open-deposit-methods">＋ Add funds</button>` : ""}`, "deposit-history");
     } catch (error) { toast(error.message); }
   }
 
@@ -693,7 +699,7 @@
         <div class="profile-stats"><div><small>Balance</small><strong>${money(p.balance)} USDT</strong></div><div><small>Orders</small><strong>${Number(p.orders || 0)}</strong></div><div><small>Total spent</small><strong>${money(p.spent)} USDT</strong></div><div><small>Deposited</small><strong>${money(p.deposited)} USDT</strong></div></div>
         <div class="row-line"><div><strong>Telegram ID</strong><small>RainDeals account</small></div><span class="amount">${esc(p.telegram_id)}</span></div>
       </div>
-      <div class="panel-card referral-card"><h2 class="panel-heading">🤝 Invite friends</h2><p>Invitees count as completed after opening the RainDeals Store and passing verification. Shared-network matches may need admin review.</p><div class="referral-link"><code>${esc(p.referral_link || "Referral link unavailable")}</code><button class="text-button" data-action="copy-referral" ${p.referral_link ? "" : "disabled"}>Copy</button></div><div class="referral-stats"><span><strong>${Number(p.referrals || 0)}</strong><small>Invited</small></span><span><strong>${Number(p.verified_referrals || 0)}</strong><small>Completed</small></span><span><strong>${money(p.referral_earnings)} USDT</strong><small>Earned</small></span></div><button class="primary-button wide-button" style="margin-top:12px" data-action="share-referral" ${p.referral_link ? "" : "disabled"}>Share invite link</button></div>
+      ${state.features.referrals ? `<div class="panel-card referral-card"><h2 class="panel-heading">🤝 Invite friends</h2><p>Invitees count as completed after opening the RainDeals Store and passing verification. Shared-network matches may need admin review.</p><div class="referral-link"><code>${esc(p.referral_link || "Referral link unavailable")}</code><button class="text-button" data-action="copy-referral" ${p.referral_link ? "" : "disabled"}>Copy</button></div><div class="referral-stats"><span><strong>${Number(p.referrals || 0)}</strong><small>Invited</small></span><span><strong>${Number(p.verified_referrals || 0)}</strong><small>Completed</small></span><span><strong>${money(p.referral_earnings)} USDT</strong><small>Earned</small></span></div><button class="primary-button wide-button" style="margin-top:12px" data-action="share-referral" ${p.referral_link ? "" : "disabled"}>Share invite link</button></div>` : ""}
       <button class="order-card" data-view="notifications"><div class="order-top"><strong>🔔 Notifications</strong><span>${Number(state.unread || 0)} unread ›</span></div><p>Recent payment, order, support, and account updates.</p></button>
       <button class="order-card" data-action="notification-preferences"><div class="order-top"><strong>⚙️ Notification preferences</strong><span>›</span></div><p>Choose which bot updates you receive.</p></button>
       <button class="secondary-button wide-button" data-action="open-bot">Support &amp; account help in Telegram</button>`;
@@ -839,7 +845,9 @@
     if (target.dataset.action === "create-stars-deposit") {
       const input = $("#stars-amount");
       const amount = Number(input?.value);
-      if (!Number.isSafeInteger(amount) || amount < 1 || amount > 100_000) { toast("Enter a whole Stars amount from 1 to 100,000."); input?.focus(); return; }
+      const stars = state.depositMethods.find(row => row.network === "STARS");
+      const minimum = Number(stars?.stars_minimum ?? 1), maximum = Number(stars?.stars_maximum ?? 100_000);
+      if (!Number.isSafeInteger(amount) || amount < minimum || amount > maximum) { toast(`Enter a whole Stars amount from ${minimum.toLocaleString()} to ${maximum.toLocaleString()}.`); input?.focus(); return; }
       beginDeposit("STARS", amount);
       return;
     }
@@ -932,8 +940,10 @@
     try {
       const data = await api("/bootstrap");
       state.profile = data.profile; state.unread = data.unread_notifications || 0;
+      state.features = { ...state.features, ...(data.features || {}) };
       state.botUsername = data.main_bot_username || "";
       state.depositMethods = data.deposit_methods || [];
+      state.features = { ...state.features, ...(data.features || {}) };
       $("#loading").classList.add("hidden");
       if (data.verification?.just_completed) {
         document.body.classList.add("verification-only");
@@ -944,7 +954,8 @@
       syncHeader();
       $("#main").classList.remove("hidden"); $("#bottom-nav").classList.remove("hidden");
       renderProfile();
-      loadCart().catch(error => { state.cartReady = false; toast(error.message); });
+      if (state.features.cart) loadCart().catch(error => { state.cartReady = false; toast(error.message); });
+      else { state.cartReady = true; $("#cart-open").classList.add("hidden"); }
       loadProducts(false).catch(error => {
         $("#product-grid").innerHTML = `<div class="soft-note">${esc(error.message)} <button class="text-button" data-action="refresh-catalog">Try again</button></div>`;
       });

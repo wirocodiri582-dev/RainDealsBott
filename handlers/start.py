@@ -818,6 +818,10 @@ def _get_or_create_user(
     load_home_menu: bool = True,
     require_valid_referral: bool = False,
 ) -> dict:
+    if ref_payload:
+        from services.runtime_settings import setting_bool
+        if not setting_bool("feature_referrals", True):
+            ref_payload = ""
     with transaction() as db:
         user = db.query(User).filter(User.telegram_id == telegram_id).first()
         is_new = False

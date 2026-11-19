@@ -48,14 +48,14 @@ import secrets
 import threading
 import time as time_module
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.header import decode_header
 from typing import Optional, Union
 
 import requests
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, text
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -1822,9 +1822,10 @@ def _match_upi(
     if payment is None:
         return None
 
+    from services.runtime_settings import payment_value
     return {
         "sender": "UPI",
-        "receiver": UPI_ID,
+        "receiver": payment_value("payment_upi_id", UPI_ID),
         "amount": payment["amount"],
         "inr_amount": payment["amount"],
         "utr": (
@@ -2087,6 +2088,7 @@ async def verify_binance_pay_order(
 _usdt_inr_rate_cache = {
     "rate": None,
     "last_updated": None,
+    "source_url": None,
     "ttl_seconds": 180,  # Refresh cache every 3 minutes
 }
 
@@ -2095,12 +2097,21 @@ _current_api_key_index = 0
 
 def _get_usdt_inr_rate() -> Decimal:
     """
-    Fetches the live exchange rate from samarthpricefetch.onrender.com.
-    Falls back sequentially to open exchange APIs and config defaults.
+    Fetches the Manager-configured price source first, then public rate fallbacks.
+    The custom endpoint is read from the shared TiDB runtime settings table.
     """
     global _current_api_key_index
     now = time_module.time()
     cache = _usdt_inr_rate_cache
+
+    # A Manager edit to the source URL invalidates the old quote immediately
+    # (after the runtime-settings cache TTL), rather than waiting three minutes.
+    from services.runtime_settings import payment_value
+    configured_source = payment_value("usdt_price_source_url", "")
+    if configured_source != cache.get("source_url"):
+        cache["source_url"] = configured_source
+        cache["rate"] = None
+        cache["last_updated"] = None
 
     # 1. Return cached rate if fresh
     if (
@@ -2110,50 +2121,18 @@ def _get_usdt_inr_rate() -> Decimal:
     ):
         return cache["rate"]
 
-    # 2. Try primary live fetcher service hosted on Render
-    render_service_url = getattr(
-        config,
-        "RENDER_RATE_FETCHER_URL",
-        "https://samarthpricefetch.onrender.com/"
-    )
-
+    # 2. Try the operator-selected source saved by Manager in shared TiDB.
     try:
-        response = requests.get(
-            render_service_url,
-            headers={"Accept": "text/html,application/json"},
-            timeout=8
-        )
-        if response.status_code == 200:
-            text = response.text
-
-            # Try parsing raw JSON response
-            try:
-                json_data = json.loads(text)
-                if "rate" in json_data:
-                    rate_val = float(json_data["rate"])
-                    if rate_val > 0:
-                        rate = Decimal(str(rate_val))
-                        cache["rate"] = rate
-                        cache["last_updated"] = now
-                        logger.info("Fetched USD/INR rate from Render service JSON: %s", rate)
-                        return rate
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
-
-            # Try parsing HTML output from rendered webpage
-            match = re.search(r'₹\s*([\d\.]+)', text)
-            if not match:
-                match = re.search(r'([\d\.]+)\s*INR', text, re.IGNORECASE)
-            if match:
-                rate_val = float(match.group(1))
-                if 70.0 < rate_val < 150.0:
-                    rate = Decimal(str(rate_val))
-                    cache["rate"] = rate
-                    cache["last_updated"] = now
-                    logger.info("Fetched USD/INR rate from Render service HTML: %s", rate)
-                    return rate
-    except Exception as exc:
-        logger.warning("Render rate fetcher service unavailable: %s", exc)
+        from services.runtime_settings import fetch_manager_usdt_inr_rate, store_usdt_inr_snapshot
+        rate = fetch_manager_usdt_inr_rate()
+        if rate is not None:
+            cache["rate"] = rate
+            cache["last_updated"] = now
+            store_usdt_inr_snapshot(rate)
+            logger.info("Fetched USDT/INR rate from Manager source: %s", rate)
+            return rate
+    except Exception:
+        logger.exception("Could not read Manager-configured price source")
 
     # 3. Try CurrencyAPI keys if configured
     api_keys = getattr(config, "CURRENCY_API_KEYS", [])
@@ -2432,6 +2411,7 @@ def _hold_underpaid_for_review(
 ):
     """Preserve a verified short payment and enqueue one durable admin alert."""
     deposit.received_amount = received_amount
+    deposit.status = "review_required"
     if inr_amount is not None:
         deposit.inr_amount = inr_amount
     if conversion_rate is not None:
@@ -2447,7 +2427,7 @@ def _hold_underpaid_for_review(
             "shortfall": str(shortfall),
         })
 
-    from services.notification_outbox import enqueue_admin
+    from services.notification_outbox import enqueue, enqueue_admin
     enqueue_admin(
         db,
         f"deposit-underpaid:{deposit.id}",
@@ -2459,6 +2439,17 @@ def _hold_underpaid_for_review(
         f"Shortfall: <code>{shortfall:.8f} USDT</code>\n"
         "No wallet credit was made. Review the saved payment before deciding how to resolve it.",
     )
+    try:
+        bot_id = int(str(getattr(config, "BOT_TOKEN", "")).split(":", 1)[0])
+        enqueue(
+            db,
+            f"deposit-underpaid-user:{deposit.id}",
+            str(deposit.telegram_id),
+            "⚠️ Your payment was confirmed, but its amount is below the invoice amount. No wallet credit was made yet. RainDeals support will review it.",
+            bot_id=bot_id,
+        )
+    except Exception:
+        logger.exception("Could not queue customer underpayment notice deposit_id=%s", deposit.id)
     db.commit()
     logger.warning(
         "Verified deposit is underpaid and held for review deposit_id=%s received=%s requested=%s",
@@ -2466,6 +2457,15 @@ def _hold_underpaid_for_review(
         received_amount,
         requested_amount,
     )
+
+
+def _manual_deposit_credit_approved(db, deposit_id: int) -> bool:
+    try:
+        return db.execute(text(
+            "SELECT action FROM raindeals_deposit_reviews WHERE deposit_id=:deposit_id ORDER BY id DESC LIMIT 1"
+        ), {"deposit_id": int(deposit_id)}).scalar() == "approve_credit"
+    except Exception:
+        return False
 
 
 # ================================================================
@@ -2515,15 +2515,16 @@ async def _verify_deposit_claimed(
         if deposit.status in (
                 "completed",
                 "failed",
+                "review_required",
+                "refunded",
         ):
             _clear_pending_attempts(
                 deposit.id
             )
 
-            return (
-                    deposit.status
-                    == "completed"
-            )
+            if result_info is not None and deposit.status == "review_required":
+                result_info.update({"reason": "review_required", "deposit_id": int(deposit.id)})
+            return deposit.status == "completed"
 
         # --------------------------------------------------------
         # Requested amount
@@ -2661,6 +2662,7 @@ async def _verify_deposit_claimed(
                         received_amount
                         < requested_usdt
                         - AMOUNT_TOLERANCE
+                        and not _manual_deposit_credit_approved(db, int(deposit.id))
                 ):
                     _hold_underpaid_for_review(
                         db, deposit, received_amount, requested_usdt, result_info,
@@ -2773,6 +2775,16 @@ async def _verify_deposit_claimed(
             return False
 
         chain = CHAINS[network]
+        try:
+            from services.runtime_settings import payment_value
+            configured_address = payment_value(
+                "payment_bep20_address" if network == "BEP20" else "payment_polygon_address",
+                chain.address,
+            ).lower()
+            if configured_address:
+                chain = replace(chain, address=configured_address)
+        except Exception:
+            logger.exception("Could not load Manager payment destination for %s", network)
 
         # Persist when this TXID was first accepted. This is the anchor for
         # the three-day Binance-history claim window, including after restart.

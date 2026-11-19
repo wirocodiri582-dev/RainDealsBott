@@ -66,6 +66,9 @@ def change(user_id, product_id, quantity):
             raise ValueError('Product is unavailable because its price is invalid.')
         is_free = Decimal(str(product.price)) == 0
         if is_free:
+            from services.runtime_settings import setting_bool
+            if not setting_bool('feature_freebies', True):
+                raise ValueError('Freebies are temporarily unavailable.')
             quantity = 1
             from services.freebie_referrals import freebie_eligibility
             gate = freebie_eligibility(db, user_id, product)
@@ -131,14 +134,18 @@ def _quote(db, user_id):
                     price = _money(bulk)
                 gate = None
                 if Decimal(str(product.price)) == 0:
-                    from services.freebie_referrals import freebie_eligibility
-                    gate = freebie_eligibility(db, user_id, product)
-                    if not gate["unlocked"]:
-                        if not gate["claimant_verified"]:
-                            error = 'Open the RainDeals Mini App once to verify your Telegram account before claiming this freebie.'
-                        else:
-                            error = (f'This freebie unlocks after {gate["required"]} referred account(s) open the RainDeals Mini App. '
-                                     f'Verified: {gate["verified_referrals"]}/{gate["required"]}.')
+                    from services.runtime_settings import setting_bool
+                    if not setting_bool('feature_freebies', True):
+                        error = 'Freebies are temporarily unavailable.'
+                    else:
+                        from services.freebie_referrals import freebie_eligibility
+                        gate = freebie_eligibility(db, user_id, product)
+                        if not gate["unlocked"]:
+                            if not gate["claimant_verified"]:
+                                error = 'Open the RainDeals Mini App once to verify your Telegram account before claiming this freebie.'
+                            else:
+                                error = (f'This freebie unlocks after {gate["required"]} referred account(s) open the RainDeals Mini App. '
+                                         f'Verified: {gate["verified_referrals"]}/{gate["required"]}.')
                 try:
                     if error:
                         pass

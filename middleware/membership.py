@@ -27,7 +27,10 @@ from config import (
 )
 from database import SessionLocal
 from models.user import User
-from services.maintenance_mode import is_maintenance_enabled
+from services.maintenance_mode import (
+    customer_store_pause_message,
+    is_customer_store_paused,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -290,22 +293,39 @@ class BannedUserMiddleware(BaseMiddleware):
                     await _delete_group_message(actual_event)
                 return None
 
-        if from_user and from_user.id not in ADMIN_IDS and await asyncio.to_thread(is_maintenance_enabled):
+        if from_user and from_user.id not in ADMIN_IDS and await asyncio.to_thread(is_customer_store_paused):
+            pause_text = customer_store_pause_message(MAINTENANCE_TEXT)
             if isinstance(actual_event, CallbackQuery):
                 if actual_event.message:
                     try:
-                        await actual_event.message.edit_text(MAINTENANCE_TEXT, parse_mode="HTML")
+                        await actual_event.message.edit_text(pause_text, parse_mode="HTML")
                     except Exception:
-                        await actual_event.answer(MAINTENANCE_TEXT, show_alert=True)
+                        await actual_event.answer(pause_text, show_alert=True)
                 else:
-                    await actual_event.answer(MAINTENANCE_TEXT, show_alert=True)
+                    await actual_event.answer(pause_text, show_alert=True)
             elif isinstance(actual_event, Message):
                 try:
                     await actual_event.delete()
                 except Exception:
                     pass
-                await actual_event.answer(MAINTENANCE_TEXT, parse_mode="HTML")
+                await actual_event.answer(pause_text, parse_mode="HTML")
             return None
+
+        if from_user and from_user.id not in ADMIN_IDS and isinstance(actual_event, CallbackQuery):
+            callback_data = str(actual_event.data or "")
+            feature = (
+                "freebies" if callback_data.startswith("freebies") else
+                "referrals" if callback_data.startswith(("referral", "referrals")) else
+                "vendor_offers" if callback_data.startswith("vendor_") else
+                "cart" if callback_data.startswith(("ct_cart", "ct_pay_")) else
+                "deposits" if callback_data.startswith("deposit_") or callback_data in {"my_deposits", "my_spends"} else
+                None
+            )
+            if feature:
+                from services.runtime_settings import setting_bool
+                if not await asyncio.to_thread(setting_bool, f"feature_{feature}", True):
+                    await actual_event.answer("This feature is temporarily unavailable.", show_alert=True)
+                    return None
 
         private_chat_event = (
             isinstance(actual_event, Message)

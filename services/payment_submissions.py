@@ -1,7 +1,7 @@
 """Bind one payment reference to its owner's invoice without replacing prior work."""
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 
 
@@ -93,9 +93,65 @@ def credit_verified(db, original, amount, inr_amount=None, conversion_rate=None)
     if deposit.status == 'completed':
         db.rollback()
         return True
-    if deposit.status in ('failed', 'expired', 'cancelled') or not deposit.tx_hash:
+    if deposit.status in ('failed', 'expired', 'cancelled', 'refunded') or not deposit.tx_hash:
         db.rollback()
         return False
+    if str(deposit.network or '').upper() != 'STARS':
+        try:
+            from services.runtime_settings import payment_limits
+            minimum, maximum = payment_limits(str(deposit.network or '').upper())
+            measured = Decimal(str(inr_amount)) if str(deposit.network or '').upper() == 'UPI' and inr_amount is not None else amount
+            approved = db.execute(text(
+                'SELECT action FROM raindeals_deposit_reviews WHERE deposit_id=:deposit_id ORDER BY id DESC LIMIT 1'
+            ), {'deposit_id': int(deposit.id)}).scalar()
+            within_limits = measured.is_finite() and minimum <= measured <= maximum
+            if not within_limits and approved != 'approve_credit':
+                deposit.received_amount = amount
+                if inr_amount is not None:
+                    deposit.inr_amount = Decimal(str(inr_amount))
+                if conversion_rate is not None:
+                    deposit.conversion_rate = Decimal(str(conversion_rate))
+                deposit.status = 'review_required'
+                from services.notification_outbox import enqueue, enqueue_admin
+                unit = 'INR' if str(deposit.network or '').upper() == 'UPI' else 'USDT'
+                enqueue_admin(
+                    db,
+                    f'deposit-range-review:{deposit.id}',
+                    '⚠️ <b>Deposit outside configured range · review needed</b>\n'
+                    f'Deposit: <code>#{deposit.id}</code> · Method: <code>{deposit.network}</code>\n'
+                    f'Confirmed payment: <code>{measured:.8f} {unit}</code>\n'
+                    f'Configured range: <code>{minimum}–{maximum} {unit}</code>\n'
+                    'No wallet credit was made. Review the verified payment in Manager before approving credit or recording an external refund.'
+                )
+                try:
+                    import config
+                    bot_id = int(str(getattr(config, 'BOT_TOKEN', '')).split(':', 1)[0])
+                    enqueue(
+                        db,
+                        f'deposit-range-review-user:{deposit.id}',
+                        str(deposit.telegram_id),
+                        '⚠️ Your payment was verified, but it is outside the configured deposit range. No wallet credit was made yet. RainDeals support will review it.',
+                        bot_id=bot_id,
+                    )
+                except Exception:
+                    pass
+                db.commit()
+                return None
+        except Exception as exc:
+            # A missing review table is not permission to bypass configured
+            # limits. Hold the verified payment and alert the admins.
+            if 'table' not in str(exc).lower() and 'doesn\'t exist' not in str(exc).lower():
+                raise
+            db.rollback()
+            deposit = db.query(Deposit).filter(Deposit.id == original.id).populate_existing().with_for_update().first()
+            if deposit:
+                deposit.received_amount = amount
+                deposit.status = 'review_required'
+                from services.notification_outbox import enqueue_admin
+                enqueue_admin(db, f'deposit-range-review:{deposit.id}',
+                              f'⚠️ Deposit #{deposit.id} is held for review because the review schema is unavailable. No wallet credit was made.')
+                db.commit()
+            return None
     duplicate = db.query(Deposit.id).filter(Deposit.tx_hash == deposit.tx_hash,
                     Deposit.status == 'completed', Deposit.id != deposit.id).first()
     if duplicate:

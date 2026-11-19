@@ -35,6 +35,12 @@ def _auth_error():
     return HTTPException(status_code=401, detail={"error": "telegram_auth_required", "message": "Open this Mini App from the RainDeals Telegram bot."})
 
 
+def _require_feature(name: str, message: str) -> None:
+    from services.runtime_settings import setting_bool
+    if not setting_bool(f"feature_{name}", True):
+        raise HTTPException(status_code=503, detail={"error": "feature_unavailable", "message": message})
+
+
 def _verify_init_data(init_data: str) -> dict:
     if not BOT_TOKEN or not init_data or len(init_data) > 16_384:
         raise _auth_error()
@@ -71,6 +77,10 @@ def current_user(
     init_data: str | None = Header(default=None, alias="X-Telegram-Init-Data"),
 ) -> dict:
     auth = _verify_init_data(init_data or "")
+    from services.runtime_settings import setting_bool, get_setting
+    if not setting_bool("miniapp_enabled", True):
+        message = get_setting("miniapp_disabled_message", "The RainDeals shop is temporarily unavailable. Please use the bot or try again later.")
+        raise HTTPException(status_code=503, detail={"error": "miniapp_disabled", "message": message})
     with SessionLocal() as db:
         # Most Mini App requests only need a read. Avoid taking a database row
         # lock for every asset/API request; acquire it only for the one-time
@@ -363,22 +373,42 @@ _DEPOSIT_LABELS = {
 
 def _deposit_method_rows() -> list[dict]:
     from services.stars_payments import stars_rate
+    from services.stars_payments import stars_limits
+    from services.runtime_settings import payment_limits, payment_method_enabled, payment_method_order, payment_value
 
     stars_exchange_rate = stars_rate()
+    destinations = {
+        "BEP20": payment_value("payment_bep20_address", str(getattr(config, "BEP20_ADDRESS", "") or "")),
+        "POLYGON": payment_value("payment_polygon_address", str(getattr(config, "POLYGON_ADDRESS", "") or "")),
+        "BINANCE": payment_value("payment_binance_pay_id", str(getattr(config, "BINANCE_PAY_ID", "") or "")),
+        "UPI": payment_value("payment_upi_id", str(getattr(config, "UPI_ID", "") or "")),
+    }
     configured = {
-        "BEP20": bool(str(getattr(config, "BEP20_ADDRESS", "") or "").strip()),
-        "POLYGON": bool(str(getattr(config, "POLYGON_ADDRESS", "") or "").strip()),
-        "BINANCE": bool(str(getattr(config, "BINANCE_PAY_ID", "") or "").strip()),
-        "UPI": bool(str(getattr(config, "UPI_ID", "") or "").strip()),
+        "BEP20": bool(destinations["BEP20"]),
+        "POLYGON": bool(destinations["POLYGON"]),
+        "BINANCE": bool(destinations["BINANCE"]),
+        "UPI": bool(destinations["UPI"]),
         "STARS": bool(BOT_TOKEN and stars_exchange_rate is not None),
     }
-    return [{"network": key, "icon": value[0], "label": value[1], "reference_label": value[2],
-             "configured": configured[key],
-             "usdt_per_star": str(stars_exchange_rate) if key == "STARS" and stars_exchange_rate else None}
-            for key, value in _DEPOSIT_LABELS.items()]
+    methods = []
+    for key in payment_method_order():
+        if key not in _DEPOSIT_LABELS:
+            continue
+        minimum, maximum = payment_limits(key)
+        stars_min, stars_max = stars_limits() if key == "STARS" else (None, None)
+        methods.append({
+            "network": key, "icon": _DEPOSIT_LABELS[key][0], "label": _DEPOSIT_LABELS[key][1],
+            "reference_label": _DEPOSIT_LABELS[key][2],
+            "configured": configured[key] and payment_method_enabled(key),
+            "minimum": str(minimum), "maximum": str(maximum),
+            "stars_minimum": stars_min, "stars_maximum": stars_max,
+            "usdt_per_star": str(stars_exchange_rate) if key == "STARS" and stars_exchange_rate else None,
+        })
+    return methods
 
 
 def _deposit_view(row: Deposit) -> dict:
+    from services.runtime_settings import payment_value
     network = str(row.network or "").upper()
     label = _DEPOSIT_LABELS.get(network, ("💳", network or "Payment", "Reference"))
     expiry = row.invoice_expires_at
@@ -398,16 +428,16 @@ def _deposit_view(row: Deposit) -> dict:
                 "instructions": "Open Telegram's secure Stars checkout. Your wallet is credited after Telegram confirms payment.",
             }
         elif network == "BEP20":
-            payment["address"] = str(getattr(config, "BEP20_ADDRESS", "") or "")
+            payment["address"] = payment_value("payment_bep20_address", str(getattr(config, "BEP20_ADDRESS", "") or ""))
             payment["instructions"] = "Send USDT on BNB Smart Chain (BEP20), then submit the transaction hash."
         elif network == "POLYGON":
-            payment["address"] = str(getattr(config, "POLYGON_ADDRESS", "") or "")
+            payment["address"] = payment_value("payment_polygon_address", str(getattr(config, "POLYGON_ADDRESS", "") or ""))
             payment["instructions"] = "Send USDT on Polygon, then submit the transaction hash."
         elif network == "BINANCE":
-            payment["address"] = str(getattr(config, "BINANCE_PAY_ID", "") or "")
+            payment["address"] = payment_value("payment_binance_pay_id", str(getattr(config, "BINANCE_PAY_ID", "") or ""))
             payment["instructions"] = "Pay using Binance Pay, then submit the Order ID from the receipt."
         elif network == "UPI":
-            payment["address"] = str(getattr(config, "UPI_ID", "") or "")
+            payment["address"] = payment_value("payment_upi_id", str(getattr(config, "UPI_ID", "") or ""))
             payment["instructions"] = "Pay using UPI, then submit the UTR or transaction reference."
     return {
         "id": int(row.id), "invoice": str(row.invoice_code or row.order_id or ""),
@@ -437,12 +467,14 @@ def _owned_deposit(user_id: int, deposit_id: int) -> Deposit | None:
 @router.get("/bootstrap")
 def bootstrap(request: Request, auth=Depends(current_user)):
     from services import notification_inbox
+    from services.runtime_settings import setting_bool
     user = auth.get("bootstrap_profile")
     if not user:
         raise HTTPException(status_code=403, detail="Could not load the RainDeals profile.")
     username = getattr(request.app.state, "main_bot_username", MAIN_BOT_USERNAME)
     referral_code = user["referral_code"]
-    referral_link = f"https://t.me/{username}?start=ref_{referral_code}" if username and referral_code else ""
+    referral_enabled = setting_bool("feature_referrals", True)
+    referral_link = f"https://t.me/{username}?start=ref_{referral_code}" if referral_enabled and username and referral_code else ""
     return {
         "profile": {"telegram_id": user["telegram_id"], "name": user["name"],
                     "username": user["username"], "balance": _money(user["balance"]),
@@ -454,10 +486,17 @@ def bootstrap(request: Request, auth=Depends(current_user)):
                     "referral_earnings": _money(user["referral_earnings"]), "referral_link": referral_link},
         "unread_notifications": int(notification_inbox.count(auth["id"])),
         "main_bot_username": username,
-        "deposit_methods": _deposit_method_rows(),
+        "deposit_methods": _deposit_method_rows() if setting_bool("feature_deposits", True) else [],
         "verification": {
             "just_completed": bool(auth.get("newly_verified")),
             "referred": bool(auth.get("referred")),
+        },
+        "features": {
+            "cart": setting_bool("feature_cart", True),
+            "freebies": setting_bool("feature_freebies", True),
+            "referrals": setting_bool("feature_referrals", True),
+            "vendor_offers": setting_bool("feature_vendor_offers", True),
+            "deposits": setting_bool("feature_deposits", True),
         },
     }
 
@@ -465,6 +504,8 @@ def bootstrap(request: Request, auth=Depends(current_user)):
 @router.get("/profile")
 def profile(request: Request, auth=Depends(current_user)):
     from services.freebie_referrals import verified_referral_count
+    from services.runtime_settings import setting_bool
+    referrals_enabled = setting_bool("feature_referrals", True)
     with SessionLocal() as db:
         user = db.query(User).filter(User.telegram_id == auth["id"]).first()
         if not user:
@@ -477,18 +518,20 @@ def profile(request: Request, auth=Depends(current_user)):
             "orders": int(user.total_orders or 0),
             "referrals": int(db.query(func.count(User.id)).filter(
                 User.referred_by == int(user.telegram_id)
-            ).scalar() or 0),
-            "verified_referrals": verified_referral_count(db, auth["id"]),
+            ).scalar() or 0) if referrals_enabled else 0,
+            "verified_referrals": verified_referral_count(db, auth["id"]) if referrals_enabled else 0,
             "referral_earnings": _money(user.referral_earnings),
             "referral_link": (
                 f"https://t.me/{username}?start=ref_{str(user.referral_code or '').strip()}"
-                if username and user.referral_code else ""
+                if referrals_enabled and username and user.referral_code else ""
             ),
         }
 
 
 @router.get("/products")
 async def products(freebies: bool = False, auth=Depends(current_user)):
+    if freebies:
+        _require_feature("freebies", "Freebies are temporarily unavailable.")
     try:
         rows = await _cached_product_rows(auth["id"], freebies)
     except Exception:
@@ -502,12 +545,15 @@ def product_detail(product_id: int, auth=Depends(current_user)):
     rows = _product_rows(auth["id"], product_id=product_id, include_details=True)
     if not rows:
         raise HTTPException(status_code=404, detail="Product is unavailable.")
+    if Decimal(str(rows[0].get("price") or 0)) == 0:
+        _require_feature("freebies", "Freebies are temporarily unavailable.")
     return {"product": rows[0]}
 
 
 @router.get("/deposit-methods")
 def deposit_methods(auth=Depends(current_user)):
-    return {"methods": _deposit_method_rows()}
+    from services.runtime_settings import setting_bool
+    return {"methods": _deposit_method_rows() if setting_bool("feature_deposits", True) else []}
 
 
 @router.post("/deposits")
@@ -518,6 +564,10 @@ async def create_deposit(payload: DepositCreate, request: Request, auth=Depends(
         _submitted_invoice, _switch_invoice_network,
     )
     from decimal import Decimal
+    from services.runtime_settings import setting_bool
+
+    if not setting_bool("feature_deposits", True):
+        raise HTTPException(status_code=503, detail="Deposits are temporarily unavailable. Please try again later.")
 
     method = next((row for row in _deposit_method_rows() if row["network"] == payload.network), None)
     if not method or not method["configured"]:
@@ -525,6 +575,10 @@ async def create_deposit(payload: DepositCreate, request: Request, auth=Depends(
     if payload.network == "STARS":
         if payload.stars_amount is None:
             raise HTTPException(status_code=422, detail="Enter a whole number of Telegram Stars.")
+        from services.stars_payments import stars_limits
+        minimum, maximum = stars_limits()
+        if not minimum <= int(payload.stars_amount) <= maximum:
+            raise HTTPException(status_code=422, detail=f"Enter between {minimum:,} and {maximum:,} Stars.")
         bot = getattr(request.app.state, "main_bot", None)
         if bot is None:
             raise HTTPException(status_code=503, detail="Telegram Stars checkout is temporarily unavailable.")
@@ -602,6 +656,7 @@ def deposit_detail(deposit_id: int, auth=Depends(current_user)):
 async def submit_deposit_reference(deposit_id: int, payload: DepositReference, auth=Depends(current_user)):
     import asyncio
     from handlers.deposit import _valid_order_id, _valid_upi_reference, TX_HASH_RE
+    from services.runtime_settings import payment_reference_allowed
     from services.payment_submissions import bind_reference
 
     row = await asyncio.to_thread(_owned_deposit, auth["id"], deposit_id)
@@ -613,7 +668,7 @@ async def submit_deposit_reference(deposit_id: int, payload: DepositReference, a
     reference = payload.reference.strip()
     valid = (_valid_upi_reference(reference) if network == "UPI" else
              _valid_order_id(reference) if network == "BINANCE" else
-             bool(TX_HASH_RE.fullmatch(reference)) if network in {"BEP20", "POLYGON"} else False)
+             bool(TX_HASH_RE.fullmatch(reference)) and payment_reference_allowed(network, reference) if network in {"BEP20", "POLYGON"} else False)
     if not valid:
         reference_label = _DEPOSIT_LABELS.get(network, ("", "", "payment reference"))[2]
         raise HTTPException(status_code=422, detail=f"Enter a valid {reference_label}.")
@@ -652,11 +707,13 @@ def redeem_promocode(payload: PromocodePayload, auth=Depends(current_user)):
 
 @router.get("/cart")
 def get_cart(auth=Depends(current_user)):
+    _require_feature("cart", "Cart is temporarily unavailable.")
     return _cart_snapshot(auth["id"])
 
 
 @router.post("/cart")
 def change_cart(payload: CartChange, auth=Depends(current_user)):
+    _require_feature("cart", "Cart is temporarily unavailable.")
     from services import cart
     try:
         cart.change(auth["id"], payload.product_id, payload.quantity)
@@ -667,6 +724,7 @@ def change_cart(payload: CartChange, auth=Depends(current_user)):
 
 @router.delete("/cart")
 def clear_cart(auth=Depends(current_user)):
+    _require_feature("cart", "Cart is temporarily unavailable.")
     from services import cart
     try:
         cart.clear(auth["id"])
@@ -692,6 +750,7 @@ def _validate_buyer_info(user_id: int, payload: dict[str, dict[str, str]]) -> No
 
 @router.post("/checkout")
 async def checkout(payload: CheckoutPayload, request: Request, auth=Depends(current_user)):
+    _require_feature("cart", "Cart checkout is temporarily unavailable.")
     import asyncio
     from services import cart
     try:

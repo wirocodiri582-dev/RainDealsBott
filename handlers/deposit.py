@@ -207,6 +207,31 @@ def _get_network_info(network: str) -> dict:
     })
 
 
+def _configured_payment_value(key: str, fallback: str = "") -> str:
+    from services.runtime_settings import payment_value
+    return payment_value(key, fallback)
+
+
+def _payment_method_is_enabled(network: str) -> bool:
+    from services.runtime_settings import payment_method_enabled, payment_value
+    fallback = {
+        "BEP20": getattr(config, "BEP20_ADDRESS", ""),
+        "POLYGON": getattr(config, "POLYGON_ADDRESS", ""),
+        "BINANCE": getattr(config, "BINANCE_PAY_ID", ""),
+        "UPI": getattr(config, "UPI_ID", ""),
+    }
+    if network == "STARS":
+        from services.stars_payments import stars_rate
+        configured = stars_rate() is not None
+    else:
+        key = {
+            "BEP20": "payment_bep20_address", "POLYGON": "payment_polygon_address",
+            "BINANCE": "payment_binance_pay_id", "UPI": "payment_upi_id",
+        }.get(network)
+        configured = bool(payment_value(key, fallback.get(network, ""))) if key else False
+    return payment_method_enabled(network) and configured
+
+
 def _status_emoji(status: str) -> str:
     """Get emoji for deposit status."""
     status_map = {
@@ -216,6 +241,8 @@ def _status_emoji(status: str) -> str:
         "failed": "❌",
         "expired": "⏰",
         "cancelled": "🚫",
+        "review_required": "⚠️",
+        "refunded": "↩️",
     }
     return status_map.get(status, "❓")
 
@@ -229,6 +256,8 @@ def _status_label(status: str) -> str:
         "failed": "Failed",
         "expired": "Expired",
         "cancelled": "Cancelled",
+        "review_required": "Needs admin review",
+        "refunded": "Refund recorded",
     }
     return status_map.get(status, status.capitalize())
 
@@ -550,13 +579,21 @@ async def _show_deposits_page(callback: CallbackQuery, page: int = 0):
 
 def _valid_upi_reference(txid: str) -> bool:
     val = (txid or "").strip()
-    return bool(
+    format_ok = bool(
         UTR_RE.fullmatch(val)
         or TXN_ID_RE.fullmatch(val)
     )
+    if not format_ok:
+        return False
+    from services.runtime_settings import payment_reference_allowed
+    return payment_reference_allowed("UPI", val)
 
 def _valid_order_id(value: str) -> bool:
-    return bool(ORDER_ID_RE.match(value))
+    value = str(value or "").strip()
+    if not ORDER_ID_RE.fullmatch(value):
+        return False
+    from services.runtime_settings import payment_reference_allowed
+    return payment_reference_allowed("BINANCE", value)
 
 
 def _valid_promo_code(value: str) -> bool:
@@ -651,6 +688,10 @@ async def deposit_menu(callback: CallbackQuery, state: FSMContext):
             await state.clear()
 
         balance = await asyncio.to_thread(_load_wallet_balance, callback.from_user.id)
+        from services.runtime_settings import setting_bool
+        if not setting_bool("feature_deposits", True):
+            await show(callback, "💳 <b>Deposits are temporarily unavailable.</b>\n\nPlease check back later or contact support.", parse_mode="HTML", reply_markup=_back_to_menu_kb(), state=state)
+            return
         text = (
             "💎 <b>DEPOSIT MONEY</b>\n\n"
             f"💳 Your balance: <b>{_format_usdt(balance)}</b>\n"
@@ -675,9 +716,10 @@ async def deposit_menu(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "deposit_stars")
 async def start_stars_deposit(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    from services.stars_payments import stars_rate
+    from services.stars_payments import stars_rate, stars_limits
 
     rate = stars_rate()
+    minimum, maximum = stars_limits()
     if rate is None:
         await show(
             callback,
@@ -696,7 +738,7 @@ async def start_stars_deposit(callback: CallbackQuery, state: FSMContext):
         f"Wallet credit rate: <b>{_format_usdt(rate)} per Star</b>\n"
         "Enter the number of Stars to pay as a whole number. Telegram will "
         "confirm the payment automatically; do not send a transaction hash.\n\n"
-        f"Minimum: <b>1 Star</b> · Maximum: <b>100,000 Stars</b>\n"
+        f"Minimum: <b>{minimum:,} Stars</b> · Maximum: <b>{maximum:,} Stars</b>\n"
         "Type <code>CANCEL</code> to go back.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -716,10 +758,12 @@ async def process_stars_amount(message: Message, state: FSMContext):
         )
         await state.clear()
         return
-    if not re.fullmatch(r"\d{1,6}", raw) or not 1 <= int(raw) <= 100_000:
+    from services.stars_payments import stars_limits
+    minimum, maximum = stars_limits()
+    if not re.fullmatch(r"\d{1,6}", raw) or not minimum <= int(raw) <= maximum:
         await update_card(
             message, state,
-            "⚠️ Enter a whole number from <b>1 to 100,000 Stars</b>, for example <code>1</code> or <code>2</code>. "
+            f"⚠️ Enter a whole number from <b>{minimum:,} to {maximum:,} Stars</b>. "
             "Type <code>CANCEL</code> to go back.",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="↩️ Back to payment methods", callback_data="deposit_start")
@@ -1071,6 +1115,9 @@ async def select_network(callback: CallbackQuery, state: FSMContext):
     """Select or switch the payment method for a single active invoice."""
     await callback.answer()
     network = NETWORK_CALLBACKS[callback.data]
+    if not _payment_method_is_enabled(network):
+        await show(callback, "⚠️ This payment method is currently unavailable. Choose another method.", reply_markup=get_deposit_menu(), replace_media=bool(callback.message.photo))
+        return
     verifying = await asyncio.to_thread(_submitted_invoice, callback.from_user.id)
     if verifying:
         await state.clear()
@@ -1276,7 +1323,9 @@ def _create_invoice(telegram_id: int, amount_usdt: Decimal, network: str) -> dic
                 break
         if not code:
             raise RuntimeError("Could not allocate a unique invoice code")
-        expires = datetime.utcnow() + timedelta(seconds=INVOICE_LIFETIME_SECONDS)
+        from services.runtime_settings import invoice_lifetime_seconds
+        lifetime = invoice_lifetime_seconds(network, INVOICE_LIFETIME_SECONDS)
+        expires = datetime.utcnow() + timedelta(seconds=lifetime)
         deposit = Deposit(
             telegram_id=telegram_id,
             order_id=code,
@@ -1496,14 +1545,15 @@ def _invoice_payload(network: str, data: dict) -> str:
     network_config = _get_network_info(network)
 
     if network == "UPI":
-        upi_id = escape(str(getattr(config, "UPI_ID", "") or "Not configured"))
+        upi_id = escape(_configured_payment_value("payment_upi_id", str(getattr(config, "UPI_ID", "") or "Not configured")))
         payment_info = (
             f"🟢 <b>UPI ID</b>\n<code>{upi_id}</code>\n\n"
             "Pay any amount; the verified amount is credited."
         )
         reference = "UTR / Transaction reference"
     elif network in CRYPTO_NETWORKS:
-        address = escape(str(NETWORK_ADDRESSES.get(network, "") or "Not configured"))
+        setting_key = "payment_bep20_address" if network == "BEP20" else "payment_polygon_address"
+        address = escape(_configured_payment_value(setting_key, str(NETWORK_ADDRESSES.get(network, "") or "Not configured")))
         payment_info = (
             f"{network_config['icon']} <b>USDT address · {network_config['label']}</b>\n"
             f"<code>{address}</code>\n\n"
@@ -1511,7 +1561,7 @@ def _invoice_payload(network: str, data: dict) -> str:
         )
         reference = "Transaction Hash (TXID)"
     else:
-        pay_id = escape(str(BINANCE_PAY_ID or "Not configured"))
+        pay_id = escape(_configured_payment_value("payment_binance_pay_id", str(BINANCE_PAY_ID or "Not configured")))
         payment_info = (
             f"🔴 <b>Binance Pay ID</b>\n<code>{pay_id}</code>\n\n"
             "Pay any amount through Binance Pay; the verified amount is credited."
@@ -1582,7 +1632,7 @@ def _set_pending_if_waiting(deposit_id: int) -> None:
     db = SessionLocal()
     try:
         dep = db.query(Deposit).filter(Deposit.id == deposit_id).first()
-        if dep and dep.status not in {"completed", "failed", "expired"}:
+        if dep and dep.status not in {"completed", "failed", "expired", "review_required", "refunded"}:
             dep.status = "pending"
             db.commit()
     finally:

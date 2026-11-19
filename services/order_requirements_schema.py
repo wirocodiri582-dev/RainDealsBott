@@ -102,6 +102,59 @@ def ensure_order_requirements_schema() -> None:
         if missing:
             raise
     with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE IF NOT EXISTS raindeals_runtime_settings ("
+            "setting_key VARCHAR(64) NOT NULL PRIMARY KEY,"
+            "setting_value MEDIUMTEXT NOT NULL,"
+            "updated_by BIGINT NOT NULL DEFAULT 0,"
+            "updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)"
+            ")"
+        ))
+        connection.execute(text(
+            "CREATE TABLE IF NOT EXISTS raindeals_deposit_reviews ("
+            "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,"
+            "deposit_id BIGINT NOT NULL,admin_id BIGINT NOT NULL,"
+            "action VARCHAR(24) NOT NULL,note TEXT NOT NULL,"
+            "external_reference VARCHAR(255) NULL,"
+            "created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),"
+            "KEY ix_deposit_review_id (deposit_id,id),"
+            "KEY ix_deposit_review_created (created_at)"
+            ")"
+        ))
+        import config
+        runtime_defaults = {
+            "payment_upi_id": str(getattr(config, "UPI_ID", "") or ""),
+            "payment_bep20_address": str(getattr(config, "BEP20_ADDRESS", "") or ""),
+            "payment_polygon_address": str(getattr(config, "POLYGON_ADDRESS", "") or ""),
+            "payment_binance_pay_id": str(getattr(config, "BINANCE_PAY_ID", "") or ""),
+            "payment_stars_usdt_per_star": str(getattr(config, "TELEGRAM_STARS_USDT_PER_STAR", "") or ""),
+            "payment_order": '["BEP20","POLYGON","BINANCE","UPI","STARS"]',
+            "payment_enabled_upi": "1", "payment_enabled_bep20": "1",
+            "payment_enabled_polygon": "1", "payment_enabled_binance": "1", "payment_enabled_stars": "1",
+            "payment_min_upi": "1", "payment_max_upi": "1000000",
+            "payment_min_bep20": "0.01", "payment_max_bep20": "100000",
+            "payment_min_polygon": "0.01", "payment_max_polygon": "100000",
+            "payment_min_binance": "0.01", "payment_max_binance": "100000",
+            "payment_min_stars": "1", "payment_max_stars": "100000",
+            "payment_expiry_upi": "3600", "payment_expiry_bep20": "3600",
+            "payment_expiry_polygon": "3600", "payment_expiry_binance": "3600", "payment_expiry_stars": "3600",
+            "payment_reference_min_upi": "8", "payment_reference_max_upi": "20",
+            "payment_reference_min_binance": "8", "payment_reference_max_binance": "32",
+            "payment_reference_prefix_upi": "", "payment_reference_prefix_binance": "",
+            "shop_enabled": "1", "miniapp_enabled": "1", "feature_cart": "1",
+            "feature_freebies": "1", "feature_referrals": "1", "feature_vendor_offers": "1", "feature_deposits": "1",
+            "shop_pause_message": "RainDeals is temporarily unavailable. Please try again later.",
+            "miniapp_disabled_message": "The RainDeals shop is temporarily unavailable. Please use the bot or try again later.",
+            "usdt_price_source_url": "",
+        }
+        for setting_key, setting_value in runtime_defaults.items():
+            if setting_key == "payment_stars_usdt_per_star" and not setting_value:
+                continue
+            connection.execute(text(
+                "INSERT IGNORE INTO raindeals_runtime_settings "
+                "(setting_key,setting_value,updated_by,updated_at) "
+                "VALUES (:setting_key,:setting_value,0,UTC_TIMESTAMP(6))"
+            ), {"setting_key": setting_key, "setting_value": setting_value})
         if _ensure_column(connection,'bot_notification_jobs','inbox_read_at','DATETIME NULL'):
             connection.execute(text("UPDATE bot_notification_jobs SET inbox_read_at=UTC_TIMESTAMP() "
                                     "WHERE status IN ('sent','uncertain','resolved','failed')"))

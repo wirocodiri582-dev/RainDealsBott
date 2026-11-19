@@ -1,6 +1,8 @@
 import logging
 import threading
 import time
+from datetime import datetime, timezone
+from html import escape
 
 from database import SessionLocal, engine
 from models.maintenance_setting import MaintenanceSetting
@@ -45,6 +47,38 @@ def is_maintenance_enabled() -> bool:
         return True
     finally:
         db.close()
+
+
+def is_customer_store_paused() -> bool:
+    """Honor the manual lock, Manager shop switch, and an optional UTC window."""
+    if is_maintenance_enabled():
+        return True
+    try:
+        from services.runtime_settings import get_setting, setting_bool
+        if not setting_bool("shop_enabled", True):
+            return True
+        start_raw = str(get_setting("maintenance_schedule_start", "") or "").strip()
+        end_raw = str(get_setting("maintenance_schedule_end", "") or "").strip()
+        if not start_raw or not end_raw:
+            return False
+        def parse_utc(raw):
+            value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+        now = datetime.now(timezone.utc)
+        start, end = parse_utc(start_raw), parse_utc(end_raw)
+        return start <= now <= end
+    except Exception:
+        logger.exception("Could not evaluate Manager shop pause schedule; honoring manual maintenance state")
+        return False
+
+
+def customer_store_pause_message(default: str) -> str:
+    try:
+        from services.runtime_settings import get_setting
+        custom = str(get_setting("shop_pause_message", "") or "").strip()
+        return escape(custom[:1000]) if custom else default
+    except Exception:
+        return default
 
 
 def set_maintenance_enabled(enabled: bool) -> None:
