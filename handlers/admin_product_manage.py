@@ -35,8 +35,6 @@ from services.input_forms import is_cancel
 from services.session_resume import save_resume
 from handlers.products import (
     _real_stock,
-    _stock_state,
-    _stock_state_lock,
     _send_stock_channel_message,
     _notify_restock_subscribers,
     invalidate_products_cache,
@@ -319,7 +317,9 @@ def _build_stockctl_sync_text(product) -> str:
     return "<pre>" + safe("\n".join(lines)) + "</pre>"
 
 
-async def _notify_stock_change(bot, pid: int, added: int | None = None):
+async def _notify_stock_change(
+    bot, pid: int, added: int | None = None, *, previous_stock: int | None = None,
+):
     """Queue a clear public stock update and a durable Admin Notify alert."""
     product = await asyncio.to_thread(_load_product, pid)
 
@@ -331,13 +331,6 @@ async def _notify_stock_change(bot, pid: int, added: int | None = None):
     updated = getattr(product, "updated_at", None)
     event_stamp = updated.isoformat() if updated else str(stock)
     threshold = int(product.low_stock_threshold if product.low_stock_threshold is not None else DEFAULT_LOW_STOCK_THRESHOLD)
-    async with _stock_state_lock:
-        previous_state = _stock_state.get(product.id)
-        previous_stock = previous_state.get("last") if previous_state else None
-        _stock_state[product.id] = {
-            "last": stock,
-            "low_stock_notified": stock <= threshold,
-        }
     if added and added > 0:
         public_text = (
             "👑🟥🟥🟥🟥🟥\n\n"
@@ -2179,7 +2172,12 @@ async def set_stock(message: Message):
         db.close()
 
     try:
-        await _notify_stock_change(message.bot, pid, added=max(0, stock - previous_stock))
+        await _notify_stock_change(
+            message.bot,
+            pid,
+            added=max(0, stock - previous_stock),
+            previous_stock=previous_stock,
+        )
     except Exception:
         logger.exception("Failed to send stock notification after /setstock")
 

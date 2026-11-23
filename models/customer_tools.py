@@ -26,6 +26,16 @@ class CartCheckout(Base):
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
 
 
+class MiniAppRecentProduct(Base):
+    """Small per-user Mini App history; never stores a raw Telegram initData value."""
+    __tablename__ = 'bot_miniapp_recent_products'
+    __table_args__ = (UniqueConstraint('telegram_id', 'product_id', name='uq_miniapp_recent_owner_product'),)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False, index=True)
+    product_id = Column(Integer, nullable=False, index=True)
+    viewed_at = Column(DateTime, nullable=False, default=func.now(), index=True)
+
+
 class CustomerPreferences(Base):
     __tablename__ = 'bot_customer_preferences'
     telegram_id = Column(BigInteger, primary_key=True)

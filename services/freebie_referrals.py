@@ -366,21 +366,35 @@ def notify_claimant_verification(db: Session, user: User) -> None:
 
 def freebie_eligibility(db: Session, telegram_id: int, product: Product) -> dict:
     required = max(0, int(getattr(product, "freebie_referrals_required", 0) or 0))
-    if required == 0:
-        return {
-            "required": 0,
-            "verified_referrals": 0,
-            "claimant_verified": True,
-            "unlocked": True,
-        }
     user = db.query(User).filter(User.telegram_id == int(telegram_id)).first()
     claimant_verified = bool(user and user.miniapp_verified_at)
-    count = verified_referral_count(db, telegram_id)
+    count = verified_referral_count(db, telegram_id) if required else 0
+    from services.runtime_settings import payment_value
+    try:
+        daily_limit = max(0, min(1000, int(payment_value('freebie_claim_limit_daily', '0') or 0)))
+    except ValueError:
+        daily_limit = 0
+    daily_claims = 0
+    if daily_limit:
+        from datetime import datetime, timedelta
+        from models.order import Order
+        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        daily_claims = int(db.query(func.count(Order.id)).filter(
+            Order.telegram_id == int(telegram_id),
+            Order.amount <= 0,
+            Order.refunded.is_(False),
+            Order.created_at >= today,
+            Order.created_at < today + timedelta(days=1),
+        ).scalar() or 0)
+    limit_reached = bool(daily_limit and daily_claims >= daily_limit)
     return {
         "required": required,
         "verified_referrals": count,
         "claimant_verified": claimant_verified,
-        "unlocked": required == 0 or (claimant_verified and count >= required),
+        "daily_limit": daily_limit,
+        "daily_claims": daily_claims,
+        "limit_reached": limit_reached,
+        "unlocked": not limit_reached and (required == 0 or (claimant_verified and count >= required)),
     }
 
 

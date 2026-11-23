@@ -75,7 +75,7 @@ def _ensure_index(connection, table, columns, name):
 
 
 def ensure_order_requirements_schema() -> None:
-    from models.customer_tools import CartItem, CartCheckout, CustomerPreferences, CustomerJobCursor, ClaimMessage, CancellationRequest, WalletEntry
+    from models.customer_tools import CartItem, CartCheckout, CustomerPreferences, CustomerJobCursor, ClaimMessage, CancellationRequest, WalletEntry, MiniAppRecentProduct
     required_tables = [
             OrderRequirementSubmission.__table__,
             ProductEngagement.__table__,
@@ -84,7 +84,7 @@ def ensure_order_requirements_schema() -> None:
             CheckoutAttempt.__table__, OrderEvent.__table__, OrderWorkNote.__table__,
             WarrantyRequest.__table__, NotificationJob.__table__, ProviderHealth.__table__,
             ApiKey.__table__, ApiOrder.__table__, ApiRateLimitBucket.__table__,
-            CartItem.__table__, CartCheckout.__table__, CustomerPreferences.__table__, CustomerJobCursor.__table__,
+            CartItem.__table__, CartCheckout.__table__, MiniAppRecentProduct.__table__, CustomerPreferences.__table__, CustomerJobCursor.__table__,
             ClaimMessage.__table__, CancellationRequest.__table__, WalletEntry.__table__,
             VendorOffer.__table__,
             VendorRequest.__table__,
@@ -146,6 +146,9 @@ def ensure_order_requirements_schema() -> None:
             "shop_pause_message": "RainDeals is temporarily unavailable. Please try again later.",
             "miniapp_disabled_message": "The RainDeals shop is temporarily unavailable. Please use the bot or try again later.",
             "usdt_price_source_url": "",
+            "product_bundles_json": "[]",
+            "product_promotions_json": "[]",
+            "freebie_claim_limit_daily": "0",
         }
         for setting_key, setting_value in runtime_defaults.items():
             if setting_key == "payment_stars_usdt_per_star" and not setting_value:

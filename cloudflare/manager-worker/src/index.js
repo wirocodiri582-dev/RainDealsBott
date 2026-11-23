@@ -122,7 +122,8 @@ const runtimeSettingKeys=new Set([
   'payment_reference_prefix_upi','payment_reference_prefix_bep20','payment_reference_prefix_polygon','payment_reference_prefix_binance',
   'payment_reference_min_upi','payment_reference_max_upi','payment_reference_min_binance','payment_reference_max_binance',
   'shop_enabled','miniapp_enabled','feature_cart','feature_freebies','feature_referrals','feature_vendor_offers','feature_deposits',
-  'shop_pause_message','miniapp_disabled_message','maintenance_schedule_start','maintenance_schedule_end'
+  'shop_pause_message','miniapp_disabled_message','maintenance_schedule_start','maintenance_schedule_end',
+  'product_bundles_json','product_promotions_json','freebie_claim_limit_daily'
 ]);
 function publicHttpsUrl(value){
   const raw=String(value||'').trim();if(!raw)return '';
@@ -146,6 +147,33 @@ function normalizeRuntimeSettings(input){
     }
     if(key.startsWith('payment_enabled_')||['shop_enabled','miniapp_enabled','feature_cart','feature_freebies','feature_referrals','feature_vendor_offers','feature_deposits'].includes(key)){
       if(!['0','1'].includes(value))error(key+' must be on (1) or off (0).');out[key]=value;continue;
+    }
+    if(key==='freebie_claim_limit_daily'){
+      if(!/^\d{1,4}$/.test(value)||Number(value)>1000)error('Daily freebie limit must be between 0 and 1,000; zero means unlimited.');out[key]=value;continue;
+    }
+    if(key==='product_bundles_json'||key==='product_promotions_json'){
+      let rows;try{rows=JSON.parse(value||'[]')}catch{error(key+' must be valid JSON.')}
+      if(!Array.isArray(rows)||rows.length>50)error(key+' must be a JSON array with at most 50 entries.');
+      const normalized=rows.map((row,index)=>{
+        if(!row||typeof row!=='object'||Array.isArray(row))error(key+' entry '+(index+1)+' must be an object.');
+        const label=String(row.name||row.label||'').trim().slice(0,80);
+        if(!label)error(key+' entries need a name/label.');
+        const item={label,active:row.active!==false&&row.active!==0&&row.active!=='0'};
+        const description=String(row.description||'').trim().slice(0,240);if(description)item.description=description;
+        if(key==='product_bundles_json'){
+          const ids=Array.isArray(row.product_ids)?[...new Set(row.product_ids.map(Number))]:[];
+          if(ids.length<2||ids.length>8||ids.some(id=>!Number.isSafeInteger(id)||id<=0))error('Bundle entries must contain 2–8 valid product_ids.');
+          item.product_ids=ids;
+        }else{
+          const productId=Number(row.product_id);
+          if(!Number.isSafeInteger(productId)||productId<=0)error('Promotion entries need a valid product_id.');
+          item.product_id=productId;
+          for(const field of ['starts_at','ends_at']){const date=new Date(row[field]);if(!row[field]||Number.isNaN(date.getTime()))error('Promotion entries need valid starts_at and ends_at timestamps.');item[field]=date.toISOString()}
+          if(new Date(item.ends_at)<=new Date(item.starts_at))error('Promotion end must be after its start.');
+        }
+        return item;
+      });
+      out[key]=JSON.stringify(normalized);continue;
     }
     if(key.startsWith('payment_min_')||key.startsWith('payment_max_')||key==='payment_stars_usdt_per_star'){
       if(value===''&&key==='payment_stars_usdt_per_star'){out[key]='';continue}
@@ -202,6 +230,7 @@ async function managerAdmin(env,id){
 }
 function hasPermission(admin,permission){return Number(admin?.is_owner)===1||admin?.permissions?.includes('*')||admin?.permissions?.includes(permission)}
 function requiredPermission(path){
+  if(path==='/manage/runtime-settings'||path.startsWith('/manage/runtime-settings/'))return'settings';
   if(/^\/manage\/vendor_offers\/\d+\/private$/.test(path))return'vendor_offer_secrets';
   if(path==='/manage/vendor_offers'||path.startsWith('/manage/vendor_offers/'))return'vendor_offers';
   if(path==='/manage/claims'||path.startsWith('/manage/claims/'))return'orders';

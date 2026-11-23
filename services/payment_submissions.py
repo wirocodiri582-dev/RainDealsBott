@@ -68,6 +68,36 @@ def bind_reference(deposit_id, reference, user_id, network):
         raise
 
 
+def request_reference_correction(deposit_id, user_id):
+    """Allow a customer to replace a typo only before verification claims the invoice."""
+    from database import transaction
+    from models.deposit import Deposit
+    from services.notification_outbox import enqueue_admin
+    with transaction() as db:
+        row = db.query(Deposit).filter(
+            Deposit.id == int(deposit_id), Deposit.telegram_id == int(user_id)
+        ).with_for_update().first()
+        if not row:
+            return 'not_found'
+        if row.status != 'pending' or not row.tx_hash:
+            return 'not_correctable'
+        now = datetime.utcnow()
+        if row.verification_lease_until and row.verification_lease_until > now:
+            return 'verification_running'
+        if row.invoice_expires_at and row.invoice_expires_at <= now:
+            return 'expired'
+        row.tx_hash = None
+        row.status = 'waiting_hash'
+        row.verification_started_at = None
+        row.verification_lease_token = None
+        row.verification_lease_until = None
+        enqueue_admin(
+            db, f'deposit-reference-correction:{row.id}:{now.strftime("%Y%m%d%H%M%S")}',
+            f'ℹ️ Customer requested a payment-reference correction for deposit #{row.id}. The prior reference was cleared before verification; no credit was issued.'
+        )
+        return 'ok'
+
+
 def credit_verified(db, original, amount, inr_amount=None, conversion_rate=None):
     """Final accounting only: callers must already have verified the actual payment."""
     from models.deposit import Deposit

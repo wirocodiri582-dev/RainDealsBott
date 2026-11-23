@@ -20,13 +20,13 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from sqlalchemy import JSON, String, cast, update, func
+from sqlalchemy import JSON, String, cast, update, func, text
 from sqlalchemy.exc import SQLAlchemyError
 
 import config
 from config import ADMIN_IDS
 from utils.ui import schedule_delete_card, show, update_card, answer_card
-from database import SessionLocal, transaction, retry_on_write_conflict
+from database import SessionLocal, transaction, retry_on_write_conflict, engine
 from models.product import Product
 from models.user import User
 from models.order import Order
@@ -1048,7 +1048,7 @@ def _product_purchase_configuration_errors(product) -> list[str]:
 
 
 def _load_product_models_safely(query) -> list[Product]:
-    """Materialize rows safely; never erase purchase rules during a catalog read."""
+    """Load products safely; repair only malformed optional bulk-price rules."""
     product_columns = list(Product.__table__.columns)
     json_fields = {
         column.name
@@ -1070,11 +1070,13 @@ def _load_product_models_safely(query) -> list[Product]:
         "bulk_pricing": dict,
     }
     products = []
+    invalid_bulk_pricing_repairs: dict[int, str] = {}
     for row in rows:
         values = {
             column.name: row[index]
             for index, column in enumerate(product_columns)
         }
+        original_bulk_pricing = values.get("bulk_pricing")
         invalid_fields = []
         invalid_purchase_fields = []
         for field in json_fields:
@@ -1181,10 +1183,10 @@ def _load_product_models_safely(query) -> list[Product]:
             field for field in final_purchase_errors if field != "bulk_pricing"
         )
         if invalid_bulk_pricing:
-            logger.warning(
-                "Ignoring invalid optional bulk pricing; base price applies product_id=%s",
-                values.get("id"),
-            )
+            product_id = values.get("id")
+            if product_id is not None and original_bulk_pricing is not None:
+                invalid_bulk_pricing_repairs[int(product_id)] = str(original_bulk_pricing)
+            logger.warning("Invalid optional bulk pricing; using base price product_id=%s", product_id)
         if invalid_purchase_fields:
             logger.warning(
                 "Product remains visible with purchases disabled for invalid configuration product_id=%s fields=%s",
@@ -1201,6 +1203,28 @@ def _load_product_models_safely(query) -> list[Product]:
         product = Product(**values)
         product._invalid_purchase_configuration = tuple(sorted(set(invalid_purchase_fields)))
         products.append(product)
+    if invalid_bulk_pricing_repairs:
+        try:
+            with engine.begin() as connection:
+                connection.execute(text(
+                    "UPDATE products SET bulk_pricing = NULL "
+                    "WHERE id = :product_id AND CAST(bulk_pricing AS CHAR) = :original_value"
+                ), [
+                    {"product_id": product_id, "original_value": original}
+                    for product_id, original in invalid_bulk_pricing_repairs.items()
+                ])
+            logger.info(
+                "Cleared malformed optional bulk-pricing rules for %s product(s); base prices apply",
+                len(invalid_bulk_pricing_repairs),
+            )
+        except Exception:
+            # The current catalog remains safe at base price even if the
+            # best-effort persistent repair is temporarily unavailable.
+            logger.warning(
+                "Could not persist cleanup for malformed optional bulk pricing product_ids=%s",
+                ",".join(map(str, sorted(invalid_bulk_pricing_repairs))),
+                exc_info=True,
+            )
     return products
 
 
@@ -1440,9 +1464,6 @@ def _get_max_qty(product) -> int:
 # ║      LIMITED STOCK BROADCASTS (→ STOCK_GROUP_ID, user-facing)║
 # ╚══════════════════════════════════════════════════════════════╝
 
-_stock_state: dict[int, dict] = {}
-_stock_state_lock = asyncio.Lock()
-_stock_scan_seeded = False
 _stock_bot_username: str | None = None
 _stock_bot_username_lock = asyncio.Lock()
 
@@ -1556,113 +1577,8 @@ def _log_stock_notification_task(task: asyncio.Task):
         logger.exception("Unexpected error while delivering stock notifications")
 
 
-async def _refresh_and_scan_product(bot, product_id: int):
-    try:
-        product = await asyncio.to_thread(_fetch_product, product_id)
-        if product:
-            _fire_stock_scan(bot, [product])
-    except Exception:
-        logger.exception("Could not refresh product stock after purchase")
-
-
-async def _scan_stock_changes(bot, products: list):
-    global _stock_scan_seeded
-
-    if not products:
-        return
-
-    events = []
-
-    async with _stock_state_lock:
-        first_run = not _stock_scan_seeded
-
-        for p in products:
-            current = _real_stock(p)
-            threshold = p.low_stock_threshold if p.low_stock_threshold is not None else DEFAULT_LOW_STOCK_THRESHOLD
-            state = _stock_state.get(p.id)
-
-            if state is None:
-                _stock_state[p.id] = {
-                    "last": current,
-                    "low_stock_notified": current <= threshold,
-                }
-                if not first_run:
-                    events.append(("new_product", p, {"stock": current}))
-                continue
-
-            last = state["last"]
-
-            if current > last:
-                added = current - last
-                state["last"] = current
-                state["low_stock_notified"] = current <= threshold
-                events.append(("restock", p, {"added": added, "stock": current}))
-
-            elif current < last:
-                state["last"] = current
-                if current <= threshold and not state["low_stock_notified"]:
-                    state["low_stock_notified"] = True
-                    events.append(("limited_stock", p, {"stock": current}))
-
-        _stock_scan_seeded = True
-
-    for kind, product, kwargs in events:
-        await _send_stock_channel_message(
-            bot,
-            _stock_event_text(kind, product, **kwargs),
-            product_id=product.id,
-            can_buy=kwargs.get("stock", 0) > 0,
-        )
-        if kind in {"new_product", "restock"}:
-            try:
-                from services.notification_outbox import enqueue_admin_once
-                updated = getattr(product, "updated_at", None)
-                event_stamp = updated.isoformat() if updated else str(kwargs.get("stock", 0))
-                if kind == "new_product":
-                    admin_event = f"product-added:{product.id}"
-                    admin_body = (
-                        "🆕 <b>New product added</b>\n"
-                        f"📦 <b>{_esc(product.name)}</b> · <code>#{product.id}</code>\n"
-                        f"🏷 Category: {_esc(product.category or 'General')}\n"
-                        f"💰 Price: ${_money(product.price):.2f} USDT\n"
-                        f"📊 Available stock: {kwargs.get('stock', 0)}\n"
-                        f"🚚 Delivery: {_esc(str(product.delivery_type or 'manual').title())}\n"
-                        f"🔌 API: {'On' if getattr(product, 'api_enabled', False) else 'Off'}"
-                    )
-                else:
-                    admin_event = f"product-stock:{product.id}:{event_stamp}"
-                    admin_body = (
-                        "📦 <b>Product stock replenished</b>\n"
-                        f"⚡ <b>{_esc(product.name)}</b> · <code>#{product.id}</code>\n"
-                        f"➕ Added: <b>{kwargs.get('added', 0)}</b>\n"
-                        f"✅ Available now: <b>{kwargs.get('stock', 0)}</b>\n"
-                        f"💰 Price: ${_money(product.price):.2f} USDT"
-                    )
-                await asyncio.to_thread(enqueue_admin_once, admin_event, admin_body, bot.id)
-            except Exception:
-                logger.exception("Could not queue Admin Notify product event product_id=%s", product.id)
-        if kind == "restock":
-            await _notify_restock_subscribers(bot, product, int(kwargs.get("stock", 0)))
-
-
-def _fire_stock_scan(bot, products: list):
-    """Fire-and-forget wrapper so UI handlers never wait on notification sends."""
-    try:
-        asyncio.create_task(_scan_stock_changes(bot, products))
-    except RuntimeError:
-        logger.exception("Could not schedule stock scan task")
-
-
 async def notify_new_product(bot, product):
     stock = _real_stock(product)
-    threshold = product.low_stock_threshold if product.low_stock_threshold is not None else DEFAULT_LOW_STOCK_THRESHOLD
-
-    async with _stock_state_lock:
-        _stock_state[product.id] = {
-            "last": stock,
-            "low_stock_notified": stock <= threshold,
-        }
-
     await _send_stock_channel_message(
         bot,
         _stock_event_text("new_product", product, stock=stock),
@@ -1716,7 +1632,6 @@ async def _show_freebies_categories(callback: CallbackQuery, products: list, pag
         )
         return
 
-    _fire_stock_scan(callback.bot, products)
     groups: dict[str, list] = {}
     standalone = []
     for product in products:
@@ -2018,7 +1933,6 @@ async def _show_product_categories(callback: CallbackQuery, products: list, page
             callback.from_user.id,
             [product.id for product in page_standalone],
         )
-        _fire_stock_scan(callback.bot, page_standalone)
 
     rows = []
     pending_row = []
@@ -2216,7 +2130,6 @@ async def _show_products_catalog(
     if any((getattr(product, "source", "own") or "own") == "reseller" for product in page_products):
         _schedule_reseller_stock_refresh()
 
-    _fire_stock_scan(callback.bot, page_products)
     custom_prices = await asyncio.to_thread(
         _get_catalog_custom_prices, callback.from_user.id, [product.id for product in page_products]
     )
@@ -2669,8 +2582,6 @@ async def product_info(
         else:
             await callback.answer(not_found_text, parse_mode="HTML", reply_markup=not_found_markup)
         return
-
-    _fire_stock_scan(callback.bot, [product])
 
     configuration_errors = _product_purchase_configuration_errors(product)
     max_qty = 0 if configuration_errors else _get_max_qty(product)
@@ -3882,6 +3793,24 @@ async def _notify_admins_low_stock(bot, alert: dict, order_id: int):
         logger.exception("Failed to queue Admin Notify low-stock alert order_id=%s", order_id)
 
 
+async def _notify_group_low_stock(bot, alert: dict, order_id: int):
+    """Announce only a real checkout crossing the configured low-stock limit."""
+    try:
+        product = await asyncio.to_thread(_fetch_product, int(alert["product_id"]))
+        if not product:
+            return
+        stock = max(0, int(alert.get("stock") or 0))
+        await _send_stock_channel_message(
+            bot,
+            _stock_event_text("limited_stock", product, stock=stock),
+            product_id=product.id,
+            can_buy=stock > 0,
+            event_key=f"public-low-stock:order:{int(order_id)}",
+        )
+    except Exception:
+        logger.exception("Failed to queue public low-stock alert order_id=%s", order_id)
+
+
 async def _notify_stock_purchase(bot, buyer_id: int, result: dict):
     """Post a product link only on its first sale and sell-through milestones."""
     product_id = int(result.get("product_id") or 0)
@@ -4032,12 +3961,13 @@ async def _purchase_notifications(callback, telegram_id, product_id, result):
             logger.exception("Failed to send order notification")
 
     if result.get("low_stock_alert"):
-        task = asyncio.create_task(_notify_admins_low_stock(callback.bot, result["low_stock_alert"], result["order_id"]))
-        task.add_done_callback(_log_stock_notification_task)
+        for notifier in (_notify_admins_low_stock, _notify_group_low_stock):
+            task = asyncio.create_task(
+                notifier(callback.bot, result["low_stock_alert"], result["order_id"])
+            )
+            task.add_done_callback(_log_stock_notification_task)
     task = asyncio.create_task(_notify_stock_purchase(callback.bot, telegram_id, result))
     task.add_done_callback(_log_stock_notification_task)
-    asyncio.create_task(_refresh_and_scan_product(callback.bot, product_id))
-
     commission = result.get("referral_commission_paid")
     if commission:
         task = asyncio.create_task(_notify_referral_commission(callback.bot, commission, result["order_id"]))

@@ -11,7 +11,7 @@ import json
 import logging
 import time
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from urllib.parse import parse_qsl
 
@@ -26,6 +26,10 @@ from models.deposit import Deposit
 from models.order import Order
 from models.product import Product
 from models.user import User
+from models.product_engagement import ProductEngagement
+from models.customer_tools import MiniAppRecentProduct
+from models.order_workflow import OrderEvent
+from models.order_requirement_submission import OrderRequirementSubmission
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/miniapp/api", tags=["RainDeals Mini App"])
@@ -200,6 +204,44 @@ def _serialize_product_rows(
         _product_purchase_configuration_errors,
     )
     from services.fulfillment_policy import manual_allowed as _manual_allowed
+    from models.product_engagement import ProductEngagement
+    from models.order import Order
+    from services.runtime_settings import json_list_setting, payment_value
+    with SessionLocal() as db:
+        product_ids = [int(p.id) for p in products]
+        engagements = db.query(ProductEngagement.product_id, ProductEngagement.is_favorite,
+                                ProductEngagement.restock_enabled).filter(
+            ProductEngagement.telegram_id == int(user_id),
+            ProductEngagement.product_id.in_(product_ids or [-1]),
+        ).all()
+        favorite_ids = {int(row.product_id) for row in engagements if row.is_favorite}
+        restock_ids = {int(row.product_id) for row in engagements if row.restock_enabled}
+        try:
+            daily_limit = max(0, min(1000, int(payment_value('freebie_claim_limit_daily', '0') or 0)))
+        except ValueError:
+            daily_limit = 0
+        daily_claims = 0
+        if daily_limit:
+            from datetime import timedelta
+            today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            daily_claims = int(db.query(func.count(Order.id)).filter(
+                Order.telegram_id == int(user_id), Order.amount <= 0, Order.refunded.is_(False),
+                Order.created_at >= today, Order.created_at < today + timedelta(days=1),
+            ).scalar() or 0)
+    promotions = {}
+    now = datetime.now(timezone.utc)
+    for promotion in json_list_setting('product_promotions_json'):
+        if not isinstance(promotion, dict) or not promotion.get('active', True):
+            continue
+        try:
+            start = datetime.fromisoformat(str(promotion.get('starts_at', '')).replace('Z', '+00:00'))
+            end = datetime.fromisoformat(str(promotion.get('ends_at', '')).replace('Z', '+00:00'))
+            start = start.replace(tzinfo=timezone.utc) if start.tzinfo is None else start.astimezone(timezone.utc)
+            end = end.replace(tzinfo=timezone.utc) if end.tzinfo is None else end.astimezone(timezone.utc)
+            if start <= now < end:
+                promotions[int(promotion['product_id'])] = str(promotion.get('label') or '')[:80]
+        except (ValueError, TypeError, KeyError):
+            continue
     custom_prices = _get_catalog_custom_prices(user_id, [int(p.id) for p in products])
     output = []
     for product in products:
@@ -228,6 +270,9 @@ def _serialize_product_rows(
                 referral_requirement == 0
                 or (claimant_verified and verified_referrals >= referral_requirement)
             )
+            limit_reached = bool(daily_limit and daily_claims >= daily_limit and Decimal(str(product.price or 0)) == 0)
+            if limit_reached:
+                freebie_unlocked = False
             description = getattr(product, "_catalog_description", None)
             if description is None:
                 description = str(product.description or "")
@@ -247,6 +292,12 @@ def _serialize_product_rows(
                 "verified_referrals": verified_referrals if referral_requirement else 0,
                 "claimant_miniapp_verified": claimant_verified if referral_requirement else True,
                 "freebie_unlocked": freebie_unlocked,
+                "freebie_limit_reached": limit_reached,
+                "freebie_daily_limit": daily_limit,
+                "freebie_daily_claims": daily_claims,
+                "is_favorite": int(product.id) in favorite_ids,
+                "restock_subscribed": int(product.id) in restock_ids,
+                "promotion": promotions.get(int(product.id), ""),
             })
         except Exception:
             logger.exception("Mini App product omitted due to invalid catalog configuration product_id=%s", product.id)
@@ -355,6 +406,11 @@ class DepositCreate(BaseModel):
 class DepositReference(BaseModel):
     model_config = ConfigDict(extra="forbid")
     reference: str = Field(min_length=8, max_length=255)
+
+
+class CancellationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(min_length=5, max_length=1000)
 
 
 class PromocodePayload(BaseModel):
@@ -547,7 +603,203 @@ def product_detail(product_id: int, auth=Depends(current_user)):
         raise HTTPException(status_code=404, detail="Product is unavailable.")
     if Decimal(str(rows[0].get("price") or 0)) == 0:
         _require_feature("freebies", "Freebies are temporarily unavailable.")
+    _record_recent_view(auth["id"], product_id)
+    rows[0]["recommendations"] = _recommendations(auth["id"], product_id)
     return {"product": rows[0]}
+
+
+def _record_recent_view(user_id: int, product_id: int) -> None:
+    from database import transaction
+    with transaction() as db:
+        if not db.query(Product.id).filter(Product.id == int(product_id), Product.is_active.is_(True)).first():
+            return
+        row = db.query(MiniAppRecentProduct).filter_by(
+            telegram_id=int(user_id), product_id=int(product_id)
+        ).with_for_update().first()
+        if row:
+            row.viewed_at = datetime.utcnow()
+        else:
+            db.add(MiniAppRecentProduct(telegram_id=int(user_id), product_id=int(product_id), viewed_at=datetime.utcnow()))
+        # Keep only the most recent 30 product visits per account.
+        old_ids = [item[0] for item in db.query(MiniAppRecentProduct.id).filter_by(
+            telegram_id=int(user_id)
+        ).order_by(MiniAppRecentProduct.viewed_at.desc(), MiniAppRecentProduct.id.desc()).offset(30).all()]
+        if old_ids:
+            db.query(MiniAppRecentProduct).filter(MiniAppRecentProduct.id.in_(old_ids)).delete(synchronize_session=False)
+
+
+def _recommendations(user_id: int, product_id: int, limit: int = 6) -> list[dict]:
+    with SessionLocal() as db:
+        source = db.get(Product, int(product_id))
+        if not source:
+            return []
+        purchased = db.query(Order.product_id, func.sum(Order.quantity).label('units')).filter(
+            Order.status == 'completed', Order.refunded.is_(False), Order.product_id.isnot(None)
+        ).group_by(Order.product_id).subquery()
+        query = db.query(Product).outerjoin(purchased, purchased.c.product_id == Product.id).filter(
+            Product.is_active.is_(True), Product.price > 0, Product.id != int(product_id)
+        )
+        if source.category:
+            query = query.filter(Product.category == source.category)
+        rows = query.order_by(purchased.c.units.desc(), Product.id.desc()).limit(limit * 2).all()
+    return _serialize_product_rows(user_id, rows, claimant_verified=True)[:limit]
+
+
+@router.get("/favorites")
+def favorites(auth=Depends(current_user)):
+    with SessionLocal() as db:
+        ids = [int(row[0]) for row in db.query(ProductEngagement.product_id).filter_by(
+            telegram_id=auth['id'], is_favorite=True
+        ).order_by(ProductEngagement.created_at.desc()).limit(100).all()]
+    rows = _product_rows(auth['id']) + _product_rows(auth['id'], freebies=True)
+    products = {row['id']: row for row in rows}
+    return {"products": [products[product_id] for product_id in ids if product_id in products]}
+
+
+@router.post("/favorites/{product_id}")
+def toggle_favorite(product_id: int, auth=Depends(current_user)):
+    from database import transaction
+    with transaction() as db:
+        if not db.query(Product.id).filter(Product.id == product_id, Product.is_active.is_(True)).first():
+            raise HTTPException(status_code=404, detail="Product is unavailable.")
+        row = db.query(ProductEngagement).filter_by(
+            telegram_id=auth['id'], product_id=product_id
+        ).with_for_update().first()
+        if not row:
+            row = ProductEngagement(telegram_id=auth['id'], product_id=product_id, is_favorite=True)
+            db.add(row)
+            active = True
+        else:
+            row.is_favorite = not bool(row.is_favorite)
+            active = bool(row.is_favorite)
+            if not row.is_favorite and not row.restock_enabled:
+                db.delete(row)
+    return {"product_id": product_id, "is_favorite": active}
+
+
+@router.get("/recent")
+def recent_products(auth=Depends(current_user)):
+    with SessionLocal() as db:
+        ids = [int(row[0]) for row in db.query(MiniAppRecentProduct.product_id).filter_by(
+            telegram_id=auth['id']
+        ).order_by(MiniAppRecentProduct.viewed_at.desc()).limit(30).all()]
+    rows = _product_rows(auth['id']) + _product_rows(auth['id'], freebies=True)
+    products = {row['id']: row for row in rows}
+    return {"products": [products[product_id] for product_id in ids if product_id in products]}
+
+
+@router.get("/referrals")
+def referral_activity(auth=Depends(current_user)):
+    _require_feature("referrals", "Referrals are temporarily unavailable.")
+    with SessionLocal() as db:
+        inviter = db.query(User.miniapp_ip_hash).filter(User.telegram_id == int(auth['id'])).first()
+        inviter_network = inviter[0] if inviter else None
+        users = db.query(User).filter(User.referred_by == int(auth['id'])).order_by(
+            User.id.desc()
+        ).limit(100).all()
+        network_counts = {}
+        if users:
+            network_counts = {str(network): int(count) for network, count in db.query(
+                User.miniapp_ip_hash, func.count(User.id)
+            ).filter(
+                User.referred_by == int(auth['id']),
+                User.miniapp_verified_at.isnot(None),
+                User.miniapp_ip_hash.isnot(None),
+            ).group_by(User.miniapp_ip_hash).all()}
+        rows = []
+        for user in users:
+            if user.miniapp_referral_review_rejected_at:
+                status = "rejected"
+            elif user.miniapp_referral_review_approved_at or (
+                user.miniapp_verified_at and (
+                    not user.miniapp_ip_hash or
+                    (user.miniapp_ip_hash != inviter_network and network_counts.get(str(user.miniapp_ip_hash), 0) == 1)
+                )
+            ):
+                status = "verified"
+            elif user.miniapp_verified_at:
+                status = "review"
+            else:
+                status = "joined"
+            rows.append({
+                "username": ("@" + str(user.username)[:32]) if user.username else "RainDeals member",
+                "status": status,
+                "activity_at": (user.miniapp_referral_review_rejected_at or
+                                user.miniapp_referral_review_approved_at or
+                                user.miniapp_verified_at or
+                                user.miniapp_verification_prompted_at).isoformat()
+                               if (user.miniapp_referral_review_rejected_at or
+                                   user.miniapp_referral_review_approved_at or
+                                   user.miniapp_verified_at or
+                                   user.miniapp_verification_prompted_at) else None,
+            })
+    return {"referrals": rows}
+
+
+@router.post("/restock-alerts/{product_id}")
+def subscribe_restock(product_id: int, auth=Depends(current_user)):
+    from database import transaction
+    from handlers.products import _real_stock
+    with transaction() as db:
+        product = db.query(Product).filter(Product.id == product_id, Product.is_active.is_(True)).first()
+        if not product:
+            raise HTTPException(status_code=404, detail="Product is unavailable.")
+        if int(_real_stock(product)) > 0:
+            return {"subscribed": False, "message": "This product is already in stock."}
+        row = db.query(ProductEngagement).filter_by(telegram_id=auth['id'], product_id=product_id).with_for_update().first()
+        if not row:
+            row = ProductEngagement(telegram_id=auth['id'], product_id=product_id)
+            db.add(row)
+        row.restock_enabled = True
+    return {"subscribed": True, "message": "We’ll notify you when stock returns."}
+
+
+@router.delete("/restock-alerts/{product_id}")
+def unsubscribe_restock(product_id: int, auth=Depends(current_user)):
+    with SessionLocal() as db:
+        row = db.query(ProductEngagement).filter_by(telegram_id=auth['id'], product_id=product_id).first()
+        if row:
+            row.restock_enabled = False
+            if not row.is_favorite:
+                db.delete(row)
+        db.commit()
+    return {"subscribed": False}
+
+
+@router.get("/bundles")
+def bundles(auth=Depends(current_user)):
+    from services.runtime_settings import json_list_setting
+    catalog = {row['id']: row for row in _product_rows(auth['id'])}
+    result = []
+    for row in json_list_setting('product_bundles_json'):
+        if not isinstance(row, dict) or not row.get('active', True):
+            continue
+        items = [catalog[int(product_id)] for product_id in row.get('product_ids', [])
+                 if str(product_id).isdigit() and int(product_id) in catalog]
+        if len(items) < 2:
+            continue
+        result.append({"id": '-'.join(str(item['id']) for item in items),
+                       "name": str(row.get('label') or row.get('name') or 'RainDeals bundle')[:80],
+                       "description": str(row.get('description') or '')[:240],
+                       "items": items, "total": _money(sum((Decimal(item['price']) for item in items), Decimal(0)))})
+    return {"bundles": result[:50]}
+
+
+@router.post("/bundles/{bundle_id}/cart")
+def add_bundle_to_cart(bundle_id: str, auth=Depends(current_user)):
+    _require_feature('cart', 'Cart is temporarily unavailable.')
+    from services.runtime_settings import json_list_setting
+    rows = json_list_setting('product_bundles_json')
+    bundle = next((item for item in rows if isinstance(item, dict) and item.get('active', True)
+                   and '-'.join(str(int(x)) for x in item.get('product_ids', []) if str(x).isdigit()) == bundle_id), None)
+    if not bundle:
+        raise HTTPException(status_code=404, detail='This bundle is no longer available.')
+    from services import cart
+    try:
+        cart.add_bundle(auth['id'], bundle.get('product_ids', []))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _cart_snapshot(auth['id'])
 
 
 @router.get("/deposit-methods")
@@ -696,6 +948,22 @@ async def submit_deposit_reference(deposit_id: int, payload: DepositReference, a
     return {"status": status, "message": "Payment verified." if status == "completed" else "Reference saved. Automatic verification will continue; you can check this deposit again here."}
 
 
+@router.post("/deposits/{deposit_id}/correct-reference")
+def correct_deposit_reference(deposit_id: int, auth=Depends(current_user)):
+    from services.payment_submissions import request_reference_correction
+    result = request_reference_correction(deposit_id, auth['id'])
+    messages = {
+        'not_found': (404, 'Deposit not found.'),
+        'not_correctable': (409, 'This deposit reference cannot be changed. If it was already verified, contact RainDeals support.'),
+        'verification_running': (409, 'Verification is in progress. Wait for its result before changing the reference.'),
+        'expired': (409, 'This invoice has expired. Contact RainDeals support if you already paid.'),
+    }
+    if result in messages:
+        status, message = messages[result]
+        raise HTTPException(status_code=status, detail=message)
+    return {'status': 'waiting_hash', 'message': 'The old reference was cleared. Submit the correct payment reference on this invoice.'}
+
+
 @router.post("/promocodes/redeem")
 def redeem_promocode(payload: PromocodePayload, auth=Depends(current_user)):
     from services.promotions import redeem
@@ -788,13 +1056,22 @@ async def checkout(payload: CheckoutPayload, request: Request, auth=Depends(curr
 
 
 @router.get("/orders")
-def orders(auth=Depends(current_user)):
+def orders(status: str = "", q: str = "", page: int = 0, auth=Depends(current_user)):
     with SessionLocal() as db:
-        rows = db.query(Order).filter(Order.telegram_id == auth["id"]).order_by(desc(Order.id)).limit(50).all()
+        query = db.query(Order).filter(Order.telegram_id == auth["id"])
+        if status and status != 'all':
+            query = query.filter(Order.status == status[:40])
+        if q.strip():
+            term = q.strip()[:80]
+            if term.isdigit():
+                query = query.filter((Order.id == int(term)) | Order.product_name.ilike(f'%{term}%'))
+            else:
+                query = query.filter(Order.product_name.ilike(f'%{term}%'))
+        rows = query.order_by(desc(Order.id)).offset(max(0, min(page, 1000)) * 50).limit(51).all()
         return {"orders": [{"id": int(row.id), "product_name": row.product_name,
                             "quantity": int(row.quantity or 1), "amount": _money(row.amount),
                             "status": row.status, "created_at": row.created_at.isoformat() if row.created_at else None,
-                            "refunded": bool(row.refunded)} for row in rows]}
+                            "refunded": bool(row.refunded)} for row in rows[:50]], "has_more": len(rows) > 50}
 
 
 @router.get("/orders/{order_id}")
@@ -803,10 +1080,36 @@ def order_detail(order_id: int, auth=Depends(current_user)):
         row = db.query(Order).filter(Order.id == order_id, Order.telegram_id == auth["id"]).first()
         if not row:
             raise HTTPException(status_code=404, detail="Order not found.")
+        from services.customer_tools import cancellable, cancellation_context
+        cancellation = cancellation_context(auth['id'], order_id)
+        submission = db.query(OrderRequirementSubmission).filter_by(
+            order_id=int(order.id), telegram_id=int(auth['id'])
+        ).first()
+        timeline = db.query(OrderEvent).filter_by(order_id=int(row.id), customer_visible=True).order_by(
+            OrderEvent.created_at.asc(), OrderEvent.id.asc()
+        ).limit(100).all()
         return {"id": int(row.id), "product_name": row.product_name, "quantity": int(row.quantity or 1),
                 "amount": _money(row.amount), "status": row.status,
                 "created_at": row.created_at.isoformat() if row.created_at else None,
-                "refunded": bool(row.refunded)}
+                "refunded": bool(row.refunded), "product_id": row.product_id,
+                "delivered_details": str(row.delivered_account or ''),
+                "submitted_details": submission.values if submission else {},
+                "submitted_at": submission.submitted_at.isoformat() if submission and submission.submitted_at else None,
+                "timeline": [{"kind": event.kind, "summary": event.summary,
+                              "created_at": event.created_at.isoformat() if event.created_at else None}
+                             for event in timeline],
+                "can_cancel": bool(cancellable(row) and not cancellation),
+                "cancellation": cancellation}
+
+
+@router.post("/orders/{order_id}/cancel")
+def request_order_cancellation(order_id: int, payload: CancellationPayload, auth=Depends(current_user)):
+    from services.customer_tools import request_cancellation
+    try:
+        status = request_cancellation(auth['id'], order_id, payload.reason)
+        return {"status": status, "message": "Your cancellation request was sent to RainDeals support."}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/notifications")

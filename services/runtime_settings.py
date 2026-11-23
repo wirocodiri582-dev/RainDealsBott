@@ -98,6 +98,20 @@ def payment_value(key: str, fallback: str = "") -> str:
     return str(get_setting(key, fallback) or "").strip()
 
 
+def json_list_setting(key: str, default=None) -> list:
+    """Read bounded Manager-authored JSON arrays without trusting malformed values."""
+    fallback = list(default or [])
+    raw = payment_value(key, "")
+    if not raw or len(raw) > 200_000:
+        return fallback
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        logger.warning("Ignoring invalid JSON in Manager setting %s", key)
+        return fallback
+    return value[:50] if isinstance(value, list) else fallback
+
+
 def payment_method_order() -> list[str]:
     raw = get_setting("payment_order", "[\"BEP20\",\"POLYGON\",\"BINANCE\",\"UPI\",\"STARS\"]")
     try:

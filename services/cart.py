@@ -94,6 +94,51 @@ def change(user_id, product_id, quantity):
             db.add(CartItem(telegram_id=user_id, product_id=product_id, quantity=quantity, revision=secrets.token_hex(12)))
 
 
+def add_bundle(user_id, product_ids):
+    """Add one unit of every bundle item atomically after live validation."""
+    ids = list(dict.fromkeys(int(product_id) for product_id in product_ids))
+    if not 2 <= len(ids) <= 8 or any(product_id <= 0 for product_id in ids):
+        raise ValueError('This bundle has invalid product entries.')
+    with transaction() as db:
+        _locked_user(db, user_id)
+        if _busy(db, user_id):
+            raise ValueError('A cart checkout is processing or awaiting review. Open its result first.')
+        items = db.query(CartItem).filter_by(telegram_id=user_id).with_for_update().all()
+        by_id = {int(item.product_id): item for item in items}
+        if len(set(by_id) | set(ids)) > 20:
+            raise ValueError('A cart can contain up to 20 different products.')
+        products = db.query(Product).filter(Product.id.in_(ids)).with_for_update().all()
+        by_product = {int(product.id): product for product in products}
+        from handlers.products import _product_purchase_configuration_errors
+        from services.fulfillment_policy import plan_delivery
+        for product_id in ids:
+            product = by_product.get(product_id)
+            if not product or not product.is_active or Decimal(str(product.price or 0)) <= 0:
+                raise ValueError('A bundle item is no longer available in the paid shop.')
+            if _product_purchase_configuration_errors(product):
+                raise ValueError(f'{product.name} needs checkout setup before it can be added.')
+            item = by_id.get(product_id)
+            quantity = int(item.quantity if item else 0) + 1
+            if quantity > 1000:
+                raise ValueError(f'{product.name} has reached the cart quantity limit.')
+            if product.source == 'reseller':
+                if quantity > _reseller_stock(product):
+                    raise ValueError(f'Only {_reseller_stock(product)} supplier unit(s) are available for {product.name}.')
+            else:
+                try:
+                    plan_delivery(product, quantity)
+                except ValueError as exc:
+                    raise ValueError(f'{product.name}: {exc}') from exc
+        for product_id in ids:
+            item = by_id.get(product_id)
+            if item:
+                item.quantity = int(item.quantity) + 1
+                item.revision = secrets.token_hex(12)
+            else:
+                db.add(CartItem(telegram_id=user_id, product_id=product_id, quantity=1,
+                                revision=secrets.token_hex(12)))
+
+
 def clear(user_id):
     with transaction() as db:
         _locked_user(db,user_id)

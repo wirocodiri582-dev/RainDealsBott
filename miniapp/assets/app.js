@@ -3,7 +3,9 @@
   const state = {
     initData: tg?.initData || "", profile: null, products: [], freebies: false,
     features: { cart: true, freebies: true, referrals: true, vendor_offers: true, deposits: true },
-    category: "All", search: "", stockOnly: false, sort: "featured", cart: { items: [] },
+    category: "All", search: "", stockOnly: false, sort: "featured", catalogMode: "all", modeProducts: null, favorites: new Set(), recent: [], compareIds: new Set(), bundles: [], bundlesLoaded: false, cart: { items: [] },
+    orderSearch: "", orderStatus: "all", orderPage: 0, orderHasMore: false,
+    orderDetails: new Map(), orderSearchTimer: null,
     unread: 0, botUsername: "", depositMethods: [], currentProductId: null, buyerInfoDraft: {},
     currentView: "store", cartPending: new Map(), pendingAdds: new Set(), productDetails: new Map(),
     productsRequest: 0, productRequest: 0, catalogLoadedAt: 0, productsRequests: new Map(), cartReady: false, modal: null,
@@ -186,7 +188,8 @@
   }
 
   function filteredProducts() {
-    let products = state.products.filter(product => {
+    const source = Array.isArray(state.modeProducts) ? state.modeProducts : state.products;
+    let products = source.filter(product => {
       const query = state.search.trim().toLocaleLowerCase();
       const matchesText = !query || `${product.name} ${product.category}`.toLocaleLowerCase().includes(query);
       return matchesText && (state.category === "All" || product.category === state.category) && (!state.stockOnly || product.in_stock);
@@ -207,25 +210,111 @@
     }).join("") + (state.features.freebies ? `<button class="category-chip" data-freebies="toggle">${state.freebies ? "🛍 Paid shop" : "🎁 Freebies"}</button>` : "");
   }
 
+  function allVisibleProducts() {
+    const rows = [...state.products, ...(Array.isArray(state.modeProducts) ? state.modeProducts : [])];
+    return [...new Map(rows.map(row => [Number(row.id), row])).values()];
+  }
+
+  function catalogProduct(productId) {
+    return allVisibleProducts().find(row => Number(row.id) === Number(productId)) ||
+      [...state.productDetails.values()].find(row => Number(row.id) === Number(productId));
+  }
+
+  function renderBundles() {
+    const section = $("#bundle-list");
+    if (!section) return;
+    if (state.catalogMode !== "all" || state.freebies || !state.bundles.length) {
+      section.classList.add("hidden");
+      return;
+    }
+    section.classList.remove("hidden");
+    section.innerHTML = `<div class="section-heading compact-heading"><div><p class="eyebrow">CURATED SETS</p><h2 class="panel-heading">Shop together</h2></div></div>` +
+      state.bundles.map(bundle => `<article class="bundle-card"><div><strong>${esc(bundle.name)}</strong><p>${esc(bundle.description || bundle.items.map(item => item.name).join(" · "))}</p><small>${bundle.items.map(item => esc(item.name)).join(" + ")}</small></div><div class="bundle-buy"><b>${money(bundle.total)}</b><button class="primary-button" data-bundle="${esc(bundle.id)}">Add set</button></div></article>`).join("");
+  }
+
+  function renderPromotions() {
+    const section = $("#promotion-list");
+    if (!section) return;
+    const rows = state.products.filter(row => row.promotion).slice(0, 3);
+    if (state.catalogMode !== "all" || state.freebies || !rows.length) {
+      section.classList.add("hidden");
+      return;
+    }
+    section.classList.remove("hidden");
+    section.innerHTML = `<div class="promotion-strip">${rows.map(row => `<button data-product="${Number(row.id)}"><span>✨ ${esc(row.promotion)}</span><strong>${esc(row.name)}</strong><small>${money(row.price)} USDT</small></button>`).join("")}</div>`;
+  }
+
+  async function loadBundles() {
+    if (state.bundlesLoaded) return;
+    state.bundlesLoaded = true;
+    try { state.bundles = (await api("/bundles")).bundles || []; }
+    catch { state.bundles = []; }
+    renderBundles();
+  }
+
+  async function loadCatalogMode(mode) {
+    const normalized = ["all", "favorites", "recent"].includes(mode) ? mode : "all";
+    state.catalogMode = normalized;
+    state.category = "All";
+    if (normalized === "all") {
+      state.modeProducts = null;
+      renderStore();
+      return;
+    }
+    const section = $("#product-grid");
+    section.innerHTML = `<div class="loading-card"><span class="spinner"></span><span><b>Loading ${normalized === "favorites" ? "saved items" : "recent products"}</b><small>Getting your personal list…</small></span></div>`;
+    try {
+      const data = await api(normalized === "favorites" ? "/favorites" : "/recent");
+      if (state.catalogMode !== normalized) return;
+      state.modeProducts = data.products || [];
+      if (normalized === "favorites") state.favorites = new Set(state.modeProducts.map(row => Number(row.id)));
+      if (normalized === "recent") state.recent = state.modeProducts;
+      renderStore();
+    } catch (error) {
+      if (state.catalogMode === normalized) {
+        state.modeProducts = [];
+        renderStore();
+        toast(error.message);
+      }
+    }
+  }
+
+  function renderCompare() {
+    const ids = [...state.compareIds];
+    const rows = ids.map(catalogProduct).filter(Boolean);
+    openModal(`<p class="eyebrow">PRODUCT COMPARISON</p><h2 class="page-title" id="modal-title">Compare items</h2>${rows.length ? `<div class="compare-table-wrap"><table class="compare-table"><thead><tr><th>Details</th>${rows.map(row => `<th>${esc(row.name)}</th>`).join("")}</tr></thead><tbody>${[
+      ["Price", row => `${money(row.price)} USDT`], ["Availability", row => row.preorder ? "Preorder" : `${Number(row.stock || 0)} in stock`], ["Delivery", row => String(row.delivery_type || "manual").replaceAll("_", " ")], ["Category", row => row.category || "General"]
+    ].map(([label, value]) => `<tr><th>${label}</th>${rows.map(row => `<td>${esc(value(row))}</td>`).join("")}</tr>`).join("")}</tbody></table></div><div class="compare-actions">${rows.map(row => `<button class="secondary-button" data-compare-remove="${Number(row.id)}">Remove ${esc(row.name)}</button><button class="primary-button" data-compare-add="${Number(row.id)}">Add to cart</button>`).join("")}</div>` : `<div class="empty-state"><span>⚖️</span><strong>No comparison items</strong><p>Tap the scale on up to three product cards.</p></div>`}<button class="secondary-button wide-button" style="margin-top:10px" data-close-modal>Continue shopping</button>`, "compare");
+  }
+
   function renderStore() {
     renderCategories();
+    $$('.quick-tool[data-catalog-mode]').forEach(button => button.classList.toggle('active', button.dataset.catalogMode === state.catalogMode));
+    $('#compare-count').textContent = String(state.compareIds.size);
+    renderBundles();
+    renderPromotions();
     const items = filteredProducts();
-    $("#catalog-title").textContent = state.category === "All" ? (state.freebies ? "Freebies" : "All products") : state.category;
+    $("#catalog-title").textContent = state.category !== "All" ? state.category : state.catalogMode === "favorites" ? "Saved products" : state.catalogMode === "recent" ? "Recently viewed" : state.freebies ? "Freebies" : "All products";
     $("#catalog-count").textContent = `${items.length} ${items.length === 1 ? "product" : "products"}${state.sort === "name" ? " · A → Z" : state.sort === "price" ? " · Price ↑" : ""}`;
     $("#product-grid").innerHTML = items.map((product, index) => `
       <article class="product-card" data-product="${product.id}" tabindex="0" aria-label="${esc(product.name)}">
         <div class="product-art art-${index % 5}">
           <span class="stock-pill">${product.preorder ? "⏳ Preorder" : product.stock > 999 ? "◇ 999+ in stock" : `◇ ${product.stock} ${product.stock === 1 ? "left" : "in stock"}`}</span>
-          <span class="flash-pill">ϟ</span>
+          <div class="product-overlay-actions"><button data-favorite="${product.id}" aria-label="${product.is_favorite ? "Remove favorite" : "Save favorite"}">${product.is_favorite ? "♥" : "♡"}</button><button data-compare="${product.id}" aria-label="Compare product">⚖</button></div>
           <span class="product-icon">${esc(product.icon || "📦")}</span>
         </div>
         <div class="product-info">
           <div class="product-category">${product.freebie_referrals_required ? `🔒 ${Number(product.verified_referrals || 0)}/${Number(product.freebie_referrals_required)} verified` : esc(product.category)}</div>
           <h3 class="product-name">${esc(product.name)}</h3>
+          ${product.promotion ? `<span class="product-promotion">${esc(product.promotion)}</span>` : ""}
           <div class="product-foot"><div class="product-price">${money(product.price)} <small>USDT</small></div><button class="add-button" data-add="${product.id}" aria-label="Add ${esc(product.name)} to cart" ${!state.features.cart || !product.purchasable || state.pendingAdds.has(Number(product.id)) || state.cartPending.has(Number(product.id)) ? "disabled" : ""}>${!state.features.cart ? "—" : state.pendingAdds.has(Number(product.id)) || state.cartPending.has(Number(product.id)) ? "…" : "+"}</button></div>
         </div>
       </article>`).join("");
     $("#empty-state").classList.toggle("hidden", items.length > 0);
+    if (!items.length) {
+      $("#empty-state strong").textContent = state.catalogMode === "favorites" ? "Nothing saved yet" : state.catalogMode === "recent" ? "No recently viewed products" : "No products found";
+      $("#empty-state p").textContent = state.catalogMode === "favorites" ? "Tap the heart on a product to save it here." : state.catalogMode === "recent" ? "Products you open will be listed here." : "Try another search or category.";
+    }
   }
 
   function openModal(content, kind) {
@@ -261,6 +350,8 @@
         ? "Reopen the RainDeals Mini Store to verify this Telegram session."
         : `Verified referrals: ${Number(product.verified_referrals || 0)}/${Number(product.freebie_referrals_required)}. Each friend must start from your referral link and open the Mini Store.`)
       : `Unlocked with ${Number(product.freebie_referrals_required || 0)} verified Mini Store referral(s).`;
+    const related = Array.isArray(product.recommendations) ? product.recommendations.slice(0, 4) : [];
+    const canRestock = Number(product.sellable_stock ?? product.stock ?? 0) <= 0 && !product.preorder;
     openModal(`
       <div class="modal-art">${esc(product.icon || "📦")}</div>
       <p class="eyebrow" style="margin-top:15px">${esc(product.category)} · ${product.preorder ? "PREORDER" : product.in_stock ? "IN STOCK" : "SOLD OUT"}</p>
@@ -271,7 +362,9 @@
       ${gatedFreebie ? `<div class="soft-note" style="margin:12px 0">🔐 ${esc(gateCopy)}</div>` : ""}
       ${(product.required_info || []).map(field => `<div class="soft-note">Before checkout: ${esc(field.label)} (${esc(field.type)})</div>`).join("")}
       ${product.preorder ? `<div class="soft-note" style="margin:12px 0">This item is currently out of stock. Your order will be queued for manual fulfillment when accepted.</div>` : ""}
+      ${canRestock ? `<button class="secondary-button wide-button" style="margin:8px 0" data-action="restock-alert" data-id="${Number(product.id)}">${product.restock_subscribed ? "🔔 Remove restock alert" : "🔔 Notify me when available"}</button>` : ""}
       ${gateLocked ? `<button class="primary-button wide-button" data-action="share-referral" ${state.features.referrals && state.profile?.referral_link ? "" : "disabled"}>🤝 Invite friends to unlock</button>` : unsupported ? `<div class="soft-note" style="margin:12px 0">This item needs a photo or Telegram contact. Open the bot to complete that secure form.</div><button class="primary-button wide-button" data-action="open-bot">Continue in Telegram</button>` : `<button class="primary-button wide-button" data-action="add-product" data-id="${product.id}" ${!state.features.cart || !product.purchasable || adding ? "disabled" : ""}>${!state.features.cart ? "Cart purchases are unavailable" : adding ? "Adding to cart…" : product.preorder ? "Add preorder to cart" : "Add to cart"}</button>`}
+      ${related.length ? `<div class="recommendations"><p class="eyebrow">YOU MAY ALSO LIKE</p>${related.map(row => `<button class="recommendation-row" data-recommend="${Number(row.id)}"><span>${esc(row.icon || "📦")}</span><strong>${esc(row.name)}</strong><small>${money(row.price)} USDT</small></button>`).join("")}</div>` : ""}
       <button class="secondary-button wide-button" style="margin-top:8px" data-close-modal>Keep browsing</button>
     `, "product");
   }
@@ -280,12 +373,64 @@
     state.currentProductId = Number(product.id);
     const cached = state.productDetails.get(Number(product.id));
     productSheet({ ...product, ...(cached || {}) });
+    const id = Number(product.id);
+    if (!state.productDetails.has(id)) {
+      api(`/products/${id}`).then(data => {
+        if (!data.product) return;
+        state.productDetails.set(id, data.product);
+        if (state.currentProductId === id && state.modal === "product") {
+          productSheet({ ...catalogProduct(id), ...data.product });
+        }
+      }).catch(() => {});
+    }
+  }
+
+  async function toggleFavorite(productId) {
+    const button = $(`[data-favorite="${Number(productId)}"]`);
+    if (button) button.disabled = true;
+    try {
+      const result = await api(`/favorites/${Number(productId)}`, { method: "POST" });
+      const update = rows => (rows || []).map(row => Number(row.id) === Number(productId) ? { ...row, is_favorite: result.is_favorite } : row);
+      state.products = update(state.products);
+      if (Array.isArray(state.modeProducts)) state.modeProducts = update(state.modeProducts);
+      if (result.is_favorite) state.favorites.add(Number(productId)); else state.favorites.delete(Number(productId));
+      if (state.catalogMode === "favorites") await loadCatalogMode("favorites");
+      else renderStore();
+      toast(result.is_favorite ? "Saved to your products" : "Removed from saved products");
+    } catch (error) { toast(error.message); if (button) button.disabled = false; }
+  }
+
+  async function toggleRestockAlert(productId) {
+    const product = catalogProduct(productId) || state.productDetails.get(Number(productId));
+    if (!product) return;
+    try {
+      if (product.restock_subscribed) {
+        await api(`/restock-alerts/${Number(productId)}`, { method: "DELETE" });
+        product.restock_subscribed = false;
+        toast("Restock alert removed");
+      } else {
+        const result = await api(`/restock-alerts/${Number(productId)}`, { method: "POST" });
+        product.restock_subscribed = Boolean(result.subscribed);
+        toast(result.message || "Restock alert saved");
+      }
+      productSheet({ ...product, ...(state.productDetails.get(Number(productId)) || {}) });
+    } catch (error) { toast(error.message); }
+  }
+
+  async function addBundleToCart(bundleId) {
+    if (!state.features.cart) { toast("Cart purchases are temporarily unavailable."); return; }
+    try {
+      state.cart = await api(`/bundles/${encodeURIComponent(bundleId)}/cart`, { method: "POST" });
+      state.cartReady = true;
+      syncHeader();
+      toast("Bundle items added to your cart");
+    } catch (error) { toast(error.message); }
   }
 
   async function showFullProductDetails(productId) {
     const id = Number(productId);
     const cached = state.productDetails.get(id);
-    if (cached) { productSheet({ ...state.products.find(row => row.id === id), ...cached }); return; }
+    if (cached) { productSheet({ ...catalogProduct(id), ...cached }); return; }
     const requestId = ++state.productRequest;
     const button = $('[data-action="full-product-details"]');
     if (button) { button.disabled = true; button.textContent = "Loading full description…"; }
@@ -293,7 +438,7 @@
       const data = await api(`/products/${id}`);
       if (data.product) state.productDetails.set(id, data.product);
       if (state.modal === "product" && id === state.currentProductId && requestId === state.productRequest) {
-        productSheet({ ...state.products.find(row => row.id === id), ...(data.product || {}) });
+        productSheet({ ...catalogProduct(id), ...(data.product || {}) });
       }
     } catch (error) {
       toast(error.message);
@@ -302,7 +447,7 @@
   }
 
   function applyLocalCartQuantity(snapshot, productId, quantity) {
-    const product = state.products.find(row => row.id === Number(productId));
+    const product = catalogProduct(productId);
     const items = [...(snapshot.items || [])];
     const index = items.findIndex(row => Number(row.product_id) === Number(productId));
     if (quantity <= 0) {
@@ -367,13 +512,13 @@
       const id = Number(productId);
       if (state.pendingAdds.has(id)) return;
       state.pendingAdds.add(id);
-      const product = state.products.find(row => row.id === id);
+      const product = catalogProduct(id);
       if (product && state.modal === "product") productSheet(product);
       else renderStore();
       toast("Adding as soon as your cart is ready…");
       loadCart().catch(error => {
         state.pendingAdds.delete(id);
-        const latest = state.products.find(row => row.id === id);
+        const latest = catalogProduct(id);
         if (latest && state.modal === "product") productSheet(latest);
         else renderStore();
         toast(error.message);
@@ -382,7 +527,7 @@
     }
     const id = Number(productId);
     if (state.cartPending.has(id)) return;
-    const product = state.products.find(row => row.id === id);
+    const product = catalogProduct(id);
     const current = state.cart.items.find(row => row.product_id === id)?.quantity || 0;
     const desired = current + 1;
     if (product && desired > product.sellable_stock) {
@@ -406,7 +551,7 @@
   function syncProductAddButtons() {
     $$('[data-add]').forEach(button => {
       const id = Number(button.dataset.add);
-      const product = state.products.find(row => row.id === id);
+      const product = catalogProduct(id);
       const pending = state.pendingAdds.has(id) || state.cartPending.has(id);
       button.disabled = !product?.purchasable || pending;
       button.textContent = pending ? "…" : "+";
@@ -419,7 +564,10 @@
       return;
     }
     const lines = state.cart.items || [];
-    const productMap = new Map(state.products.map(product => [product.id, product]));
+    const productMap = new Map(allVisibleProducts().map(product => [Number(product.id), product]));
+    for (const [productId, product] of state.productDetails) {
+      productMap.set(Number(productId), { ...(productMap.get(Number(productId)) || {}), ...product });
+    }
     const total = lines.reduce((sum, line) => sum + Number(line.total || 0), 0);
     const hasIssue = lines.some(line => line.error);
     const unsupported = lines.some(line => (productMap.get(line.product_id)?.required_info || line.required_info || []).some(field => ["photo", "contact"].includes(field.type)));
@@ -543,7 +691,7 @@
         ${waiting && payment?.address ? `<div class="deposit-address"><small>${deposit.network === "BINANCE" ? "Binance Pay ID" : deposit.network === "UPI" ? "UPI ID" : "Deposit address"}</small><code>${esc(payment.address)}</code><button class="text-button" data-copy="${esc(payment.address)}">Copy</button></div>` : ""}
         <p class="soft-note">${esc(payment?.instructions || paymentStatusText)}</p>
         ${waiting ? `<p class="invoice-timer">⏳ Invoice expires in <strong id="deposit-timer">—</strong></p>${isStars ? starsControls : `<label class="field-label">${esc(deposit.reference_label)}<input id="deposit-reference" class="field-input" maxlength="255" autocomplete="off" placeholder="Enter your payment reference"></label><button class="primary-button wide-button" style="margin-top:12px" data-action="submit-deposit-reference" data-deposit-id="${Number(deposit.id)}">Submit for verification</button><button class="secondary-button wide-button" style="margin-top:8px" data-action="change-payment-method">🔄 Switch payment method</button>`}` : `<p class="invoice-timer">${completed ? "This deposit is complete." : deposit.reference_submitted ? "Your reference is saved. Revisit this deposit to check its status." : expired ? "The invoice is no longer accepting payment references." : `Status: ${esc(String(deposit.status).replaceAll("_", " "))}`}</p>${completed ? `<button class="primary-button wide-button" data-close-modal>Done</button>` : deposit.reference_submitted ? `<button class="primary-button wide-button" data-action="load-deposits">My deposits</button>` : `<button class="primary-button wide-button" data-action="open-deposit-methods">${expired ? "Create a new deposit" : "Switch payment method"}</button>`}`}
-      </div><button class="secondary-button wide-button" data-action="load-deposits">My deposit history</button>`, "deposit");
+      </div>${deposit.reference_submitted && !completed && !expired && !isStars ? `<button class="secondary-button wide-button" style="margin-top:8px" data-action="correct-deposit-reference" data-deposit-id="${Number(deposit.id)}">✏️ Correct submitted reference</button>` : ""}<button class="secondary-button wide-button" data-action="load-deposits">My deposit history</button>`, "deposit");
     if (waiting) {
       const expiresAt = Date.now() + Number(deposit.remaining_seconds) * 1000;
       const update = () => {
@@ -652,6 +800,20 @@
     }
   }
 
+  async function correctDepositReference(id) {
+    const button = $('[data-action="correct-deposit-reference"]');
+    if (button) { button.disabled = true; button.textContent = "Checking invoice…"; }
+    try {
+      const result = await api(`/deposits/${Number(id)}/correct-reference`, { method: "POST", body: "{}" });
+      toast(result.message || "Submit the corrected reference.");
+      await showDeposit(id);
+      loadBalance();
+    } catch (error) {
+      toast(error.message);
+      if (button) { button.disabled = false; button.textContent = "✏️ Correct submitted reference"; }
+    }
+  }
+
   async function copyText(value, success = "Copied") {
     try { await navigator.clipboard.writeText(value); toast(success); }
     catch { toast("Could not copy. Select and copy the text manually."); }
@@ -699,7 +861,7 @@
         <div class="profile-stats"><div><small>Balance</small><strong>${money(p.balance)} USDT</strong></div><div><small>Orders</small><strong>${Number(p.orders || 0)}</strong></div><div><small>Total spent</small><strong>${money(p.spent)} USDT</strong></div><div><small>Deposited</small><strong>${money(p.deposited)} USDT</strong></div></div>
         <div class="row-line"><div><strong>Telegram ID</strong><small>RainDeals account</small></div><span class="amount">${esc(p.telegram_id)}</span></div>
       </div>
-      ${state.features.referrals ? `<div class="panel-card referral-card"><h2 class="panel-heading">🤝 Invite friends</h2><p>Invitees count as completed after opening the RainDeals Store and passing verification. Shared-network matches may need admin review.</p><div class="referral-link"><code>${esc(p.referral_link || "Referral link unavailable")}</code><button class="text-button" data-action="copy-referral" ${p.referral_link ? "" : "disabled"}>Copy</button></div><div class="referral-stats"><span><strong>${Number(p.referrals || 0)}</strong><small>Invited</small></span><span><strong>${Number(p.verified_referrals || 0)}</strong><small>Completed</small></span><span><strong>${money(p.referral_earnings)} USDT</strong><small>Earned</small></span></div><button class="primary-button wide-button" style="margin-top:12px" data-action="share-referral" ${p.referral_link ? "" : "disabled"}>Share invite link</button></div>` : ""}
+      ${state.features.referrals ? `<div class="panel-card referral-card"><h2 class="panel-heading">🤝 Invite friends</h2><p>Invitees count as completed after opening the RainDeals Store and passing verification. Shared-network matches may need admin review.</p><div class="referral-link"><code>${esc(p.referral_link || "Referral link unavailable")}</code><button class="text-button" data-action="copy-referral" ${p.referral_link ? "" : "disabled"}>Copy</button></div><div class="referral-stats"><span><strong>${Number(p.referrals || 0)}</strong><small>Invited</small></span><span><strong>${Number(p.verified_referrals || 0)}</strong><small>Completed</small></span><span><strong>${money(p.referral_earnings)} USDT</strong><small>Earned</small></span></div><button class="primary-button wide-button" style="margin-top:12px" data-action="share-referral" ${p.referral_link ? "" : "disabled"}>Share invite link</button><button class="secondary-button wide-button" style="margin-top:8px" data-action="referral-activity">View referral activity</button></div>` : ""}
       <button class="order-card" data-view="notifications"><div class="order-top"><strong>🔔 Notifications</strong><span>${Number(state.unread || 0)} unread ›</span></div><p>Recent payment, order, support, and account updates.</p></button>
       <button class="order-card" data-action="notification-preferences"><div class="order-top"><strong>⚙️ Notification preferences</strong><span>›</span></div><p>Choose which bot updates you receive.</p></button>
       <button class="secondary-button wide-button" data-action="open-bot">Support &amp; account help in Telegram</button>`;
@@ -721,14 +883,50 @@
     return state.profileRequest;
   }
 
-  async function loadOrders() {
+  async function showReferralActivity() {
+    openModal(`<p class="eyebrow">RAINDEALS REWARDS</p><h2 class="page-title" id="modal-title">Referral activity</h2><div class="loading"><span class="spinner"></span><p>Checking referral progress…</p></div>`, "referrals");
+    const request = state.modalGeneration;
+    try {
+      const data = await api("/referrals");
+      if (state.modalGeneration !== request) return;
+      const rows = data.referrals || [];
+      const labels = { verified: "Verified", review: "Under review", rejected: "Not counted", joined: "Mini App not opened" };
+      openModal(`<p class="eyebrow">RAINDEALS REWARDS</p><h2 class="page-title" id="modal-title">Referral activity</h2><p class="muted-count">A referral counts after the new account opens the RainDeals Mini Store. Suspected shared networks may need review.</p>${rows.length ? `<div class="panel-card">${rows.map(row=>`<div class="row-line"><div><strong>${esc(row.username)}</strong><small>${esc(when(row.activity_at))}</small></div><span class="status-pill ${esc(row.status)}">${esc(labels[row.status] || row.status)}</span></div>`).join("")}</div>` : `<div class="empty-state"><span>🤝</span><strong>No referrals yet</strong><p>Share your personal link to invite a friend.</p></div>`}<button class="primary-button wide-button" data-action="share-referral">Share invite link</button>`, "referrals");
+    } catch (error) {
+      if (state.modalGeneration === request) openModal(`<p class="eyebrow">RAINDEALS REWARDS</p><h2 class="page-title" id="modal-title">Referral activity</h2><p class="soft-note">${esc(error.message)}</p>`, "referrals");
+    }
+  }
+
+  async function loadOrders(page = 0) {
+    state.orderPage = Math.max(0, Number(page) || 0);
     const view = $("#orders-view");
     view.innerHTML = `<p class="eyebrow">YOUR PURCHASES</p><h1 class="page-title">My orders</h1><div class="loading"><span class="spinner"></span><p>Loading orders…</p></div>`;
     try {
-      const data = await api("/orders");
+      const params = new URLSearchParams({ page: String(state.orderPage), status: state.orderStatus });
+      if (state.orderSearch.trim()) params.set("q", state.orderSearch.trim());
+      const data = await api(`/orders?${params}`);
+      state.orderHasMore = Boolean(data.has_more);
       state.checkoutUncertain = false;
-      view.innerHTML = `<p class="eyebrow">YOUR PURCHASES</p><h1 class="page-title">My orders</h1>${data.orders.length ? data.orders.map(order => `<button class="order-card" data-order="${order.id}"><div class="order-top"><strong>Order #${order.id}</strong><span class="status-pill ${esc(order.status)}">${esc(String(order.status).replaceAll("_", " "))}</span></div><p>${esc(order.product_name)} · Qty ${order.quantity} · ${money(order.amount)} USDT</p><p>${esc(when(order.created_at))}${order.refunded ? " · Refunded" : ""}</p></button>`).join("") : `<div class="empty-state"><span>📦</span><strong>No orders yet</strong><p>Your purchases will appear here.</p></div>`}<button class="secondary-button wide-button" data-view="store">Browse products</button>`;
+      view.innerHTML = `<p class="eyebrow">YOUR PURCHASES</p><h1 class="page-title">My orders</h1>
+        <div class="order-filters"><input id="order-search" class="field-input" value="${esc(state.orderSearch)}" maxlength="80" placeholder="Search product or order number"><select id="order-status" class="field-input">${[["all","All statuses"],["completed","Completed"],["pending_manual","Awaiting delivery"],["pending_info","Needs your information"],["delivery_pending","Delivery processing"],["preorder","Preorder"],["cancelled","Cancelled"],["refunded","Refunded"]].map(([value,label])=>`<option value="${value}" ${state.orderStatus===value?"selected":""}>${label}</option>`).join("")}</select></div>
+        ${data.orders.length ? data.orders.map(order => `<button class="order-card" data-order="${order.id}"><div class="order-top"><strong>Order #${order.id}</strong><span class="status-pill ${esc(order.status)}">${esc(String(order.status).replaceAll("_", " "))}</span></div><p>${esc(order.product_name)} · Qty ${order.quantity} · ${money(order.amount)} USDT</p><p>${esc(when(order.created_at))}${order.refunded ? " · Refunded" : ""}</p></button>`).join("") : `<div class="empty-state"><span>📦</span><strong>${state.orderSearch || state.orderStatus !== "all" ? "No matching orders" : "No orders yet"}</strong><p>${state.orderSearch || state.orderStatus !== "all" ? "Adjust your search or status filter." : "Your purchases will appear here."}</p></div>`}
+        <div class="search-row" style="grid-template-columns:1fr 1fr"><button class="secondary-button" data-orders-page="${Math.max(0,state.orderPage-1)}" ${state.orderPage<=0?"disabled":""}>‹ Previous</button><button class="secondary-button" data-orders-page="${state.orderPage+1}" ${!state.orderHasMore?"disabled":""}>Next ›</button></div>
+        <button class="secondary-button wide-button" style="margin-top:10px" data-view="store">Browse products</button>`;
     } catch (error) { view.innerHTML = `<h1 class="page-title">My orders</h1><p class="soft-note">${esc(error.message)}</p>`; }
+  }
+
+  function downloadOrderReceipt(order) {
+    const details = [
+      "RainDeals order receipt", `Order #${order.id}`, `Product: ${order.product_name}`,
+      `Quantity: ${order.quantity}`, `Amount: ${order.amount} USDT`,
+      `Status: ${String(order.status).replaceAll("_", " ")}`, `Placed: ${when(order.created_at)}`,
+    ].join("\n");
+    const html = `<!doctype html><meta charset="utf-8"><title>RainDeals Order #${Number(order.id)}</title><style>body{font:16px system-ui;max-width:680px;margin:40px auto;padding:20px;color:#17243a}h1{color:#1769ff}pre{white-space:pre-wrap;font:15px/1.8 system-ui}</style><h1>🌧️ RainDeals</h1><pre>${esc(details)}</pre>`;
+    const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a"); link.href = url; link.download = `raindeals-order-${Number(order.id)}.html`;
+    document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    toast("Order receipt saved");
   }
 
   async function showOrder(orderId) {
@@ -736,8 +934,40 @@
     const request = state.modalGeneration;
     try {
       const order = await api(`/orders/${Number(orderId)}`);
-      if (state.modalGeneration === request) openModal(`<p class="eyebrow">ORDER DETAILS</p><h2 class="page-title" id="modal-title">Order #${order.id}</h2><div class="panel-card"><div class="row-line"><strong>Product</strong><span>${esc(order.product_name)}</span></div><div class="row-line"><strong>Status</strong><span class="status-pill ${esc(order.status)}">${esc(String(order.status).replaceAll("_", " "))}</span></div><div class="row-line"><strong>Quantity</strong><span>${order.quantity}</span></div><div class="row-line"><strong>Paid</strong><span>${money(order.amount)} USDT</span></div><div class="row-line"><strong>Placed</strong><span>${esc(when(order.created_at))}</span></div></div><p class="soft-note">For delivered account details or warranty help, open this order in the RainDeals Telegram bot.</p><button class="primary-button wide-button" data-action="open-bot">Open order in Telegram</button>`, "order");
+      if (state.modalGeneration === request) {
+        const submitted = Object.entries(order.submitted_details || {});
+        const timeline = order.timeline || [];
+        const cancellation = order.cancellation;
+        const delivery = String(order.delivered_details || "").trim();
+        openModal(`<p class="eyebrow">ORDER DETAILS</p><h2 class="page-title" id="modal-title">Order #${order.id}</h2>
+          <div class="panel-card"><div class="row-line"><strong>Product</strong><span>${esc(order.product_name)}</span></div><div class="row-line"><strong>Status</strong><span class="status-pill ${esc(order.status)}">${esc(String(order.status).replaceAll("_", " "))}</span></div><div class="row-line"><strong>Quantity</strong><span>${order.quantity}</span></div><div class="row-line"><strong>Paid</strong><span>${money(order.amount)} USDT</span></div><div class="row-line"><strong>Placed</strong><span>${esc(when(order.created_at))}</span></div></div>
+          ${submitted.length ? `<div class="panel-card"><h3 class="panel-heading">Information you submitted</h3>${submitted.map(([key,value])=>`<div class="row-line"><strong>${esc(key)}</strong><span>${esc(value)}</span></div>`).join("")}${order.submitted_at?`<small class="muted-count">Submitted ${esc(when(order.submitted_at))}</small>`:""}</div>`:""}
+          ${delivery ? `<div class="panel-card"><h3 class="panel-heading">Delivered information</h3><pre class="delivery-receipt">${esc(delivery)}</pre></div>` : ""}
+          ${timeline.length ? `<div class="panel-card"><h3 class="panel-heading">Order timeline</h3>${timeline.map(item=>`<div class="timeline-row"><i></i><div><strong>${esc(String(item.kind||"update").replaceAll("_"," "))}</strong><p>${esc(item.summary||"")}</p><small>${esc(when(item.created_at))}</small></div></div>`).join("")}</div>`:""}
+          ${cancellation ? `<div class="soft-note">Cancellation request: <b>${esc(cancellation.status || "submitted")}</b>${cancellation.resolution?`<br>${esc(cancellation.resolution)}`:""}</div>`:""}
+          ${order.can_cancel ? `<div class="panel-card"><h3 class="panel-heading">Request cancellation</h3><label class="field-label">Reason<textarea id="cancel-reason" class="field-input" maxlength="1000" rows="3" placeholder="Tell support why you need to cancel"></textarea></label><button class="secondary-button wide-button" data-action="request-order-cancel" data-order-id="${Number(order.id)}">Send cancellation request</button></div>` : ""}
+          <button class="secondary-button wide-button" data-action="save-order-receipt" data-order-id="${Number(order.id)}">⬇ Save order receipt</button>
+          ${order.product_id && !order.refunded ? `<button class="primary-button wide-button" style="margin-top:8px" data-action="buy-again" data-product-id="${Number(order.product_id)}">Buy this product again</button>`:""}
+          <button class="secondary-button wide-button" style="margin-top:8px" data-action="open-bot">Open warranty/support in Telegram</button>`, "order");
+        state.orderDetails.set(Number(order.id), order);
+      }
     } catch (error) { if (state.modalGeneration === request) openModal(`<h2 class="page-title" id="modal-title">Order unavailable</h2><p class="soft-note">${esc(error.message)}</p>`, "order"); }
+  }
+
+  async function requestOrderCancellation(orderId) {
+    const reason = $("#cancel-reason")?.value.trim() || "";
+    if (reason.length < 5) { toast("Add a short reason so support can review the request."); $("#cancel-reason")?.focus(); return; }
+    const button = $('[data-action="request-order-cancel"]');
+    if (button) { button.disabled = true; button.textContent = "Sending request…"; }
+    try {
+      const result = await api(`/orders/${Number(orderId)}/cancel`, { method: "POST", body: JSON.stringify({ reason }) });
+      toast(result.message || "Cancellation request sent");
+      await showOrder(orderId);
+      loadOrders(state.orderPage);
+    } catch (error) {
+      toast(error.message);
+      if (button) { button.disabled = false; button.textContent = "Send cancellation request"; }
+    }
   }
 
   async function loadNotifications(page = 0) {
@@ -825,10 +1055,32 @@
     if (!target) return;
     if (target.hasAttribute("data-close-modal")) { closeModal(); return; }
     if (target.dataset.view) { setView(target.dataset.view); return; }
+    if (target.dataset.catalogMode) { loadCatalogMode(target.dataset.catalogMode); return; }
+    if (target.id === "compare-open") { renderCompare(); return; }
+    if (target.dataset.favorite) { event.stopPropagation(); toggleFavorite(target.dataset.favorite); return; }
+    if (target.dataset.compare) {
+      event.stopPropagation();
+      const id = Number(target.dataset.compare);
+      if (state.compareIds.has(id)) state.compareIds.delete(id);
+      else if (state.compareIds.size >= 3) { toast("Compare up to three products at a time."); return; }
+      else state.compareIds.add(id);
+      persistCompare(); renderStore(); toast(state.compareIds.has(id) ? "Added to comparison" : "Removed from comparison"); return;
+    }
+    if (target.dataset.compareRemove) { state.compareIds.delete(Number(target.dataset.compareRemove)); persistCompare(); renderCompare(); return; }
+    if (target.dataset.compareAdd) { const id=Number(target.dataset.compareAdd); closeModal(); addProduct(id); return; }
+    if (target.dataset.bundle) { addBundleToCart(target.dataset.bundle); return; }
+    if (target.dataset.recommend) { const product=catalogProduct(target.dataset.recommend); if(product) openProduct(product); return; }
     if (target.dataset.category !== undefined) { state.category = target.dataset.category; renderStore(); return; }
-    if (target.dataset.freebies) { loadProducts(!state.freebies).catch(error => toast(error.message)); return; }
+    if (target.dataset.freebies) {
+      state.catalogMode = "all";
+      state.modeProducts = null;
+      state.category = "All";
+      loadProducts(!state.freebies).catch(error => toast(error.message));
+      return;
+    }
     if (target.dataset.add) { event.stopPropagation(); addProduct(target.dataset.add); return; }
     if (target.dataset.action === "add-product") { addProduct(target.dataset.id); return; }
+    if (target.dataset.action === "restock-alert") { toggleRestockAlert(target.dataset.id); return; }
     if (target.dataset.action === "open-bot") { openBot(); return; }
     if (target.id === "return-to-bot") { if (tg?.close) tg.close(); else openBot(); return; }
     if (target.dataset.action === "keep-shopping") { closeModal(); setView("store"); return; }
@@ -863,22 +1115,37 @@
     if (target.dataset.action === "change-payment-method") { showDepositMethods(); return; }
     if (target.dataset.action === "load-deposits") { loadDepositsHistory(0); return; }
     if (target.dataset.action === "submit-deposit-reference") { submitDepositReference(target.dataset.depositId); return; }
+    if (target.dataset.action === "correct-deposit-reference") { correctDepositReference(target.dataset.depositId); return; }
     if (target.dataset.action === "open-promocode") { openPromocode(); return; }
     if (target.dataset.action === "redeem-promocode") { redeemPromocode(); return; }
     if (target.dataset.action === "copy-referral") { copyText(state.profile?.referral_link || "", "Referral link copied"); return; }
     if (target.dataset.action === "share-referral") { shareReferral(); return; }
+    if (target.dataset.action === "referral-activity") { showReferralActivity(); return; }
     if (target.dataset.action === "notification-preferences") { openBot(); toast("Manage notification preferences in the RainDeals bot."); return; }
     if (target.dataset.action === "refresh-catalog") { refreshProducts(); return; }
     if (target.dataset.cartQty) {
       const item = state.cart.items.find(row => row.product_id === Number(target.dataset.cartQty));
       if (!item) return;
       const next = Number(item.quantity) + Number(target.dataset.delta);
-      const product = state.products.find(row => row.id === Number(item.product_id));
+      const product = catalogProduct(item.product_id);
       if (next > 0 && product && next > Number(product.sellable_stock)) { toast(`Only ${product.sellable_stock} units are currently available.`); return; }
       changeCart(item.product_id, Math.max(0,next)); return;
     }
     if (target.dataset.cartRemove) { changeCart(target.dataset.cartRemove, 0); return; }
     if (target.dataset.order) { showOrder(target.dataset.order); return; }
+    if (target.dataset.ordersPage !== undefined) { loadOrders(Number(target.dataset.ordersPage)); return; }
+    if (target.dataset.action === "request-order-cancel") { requestOrderCancellation(target.dataset.orderId); return; }
+    if (target.dataset.action === "save-order-receipt") {
+      const order = state.orderDetails.get(Number(target.dataset.orderId));
+      if (order) downloadOrderReceipt(order); else toast("Reopen the order and try again.");
+      return;
+    }
+    if (target.dataset.action === "buy-again") {
+      const id = Number(target.dataset.productId);
+      closeModal();
+      addProduct(id);
+      return;
+    }
     if (target.dataset.notification) {
       const unread = target.dataset.notificationUnread === "1";
       if (unread) {
@@ -897,19 +1164,39 @@
     if (target.id === "open-bot") { openBot(); return; }
     if (target.id === "catalog-refresh") { refreshProducts(); return; }
     if (target.dataset.product) {
-      const product = state.products.find(row => row.id === Number(target.dataset.product));
+      const product = catalogProduct(target.dataset.product);
       if (product) openProduct(product);
     }
+  }
+
+  function persistCompare() {
+    const userId = tg?.initDataUnsafe?.user?.id;
+    if (!userId) return;
+    try { sessionStorage.setItem(`raindeals_compare_${userId}`, JSON.stringify([...state.compareIds].slice(0, 3))); } catch {}
   }
 
   function bind() {
     document.addEventListener("click", onClick);
     document.addEventListener("input", event => {
+      if (event.target.id === "order-search") {
+        state.orderSearch = event.target.value;
+        state.orderPage = 0;
+        clearTimeout(state.orderSearchTimer);
+        state.orderSearchTimer = setTimeout(() => { if (state.currentView === "orders") loadOrders(0); }, 280);
+        return;
+      }
       const input = event.target.closest("[data-buyer-product]");
       if (!input) return;
       const productId = input.dataset.buyerProduct;
       state.buyerInfoDraft[productId] ||= {};
       state.buyerInfoDraft[productId][input.dataset.buyerLabel] = input.value;
+    });
+    document.addEventListener("change", event => {
+      if (event.target.id === "order-status") {
+        state.orderStatus = event.target.value;
+        state.orderPage = 0;
+        loadOrders(0);
+      }
     });
     $("#search").addEventListener("input", event => {
       state.search = event.target.value;
@@ -952,6 +1239,10 @@
         return;
       }
       syncHeader();
+      try {
+        const saved = JSON.parse(sessionStorage.getItem(`raindeals_compare_${data.profile.telegram_id}`) || "[]");
+        if (Array.isArray(saved)) state.compareIds = new Set(saved.map(Number).filter(Number.isSafeInteger).slice(0, 3));
+      } catch {}
       $("#main").classList.remove("hidden"); $("#bottom-nav").classList.remove("hidden");
       renderProfile();
       if (state.features.cart) loadCart().catch(error => { state.cartReady = false; toast(error.message); });
@@ -959,6 +1250,7 @@
       loadProducts(false).catch(error => {
         $("#product-grid").innerHTML = `<div class="soft-note">${esc(error.message)} <button class="text-button" data-action="refresh-catalog">Try again</button></div>`;
       });
+      loadBundles();
     } catch (error) {
       $("#loading").classList.add("hidden");
       $("#auth-error").classList.remove("hidden");

@@ -6,9 +6,9 @@
   <meta name="theme-color" content="#f3f6fc">
   <meta name="description" content="Browse the RainDeals digital store in Telegram.">
   <title>RainDeals Store</title>
-  <link rel="stylesheet" href="/miniapp/assets/styles.css?v=20261118-1">
+  <link rel="stylesheet" href="/miniapp/assets/styles.css?v=20261121-1">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script defer src="/miniapp/assets/app.js?v=20261118-1"></script>
+  <script defer src="/miniapp/assets/app.js?v=20261121-1"></script>
 </head>
 <body>
   <div class="app-shell">
@@ -52,6 +52,14 @@
         </div>
 
         <div class="category-strip" id="categories" aria-label="Product categories"></div>
+        <div class="quick-tools" aria-label="Saved and recent products">
+          <button class="quick-tool" data-catalog-mode="all">🛍️ Shop</button>
+          <button class="quick-tool" data-catalog-mode="favorites">⭐ Saved</button>
+          <button class="quick-tool" data-catalog-mode="recent">🕘 Recent</button>
+          <button class="quick-tool" id="compare-open">⚖️ Compare <span id="compare-count">0</span></button>
+        </div>
+        <section id="bundle-list" class="bundle-list hidden" aria-label="Curated bundles"></section>
+        <section id="promotion-list" class="promotion-list hidden" aria-label="Active promotions"></section>
         <div class="section-heading"><div><p class="eyebrow">CURATED FOR YOU</p><h2 id="catalog-title">All products</h2></div><div class="catalog-tools"><span id="catalog-count" class="muted-count"></span><button id="catalog-refresh" class="catalog-refresh" aria-label="Refresh products">↻</button></div></div>
         <div id="product-grid" class="product-grid"></div>
         <div id="empty-state" class="empty-state hidden"><span>🔎</span><strong>No products found</strong><p>Try another search or category.</p></div>
