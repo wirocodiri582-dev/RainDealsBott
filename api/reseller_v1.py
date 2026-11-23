@@ -1287,6 +1287,20 @@ async def _queue_api_order_review(api_order_id: int) -> None:
         logger.exception("Could not queue API order reconciliation alert reservation_id=%s", api_order_id)
 
 
+async def _queue_api_order_notification(order_id: int) -> None:
+    """Queue the customer order in Admin Notify; the order scanner is fallback."""
+    try:
+        from services.order_notifications import queue_order_notification
+
+        queued = await asyncio.to_thread(queue_order_notification, int(order_id))
+        if not queued:
+            logger.warning("Admin Notify did not accept API order alert order_id=%s", order_id)
+    except Exception:
+        # The order is already committed. Keep its API result successful and
+        # let the durable order-notification scanner retry the alert.
+        logger.exception("Could not queue Admin Notify alert for API order_id=%s", order_id)
+
+
 # ============================================================
 # PRODUCT SOURCE
 # ============================================================
@@ -1499,6 +1513,8 @@ async def create_order(
             )
 
             if order:
+
+                await _queue_api_order_notification(order.id)
 
                 return {
                     "success": True,
@@ -1760,6 +1776,10 @@ async def create_order(
         request_row.id,
         order_id,
     )
+
+    # Do not rely on the periodic scanner for API-created orders. Enqueue the
+    # same idempotent Admin Notify event used by Mini App checkout immediately.
+    await _queue_api_order_notification(order_id)
 
     # --------------------------------------------------------
     # Load order
